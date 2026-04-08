@@ -1,7 +1,6 @@
 """
 Sentinel Pro — 台股多股掃描器 v2.0
 CCI × 成交量 × 價格行為 量價策略訊號系統
-支援上市與上櫃股自動偵測
 """
 
 import streamlit as st
@@ -488,51 +487,31 @@ def optimize_params(df: pd.DataFrame, base_p: dict) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def fetch_data(symbol: str, period: str = "1y"):
-    # 如果使用者已經自帶 .TW 或 .TWO，就直接用；否則產生兩個候選名單
-    if symbol.endswith((".TW", ".TWO", ".tw", ".two")):
-        sym_list = [symbol.upper()]
-    else:
-        sym_list = [f"{symbol}.TW", f"{symbol}.TWO"]
-        
-    for sym in sym_list:
-        try:
-            df = yf.Ticker(sym).history(period=period)
-            if not df.empty and len(df) > 0:
-                df.index = pd.to_datetime(df.index).tz_localize(None)
-                df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                return df, None
-        except Exception:
-            continue
-            
-    return None, f"{symbol}: 無資料 (上市/上櫃皆查無資料)"
+    sym = symbol if symbol.endswith((".TW", ".TWO")) else symbol + ".TW"
+    try:
+        df = yf.Ticker(sym).history(period=period)
+        if df.empty:
+            return None, f"{sym}: 無資料"
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        return df, None
+    except Exception as e:
+        return None, str(e)
 
 
 @st.cache_data(ttl=60)
 def fetch_quote(symbol: str) -> dict:
-    if symbol.endswith((".TW", ".TWO", ".tw", ".two")):
-        sym_list = [symbol.upper()]
-    else:
-        sym_list = [f"{symbol}.TW", f"{symbol}.TWO"]
-        
-    for sym in sym_list:
-        try:
-            fi = yf.Ticker(sym).fast_info
-            last = getattr(fi, "last_price", None)
-            
-            # 若成功取到最後價格，代表代號正確
-            if last is not None and not np.isnan(last):
-                prev  = getattr(fi, "previous_close",  None) or 0
-                chg   = last - prev
-                chg_p = chg / prev * 100 if prev else 0
-                return {
-                    "price": round(last, 2), 
-                    "change": round(chg, 2),
-                    "change_pct": round(chg_p, 2)
-                }
-        except Exception:
-            continue
-            
-    return {}
+    sym = symbol if symbol.endswith((".TW", ".TWO")) else symbol + ".TW"
+    try:
+        fi = yf.Ticker(sym).fast_info
+        last  = getattr(fi, "last_price",      None) or 0
+        prev  = getattr(fi, "previous_close",  None) or 0
+        chg   = last - prev
+        chg_p = chg / prev * 100 if prev else 0
+        return {"price": round(last, 2), "change": round(chg, 2),
+                "change_pct": round(chg_p, 2)}
+    except Exception:
+        return {}
 
 
 # ══════════════════════════════════════════════
@@ -705,8 +684,8 @@ def watchlist_from_excel(file) -> list[str]:
 # ══════════════════════════════════════════════
 
 DEFAULT_WATCHLIST = [
-    "2330", "2317", "2454", "2382", "3711", # 上市
-    "8069", "3293", "3105", "5347", "1565", # 上櫃 (元太, 鈊象, 穩懋, 世界, 精華)
+    "2330","2317","2454","2382","3711",
+    "2308","2303","6505","2886","2891",
 ]
 
 
@@ -775,7 +754,7 @@ def main():
                 st.success(f"已匯入 {len(codes)} 支股票")
 
         wl_text = st.text_area(
-            "股票代號（每行一個，系統會自動判斷上市/上櫃）",
+            "股票代號（每行一個，不需加 .TW）",
             value="\n".join(st.session_state.watchlist),
             height=220,
         )
@@ -929,7 +908,10 @@ def main():
     with tab_drill:
         st.markdown("#### 🔬 個股深度分析（130 根 K 線）")
         c1, c2, c3 = st.columns([3, 2, 1])
-        sel_from_wl = c1.selectbox("從自選股選擇", st.session_state.watchlist)
+        sel_from_wl = c1.selectbox(
+            "從自選股選擇", st.session_state.watchlist,
+            format_func=lambda x: f"{x}.TW",
+        )
         custom_code = c2.text_input("或直接輸入代號", placeholder="e.g. 0050")
         load_btn    = c3.button("📊 載入", type="primary", use_container_width=True)
 
@@ -990,7 +972,8 @@ def main():
         st.markdown("#### 📊 回測分析 & 參數優化建議")
 
         c1, c2, c3 = st.columns([3, 2, 1])
-        bt_sym  = c1.selectbox("選擇回測標的", st.session_state.watchlist, key="bt_sym")
+        bt_sym  = c1.selectbox("選擇回測標的", st.session_state.watchlist,
+                                format_func=lambda x: f"{x}.TW", key="bt_sym")
         bt_cust = c2.text_input("或直接輸入代號", key="bt_custom")
         run_bt  = c3.button("🔬 執行", type="primary", use_container_width=True)
 
