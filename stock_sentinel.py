@@ -13,7 +13,12 @@ from plotly.subplots import make_subplots
 import io
 import itertools
 import warnings
+import logging
+
+# ── Silence noisy library output in Streamlit Cloud logs ──
 warnings.filterwarnings("ignore")
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("peewee").setLevel(logging.CRITICAL)
 
 # ──────────────────────────────────────────────
 # PAGE CONFIG
@@ -177,6 +182,50 @@ def calc_vol_ma(volume, period=20):
     return volume.rolling(period).mean()
 
 
+def calc_kd(high, low, close, k_period=9, d_period=3, smooth=3):
+    """
+    KD Stochastic.  回傳 (K, D)。
+    RSV = (close - lowest_low) / (highest_high - lowest_low) * 100
+    K   = RSV 的 smooth-period EMA
+    D   = K 的 d_period EMA
+    """
+    lo  = low.rolling(k_period).min()
+    hi  = high.rolling(k_period).max()
+    rsv = (close - lo) / (hi - lo + 1e-8) * 100
+    k   = rsv.ewm(com=smooth - 1, min_periods=smooth).mean()
+    d   = k.ewm(com=d_period - 1, min_periods=d_period).mean()
+    return k, d
+
+
+def calc_obv(close, volume):
+    """On-Balance Volume — 累積量能趨勢。"""
+    direction = np.sign(close.diff().fillna(0))
+    return (direction * volume).cumsum()
+
+
+def calc_momentum_score(df: pd.DataFrame, p: dict) -> pd.Series:
+    """
+    綜合動能分數 (0–100)，用於「強勢排行」。
+    分數越高代表短期動能越強。
+    組成：CCI 正負 + RSI 位置 + 量比 + MACD 方向 + KD 金叉
+    """
+    score = pd.Series(0.0, index=df.index)
+    # CCI 貢獻 (0-30)
+    cci_norm = df["CCI"].clip(-200, 200) / 200 * 30
+    score += cci_norm
+    # RSI 貢獻 (0-25)
+    score += df["RSI"].clip(0, 100) / 100 * 25
+    # 量比貢獻 (0-20): capped at 4×
+    score += (df["Vol_Ratio"].clip(0, 4) / 4) * 20
+    # MACD 方向貢獻 (0-15)
+    score += (df["MACD_Hist"] > 0).astype(float) * 15
+    # KD 金叉貢獻 (0-10)
+    if "K" in df.columns and "D" in df.columns:
+        kd_cross = (df["K"] > df["D"]).astype(float)
+        score += kd_cross * 10
+    return score.clip(0, 100).round(1)
+
+
 # ── Price-Action helpers ──────────────────────
 
 def has_long_lower_shadow(open_, close, low, ratio=0.5):
@@ -279,7 +328,8 @@ SIGNAL_LABEL = {
 
 def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     """
-    Returns df copy with Signal, Signal_Detail, CCI, RSI, MACD*, Vol_MA, ATR columns.
+    Returns df copy with Signal, Signal_Detail, CCI, RSI, KD, OBV,
+    MACD*, Vol_MA, ATR, MomScore columns.
     """
     df = df.copy()
 
@@ -295,8 +345,19 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     m, ms, mh       = calc_macd(df["Close"], p["macd_fast"], p["macd_slow"], p["macd_signal"])
     df["MACD"], df["MACD_Sig"], df["MACD_Hist"] = m, ms, mh
 
+    # ── KD Stochastic ──
+    k, d = calc_kd(df["High"], df["Low"], df["Close"],
+                   p.get("kd_period", 9), p.get("kd_d", 3), p.get("kd_smooth", 3))
+    df["K"], df["D"] = k, d
+
+    # ── OBV ──
+    df["OBV"]        = calc_obv(df["Close"], df["Volume"])
+    df["OBV_MA"]     = df["OBV"].rolling(p.get("obv_ma", 20)).mean()
+    df["OBV_Rising"] = df["OBV"] > df["OBV_MA"]   # OBV 趨勢向上 → 量能支撐
+
     # ── Volume conditions ──
     vol_ratio            = df["Volume"] / (df["Vol_MA"] + 1e-8)
+    df["Vol_Ratio"]      = vol_ratio.round(2)
     df["Vol_High"]       = vol_ratio >= p["vol_multiplier"]
     df["Vol_Strong"]     = vol_ratio >= p["vol_strong_multiplier"]
     df["Vol_Shrink"]     = vol_ratio < 0.8
@@ -308,13 +369,18 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     df["CCI_X_pos100_UP"]  = (cci_prev <  100) & (df["CCI"] >=  100)
     df["CCI_X_pos100_DN"]  = (cci_prev >= 100) & (df["CCI"] <   100)
 
+    # ── KD crossovers ──
+    k_prev, d_prev = df["K"].shift(1), df["D"].shift(1)
+    df["KD_Golden"]  = (k_prev <= d_prev) & (df["K"] > df["D"]) & (df["K"] < p.get("kd_oversold",  20))
+    df["KD_Dead"]    = (k_prev >= d_prev) & (df["K"] < df["D"]) & (df["K"] > p.get("kd_overbought", 80))
+
     # ── Price action ──
-    df["LowerShadow"]  = has_long_lower_shadow(df["Open"], df["Close"], df["Low"])
-    df["BullEngulf"]   = is_bullish_engulf(df["Open"], df["Close"])
-    df["UpperShadow"]  = has_long_upper_shadow(df["Open"], df["Close"], df["High"])
-    df["PriceUp"]      = df["Close"] > df["Close"].shift(1)
-    df["PriceUp_VolDN"]= df["PriceUp"] & (df["Volume"] < df["Volume"].shift(1))
-    df["BlackCandle"]  = df["Close"] < df["Open"]
+    df["LowerShadow"]   = has_long_lower_shadow(df["Open"], df["Close"], df["Low"])
+    df["BullEngulf"]    = is_bullish_engulf(df["Open"], df["Close"])
+    df["UpperShadow"]   = has_long_upper_shadow(df["Open"], df["Close"], df["High"])
+    df["PriceUp"]       = df["Close"] > df["Close"].shift(1)
+    df["PriceUp_VolDN"] = df["PriceUp"] & (df["Volume"] < df["Volume"].shift(1))
+    df["BlackCandle"]   = df["Close"] < df["Open"]
 
     # ── Divergence (only when flag on) ──
     if p.get("use_divergence", True):
@@ -328,27 +394,37 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     sig    = pd.Series("NEUTRAL", index=df.index)
     detail = pd.Series("",        index=df.index)
 
-    # 1. 強勢追漲：CCI突破+100 + 強放量 → 噴發段
-    m1 = df["CCI_X_pos100_UP"] & df["Vol_Strong"]
+    # 1. 強勢追漲：CCI突破+100 + 強放量 + OBV上升 → 噴發段
+    m1 = df["CCI_X_pos100_UP"] & df["Vol_Strong"] & df["OBV_Rising"]
     sig[m1]    = "BREAKOUT_BUY"
-    detail[m1] = "噴發段：CCI突破+100 + 強放量（倍量追強）"
+    detail[m1] = "噴發段：CCI突破+100 + 強放量 + OBV量能支撐（倍量追強）"
+
+    # 1b. 噴發但OBV不支撐 → 仍標 BREAKOUT 但附帶量能警示
+    m1b = df["CCI_X_pos100_UP"] & df["Vol_Strong"] & ~df["OBV_Rising"]
+    sig[m1b]    = "BREAKOUT_BUY"
+    detail[m1b] = "噴發段：CCI突破+100 + 強放量（⚠️ OBV量能未支撐，注意假突破）"
 
     # 2. 假突破：CCI突破+100 but 縮量 → 誘多
     m2 = df["CCI_X_pos100_UP"] & ~df["Vol_High"]
     sig[m2]    = "FAKE_BREAKOUT"
     detail[m2] = "誘多警告：CCI突破+100 but 量不配合"
 
-    # 3. 強買：CCI突破-100 + 放量 + 止跌K線
+    # 3. 強買：CCI突破-100 + 放量 + 止跌K + OBV回升
     m3 = df["CCI_X_neg100_UP"] & df["Vol_High"] & (df["LowerShadow"] | df["BullEngulf"])
     sig[m3 & (sig == "NEUTRAL")] = "STRONG_BUY"
     detail[m3 & (sig == "STRONG_BUY")] = "強買：CCI突破-100 + 放量 + 止跌K（轉折確立）"
+
+    # 3b. KD低檔金叉 + 放量 → 強買 (KD 補強)
+    m3b = df["KD_Golden"] & df["Vol_High"] & (df["LowerShadow"] | df["BullEngulf"])
+    sig[m3b & (sig == "NEUTRAL")] = "STRONG_BUY"
+    detail[m3b & (sig == "STRONG_BUY")] = "強買：KD低檔金叉(<20) + 放量 + 止跌K（底部確認）"
 
     # 4. 底背離買入
     m4 = df["BullDiv"] & df["Vol_High"]
     sig[m4 & (sig == "NEUTRAL")] = "DIV_BUY"
     detail[m4 & (sig == "DIV_BUY")] = "底背離：股價創低但CCI底部抬高 + 放量確認"
 
-    # 5. 一般買入：CCI突破0軸 + 放量
+    # 5. 一般買入：CCI突破0軸 + 放量 + OBV支撐
     m5 = df["CCI_X_zero_UP"] & df["Vol_High"]
     sig[m5 & (sig == "NEUTRAL")] = "BUY"
     detail[m5 & (sig == "BUY")] = "買入：CCI突破0軸 + 放量確認（動能轉正）"
@@ -358,10 +434,13 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     sig[m6 & (sig == "NEUTRAL")] = "WATCH"
     detail[m6 & (sig == "WATCH")] = "觀望：CCI突破-100 but 量縮（弱反彈，容易再跌）"
 
-    # 7. 強賣：CCI跌破+100 + 量縮 or 爆量黑K
-    m7 = df["CCI_X_pos100_DN"] & (df["Vol_Shrink"] | (df["Vol_High"] & df["BlackCandle"]))
+    # 7. 強賣：CCI跌破+100 + 量縮/爆量黑K 或 KD高檔死叉
+    m7a = df["CCI_X_pos100_DN"] & (df["Vol_Shrink"] | (df["Vol_High"] & df["BlackCandle"]))
+    m7b = df["KD_Dead"] & df["PriceUp_VolDN"]
+    m7  = m7a | m7b
     sig[m7 & (sig == "NEUTRAL")] = "STRONG_SELL"
-    detail[m7 & (sig == "STRONG_SELL")] = "強賣：CCI跌破+100 + 買盤竭盡（高檔撤退訊號）"
+    detail[m7a & (sig == "STRONG_SELL")] = "強賣：CCI跌破+100 + 買盤竭盡（高檔撤退訊號）"
+    detail[m7b & (sig == "STRONG_SELL")] = "強賣：KD高檔死叉(>80) + 價漲量縮（頭部訊號）"
 
     # 8. 頂背離賣出
     m8 = df["BearDiv"] & df["PriceUp_VolDN"]
@@ -375,7 +454,9 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
 
     df["Signal"]        = sig
     df["Signal_Detail"] = detail
-    df["Vol_Ratio"]     = vol_ratio.round(2)
+
+    # ── Momentum score (computed after all signals) ──
+    df["MomScore"] = calc_momentum_score(df, p)
 
     return df
 
@@ -496,25 +577,37 @@ def _resolve_symbol(code: str) -> str:
     return code  # will be resolved with fallback in fetch_data
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=3600)
 def fetch_name(code: str) -> tuple[str, str]:
-    """Return (chinese_name, market_label) for a code.
+    """
+    Return (display_name, market_label).
+    Uses fast_info.display_name when available (yfinance 1.2+),
+    falls back to info['shortName'] if needed.
     market_label: '上市' | '上櫃' | ''
     """
-    for suffix, label in [(".TW", "上市"), (".TWO", "上櫃")]:
-        sym = code if code.upper().endswith((".TW", ".TWO")) else code + suffix
+    if code.upper().endswith(".TWO"):
+        candidates = [(code, "上櫃")]
+    elif code.upper().endswith(".TW"):
+        candidates = [(code, "上市")]
+    else:
+        candidates = [(code + ".TW", "上市"), (code + ".TWO", "上櫃")]
+
+    _STRIP = [" Co., Ltd.", " Co.,Ltd.", " Corporation", " Inc.", " Ltd.",
+              "股份有限公司", "有限公司", " Co."]
+
+    for sym, label in candidates:
         try:
-            info = yf.Ticker(sym).fast_info
-            # fast_info doesn't have name; fall to .info for name
-            ticker_info = yf.Ticker(sym).info
-            name = (ticker_info.get("longName") or
-                    ticker_info.get("shortName") or "")
-            # Clean up common suffixes from yfinance
-            for strip in [" Co., Ltd.", " Co.,Ltd.", " Corporation",
-                           " Inc.", " Ltd.", "股份有限公司", "有限公司"]:
-                name = name.replace(strip, "")
+            t = yf.Ticker(sym)
+            # fast_info.display_name is cheapest (no extra HTTP call)
+            name = getattr(t.fast_info, "display_name", None) or ""
+            if not name:
+                # fallback: one HTTP call
+                name = (t.info.get("shortName") or t.info.get("longName") or "")
+            for s in _STRIP:
+                name = name.replace(s, "")
+            name = name.strip()
             if name:
-                return name.strip(), label
+                return name, label
         except Exception:
             pass
     return "", ""
@@ -531,7 +624,14 @@ def fetch_data(symbol: str, period: str = "1y"):
     last_err = "無資料"
     for sym in candidates:
         try:
-            df = yf.Ticker(sym).history(period=period)
+            import io as _io, sys as _sys
+            _old_err = _sys.stderr
+            _sys.stderr = _io.StringIO()          # swallow "possibly delisted" spam
+            try:
+                df = yf.Ticker(sym).history(period=period)
+            finally:
+                _sys.stderr = _old_err
+
             if df.empty:
                 last_err = f"{sym}: 無資料"
                 continue
@@ -590,10 +690,11 @@ MARKER_SHAPE = {
 def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
     df = df.tail(130).copy()
 
+    # 5-panel: Candle+BB+EMA | Volume+OBV | CCI | KD | MACD
     fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True,
-        row_heights=[0.44, 0.20, 0.18, 0.18],
-        vertical_spacing=0.025,
+        rows=5, cols=1, shared_xaxes=True,
+        row_heights=[0.38, 0.12, 0.17, 0.17, 0.16],
+        vertical_spacing=0.02,
     )
 
     # ── Panel 1: K線 + EMA + BB ──
@@ -604,7 +705,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
         decreasing_fillcolor="#22cc66", decreasing_line_color="#22cc66",
     ), row=1, col=1)
 
-    for col_name, color, width, dash in [
+    for col_name, color, lw, dash in [
         ("EMA1",     "#f0a500", 1.3, "solid"),
         ("EMA2",     "#2196f3", 1.3, "solid"),
         ("BB_Upper", "#607d8b", 0.8, "dot"),
@@ -614,16 +715,15 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
         if col_name in df.columns:
             fig.add_trace(go.Scatter(
                 x=df.index, y=df[col_name], name=col_name,
-                line=dict(color=color, width=width, dash=dash),
+                line=dict(color=color, width=lw, dash=dash),
                 showlegend=False,
             ), row=1, col=1)
 
-    # BB fill
     if "BB_Upper" in df.columns and "BB_Lower" in df.columns:
         fig.add_trace(go.Scatter(
             x=pd.concat([pd.Series(df.index), pd.Series(df.index[::-1])]),
             y=pd.concat([df["BB_Upper"], df["BB_Lower"][::-1]]),
-            fill="toself", fillcolor="rgba(100,140,180,0.06)",
+            fill="toself", fillcolor="rgba(100,140,180,0.05)",
             line=dict(width=0), showlegend=False, hoverinfo="skip",
         ), row=1, col=1)
 
@@ -644,59 +744,112 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
             hoverinfo="text",
         ), row=1, col=1)
 
-    # ── Panel 2: CCI ──
+    # ── Panel 2: Volume bars + OBV line ──
+    vol_colors = ["#e8414e" if c >= o else "#22cc66"
+                  for c, o in zip(df["Close"], df["Open"])]
+    fig.add_trace(go.Bar(
+        x=df.index, y=df["Volume"], marker_color=vol_colors,
+        name="Volume", showlegend=False, opacity=0.7,
+    ), row=2, col=1)
+    if "OBV" in df.columns:
+        # Normalise OBV to volume scale for overlay readability
+        obv_range = df["OBV"].max() - df["OBV"].min() + 1e-8
+        vol_range  = df["Volume"].max() + 1e-8
+        obv_scaled = (df["OBV"] - df["OBV"].min()) / obv_range * vol_range * 0.8
+        fig.add_trace(go.Scatter(
+            x=df.index, y=obv_scaled, name="OBV(scaled)",
+            line=dict(color="#00d4ff", width=1.2, dash="dot"),
+            showlegend=False,
+        ), row=2, col=1)
+        # Vol_MA line
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["Vol_MA"], name="Vol MA",
+            line=dict(color="#f0a500", width=1.0),
+            showlegend=False,
+        ), row=2, col=1)
+
+    # ── Panel 3: CCI ──
     cci_colors = ["#e8414e" if v > 100 else "#22cc66" if v < -100 else "#455a64"
                   for v in df["CCI"].fillna(0)]
     fig.add_trace(go.Bar(
         x=df.index, y=df["CCI"], marker_color=cci_colors, name="CCI", showlegend=False,
-    ), row=2, col=1)
-    for level, col in [(100, "rgba(232,65,78,0.35)"), (-100, "rgba(34,204,102,0.35)"), (0, "#37474f")]:
-        fig.add_hline(y=level, line_dash="dot", line_color=col, line_width=1, row=2, col=1)
-
-    # ── Panel 3: RSI ──
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["RSI"], name="RSI",
-        line=dict(color="#e040fb", width=1.5), showlegend=False,
     ), row=3, col=1)
-    for level, col in [(70, "rgba(232,65,78,0.35)"), (30, "rgba(34,204,102,0.35)"), (50, "#37474f")]:
+    for level, col in [(100, "rgba(232,65,78,0.35)"), (-100, "rgba(34,204,102,0.35)"), (0, "#37474f")]:
         fig.add_hline(y=level, line_dash="dot", line_color=col, line_width=1, row=3, col=1)
 
-    # ── Panel 4: MACD ──
+    # ── Panel 4: KD ──
+    if "K" in df.columns and "D" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["K"], name="K",
+            line=dict(color="#f0a500", width=1.5), showlegend=False,
+        ), row=4, col=1)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["D"], name="D",
+            line=dict(color="#2196f3", width=1.5), showlegend=False,
+        ), row=4, col=1)
+        # KD golden/dead cross markers
+        gc = df["KD_Golden"] if "KD_Golden" in df.columns else pd.Series(False, index=df.index)
+        dc = df["KD_Dead"]   if "KD_Dead"   in df.columns else pd.Series(False, index=df.index)
+        if gc.any():
+            fig.add_trace(go.Scatter(
+                x=df.index[gc], y=df.loc[gc, "K"],
+                mode="markers", marker=dict(symbol="triangle-up", color="#00ff88", size=9),
+                name="KD金叉", showlegend=False,
+            ), row=4, col=1)
+        if dc.any():
+            fig.add_trace(go.Scatter(
+                x=df.index[dc], y=df.loc[dc, "K"],
+                mode="markers", marker=dict(symbol="triangle-down", color="#ff3355", size=9),
+                name="KD死叉", showlegend=False,
+            ), row=4, col=1)
+        for level, col in [(80, "rgba(232,65,78,0.35)"), (20, "rgba(34,204,102,0.35)"), (50, "#37474f")]:
+            fig.add_hline(y=level, line_dash="dot", line_color=col, line_width=1, row=4, col=1)
+
+    # ── Panel 5: MACD ──
     hist_colors = ["#e8414e" if v >= 0 else "#22cc66" for v in df["MACD_Hist"].fillna(0)]
     fig.add_trace(go.Bar(
         x=df.index, y=df["MACD_Hist"], marker_color=hist_colors, name="Hist", showlegend=False,
-    ), row=4, col=1)
+    ), row=5, col=1)
     fig.add_trace(go.Scatter(
         x=df.index, y=df["MACD"], name="MACD",
         line=dict(color="#2196f3", width=1.3), showlegend=False,
-    ), row=4, col=1)
+    ), row=5, col=1)
     fig.add_trace(go.Scatter(
         x=df.index, y=df["MACD_Sig"], name="Signal",
         line=dict(color="#f0a500", width=1.3), showlegend=False,
-    ), row=4, col=1)
+    ), row=5, col=1)
 
     fig.update_layout(
         template="plotly_dark",
-        height=820,
+        height=920,
         paper_bgcolor="#0a0e1a",
         plot_bgcolor="#0d1226",
         xaxis_rangeslider_visible=False,
         margin=dict(l=55, r=20, t=20, b=10),
         font=dict(family="Space Mono, monospace", size=11, color="#8a9bb5"),
     )
-    for i in range(1, 5):
-        fig.update_yaxes(
-            gridcolor="#1a2a3a", zeroline=False,
-            tickfont=dict(size=10), row=i, col=1,
-        )
+    for i in range(1, 6):
+        fig.update_yaxes(gridcolor="#1a2a3a", zeroline=False,
+                         tickfont=dict(size=10), row=i, col=1)
     fig.update_xaxes(showgrid=False, rangeslider_visible=False)
 
-    # Panel labels
+    # Panel labels (y positions tuned to 5-panel layout)
     annotations = [
-        dict(x=0.01, y=1.0,  xref="paper", yref="paper", text=f"<b>{symbol}</b> · K線 / EMA / BB",  showarrow=False, font=dict(color="#8a9bb5", size=11)),
-        dict(x=0.01, y=0.53, xref="paper", yref="paper", text=f"CCI({p['cci_period']})",            showarrow=False, font=dict(color="#8a9bb5", size=11)),
-        dict(x=0.01, y=0.33, xref="paper", yref="paper", text=f"RSI({p['rsi_period']})",            showarrow=False, font=dict(color="#8a9bb5", size=11)),
-        dict(x=0.01, y=0.15, xref="paper", yref="paper", text="MACD",                               showarrow=False, font=dict(color="#8a9bb5", size=11)),
+        dict(x=0.01, y=1.00, xref="paper", yref="paper",
+             text=f"<b>{symbol}</b> · K線 / EMA / BB",
+             showarrow=False, font=dict(color="#8a9bb5", size=11)),
+        dict(x=0.01, y=0.59, xref="paper", yref="paper",
+             text="Volume / OBV",
+             showarrow=False, font=dict(color="#8a9bb5", size=11)),
+        dict(x=0.01, y=0.46, xref="paper", yref="paper",
+             text=f"CCI({p['cci_period']})",
+             showarrow=False, font=dict(color="#8a9bb5", size=11)),
+        dict(x=0.01, y=0.30, xref="paper", yref="paper",
+             text=f"KD({p.get('kd_period',9)})",
+             showarrow=False, font=dict(color="#8a9bb5", size=11)),
+        dict(x=0.01, y=0.14, xref="paper", yref="paper",
+             text="MACD",
+             showarrow=False, font=dict(color="#8a9bb5", size=11)),
     ]
     fig.update_layout(annotations=annotations)
     return fig
@@ -740,11 +893,23 @@ def watchlist_from_excel(file) -> list[str]:
 # ══════════════════════════════════════════════
 
 DEFAULT_WATCHLIST = [
-    # 上市 (TSE)
-    "2330","2317","2454","2382","3711",
-    "2308","2303","6505","2886","2891",
-    # 上櫃 (OTC/TWO) — add .TWO suffix so auto-detect works instantly
-    "6531.TWO","3105.TWO","5439.TWO","6510.TWO","3034.TWO",
+    # 上市 (TSE .TW) ─────────────────────────────
+    "2330",   # 台積電
+    "2317",   # 鴻海
+    "2454",   # 聯發科
+    "2382",   # 廣達
+    "3711",   # 日月光投控
+    "2308",   # 台達電
+    "2303",   # 聯電
+    "6505",   # 台塑化
+    "2886",   # 兆豐金
+    "2891",   # 中信金
+    # 上櫃 (OTC .TWO) ────────────────────────────
+    "3661.TWO",   # 世芯-KY
+    "6415.TWO",   # 矽力-KY
+    "5269.TWO",   # 祥碩
+    "4966.TWO",   # 譜瑞-KY
+    "6271.TWO",   # 同欣電
 ]
 
 
@@ -785,6 +950,17 @@ def main():
             macd_slow   = st.slider("慢線 EMA", 15, 40, 26, 1)
             macd_sig    = st.slider("訊號線",    3, 15,  9, 1)
 
+        with st.expander("📊 KD 隨機指標"):
+            kd_period    = st.slider("KD 週期 (RSV)",    5, 20,  9, 1)
+            kd_smooth    = st.slider("K 平滑",            1,  5,  3, 1)
+            kd_d         = st.slider("D 平滑",            1,  5,  3, 1)
+            kd_oversold  = st.slider("超賣線 (金叉門檻)", 10, 40, 20, 5)
+            kd_overbought= st.slider("超買線 (死叉門檻)", 60, 95, 80, 5)
+
+        with st.expander("📈 OBV 量能趨勢"):
+            obv_ma = st.slider("OBV 均線週期", 5, 40, 20, 1)
+            st.caption("OBV > OBV均線 = 量能支撐；用於確認突破真偽")
+
         with st.expander("🎯 均線 / 布林"):
             ema1      = st.slider("EMA 1",    5,  30, 10, 1)
             ema2      = st.slider("EMA 2",   10,  60, 20, 1)
@@ -817,7 +993,7 @@ def main():
             value="\n".join(st.session_state.watchlist),
             height=220,
         )
-        if st.button("✅ 更新清單", width='stretch'):
+        if st.button("✅ 更新清單", use_container_width=True):
             st.session_state.watchlist = [
                 s.strip() for s in wl_text.strip().splitlines() if s.strip()
             ]
@@ -833,7 +1009,7 @@ def main():
             data=to_excel(wl_export),
             file_name="watchlist.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width='stretch',
+            use_container_width=True,
         )
 
     # ── Pack params ─────────────────────────────
@@ -842,6 +1018,9 @@ def main():
         vol_multiplier=vol_multiplier, vol_strong_multiplier=vol_strong_mul,
         rsi_period=rsi_period, rsi_oversold=rsi_oversold, rsi_overbought=rsi_overbought,
         macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_sig,
+        kd_period=kd_period, kd_smooth=kd_smooth, kd_d=kd_d,
+        kd_oversold=kd_oversold, kd_overbought=kd_overbought,
+        obv_ma=obv_ma,
         ema1=ema1, ema2=ema2, bb_period=bb_period,
         use_divergence=use_divergence, div_lookback=div_lookback,
         holding_days=holding_days, profit_target=profit_target, stop_loss=stop_loss,
@@ -860,28 +1039,45 @@ def main():
     with tab_scan:
         c_hd, c_btn = st.columns([4, 1])
         c_hd.markdown("#### 📡 即時掃描 — 量價訊號")
-        run_scan = c_btn.button("🔄 掃描 + 更新報價", type="primary", width='stretch')
+        run_scan = c_btn.button("🔄 掃描 + 更新報價", type="primary", use_container_width=True)
+
+        # Sort mode selector
+        sort_mode = st.radio(
+            "排序方式",
+            ["📶 訊號強度", "🔥 動能分數", "📈 量比"],
+            horizontal=True, label_visibility="collapsed",
+        )
 
         if run_scan or not st.session_state.scan_rows:
-            rows     = []
-            prog     = st.progress(0, text="初始化...")
-            total_n  = len(st.session_state.watchlist)
+            rows      = []
+            failed    = []
+            wl        = st.session_state.watchlist
+            total_n   = max(len(wl), 1)   # guard against empty list
+            prog      = st.progress(0, text="初始化...")
 
-            for i, code in enumerate(st.session_state.watchlist):
+            for i, code in enumerate(wl):
                 prog.progress((i + 1) / total_n, text=f"分析 {code} ({i+1}/{total_n})…")
                 df_raw, err = fetch_data(code, data_period)
                 if df_raw is None or len(df_raw) < 60:
+                    failed.append(f"{code}: {err or '資料不足'}")
                     continue
 
-                df_sig = generate_signals(df_raw, params)
-                bt     = backtest(df_sig, holding_days, profit_target, stop_loss)
-                quote  = fetch_quote(code)
+                try:
+                    df_sig = generate_signals(df_raw, params)
+                except Exception as e:
+                    failed.append(f"{code}: 訊號計算失敗 ({e})")
+                    continue
+
+                bt    = backtest(df_sig, holding_days, profit_target, stop_loss)
+                quote = fetch_quote(code)
                 cn_name, mkt_label = fetch_name(code)
 
                 latest = df_sig.iloc[-1]
                 prev   = df_sig.iloc[-2]
                 price  = quote.get("price") or round(latest["Close"], 2)
-                chg_p  = quote.get("change_pct") or ((latest["Close"] - prev["Close"]) / prev["Close"] * 100)
+                chg_p  = quote.get("change_pct") or (
+                    (latest["Close"] - prev["Close"]) / (prev["Close"] + 1e-8) * 100
+                )
 
                 # Latest signal (past 3 bars)
                 recent_sig, recent_detail = "NEUTRAL", ""
@@ -893,47 +1089,66 @@ def main():
                         break
 
                 # ATR-based stop
-                atr_stop = round(price - latest["ATR"] * 1.5, 2) if pd.notna(latest["ATR"]) else "-"
+                atr_stop = round(price - latest["ATR"] * 1.5, 2) if pd.notna(latest.get("ATR")) else "-"
+                mom = round(latest.get("MomScore", 0), 1) if pd.notna(latest.get("MomScore", 0)) else 0.0
+                k_val = round(latest.get("K", np.nan), 1) if pd.notna(latest.get("K", np.nan)) else "-"
+                d_val = round(latest.get("D", np.nan), 1) if pd.notna(latest.get("D", np.nan)) else "-"
+                vol_r = round(latest["Vol_Ratio"], 2) if pd.notna(latest["Vol_Ratio"]) else 0.0
 
                 bare = code.upper().replace(".TW", "").replace(".TWO", "")
                 rows.append({
-                    "代號":     bare,
-                    "名稱":     cn_name,
-                    "市場":     mkt_label,
-                    "最新價":   price,
-                    "漲跌%":    round(chg_p, 2),
+                    "代號":       bare,
+                    "名稱":       cn_name,
+                    "市場":       mkt_label,
+                    "最新價":     price,
+                    "漲跌%":      round(chg_p, 2),
                     f"CCI({cci_period})": round(latest["CCI"], 1) if pd.notna(latest["CCI"]) else "-",
                     f"RSI({rsi_period})": round(latest["RSI"], 1) if pd.notna(latest["RSI"]) else "-",
-                    "量/均量":  round(latest["Vol_Ratio"], 2) if pd.notna(latest["Vol_Ratio"]) else "-",
-                    "訊號":     SIGNAL_LABEL.get(recent_sig, recent_sig),
-                    "說明":     recent_detail,
-                    "止損參考": atr_stop,
-                    "勝率%":    bt["win_rate"],
-                    "交易數":   bt["total"],
-                    "平均報酬%": bt["avg_return"],
-                    "_sig_key": recent_sig,
+                    "K值":        k_val,
+                    "D值":        d_val,
+                    "量/均量":    vol_r,
+                    "訊號":       SIGNAL_LABEL.get(recent_sig, recent_sig),
+                    "說明":       recent_detail,
+                    "動能分數":   mom,
+                    "止損參考":   atr_stop,
+                    "勝率%":      bt["win_rate"],
+                    "交易數":     bt["total"],
+                    "平均報酬%":  bt["avg_return"],
+                    "_sig_key":   recent_sig,
+                    "_mom":       mom,
+                    "_vol_r":     vol_r,
                 })
 
             prog.empty()
-            st.session_state.scan_rows = rows
+            st.session_state.scan_rows   = rows
+            st.session_state.scan_failed = failed
 
-        rows = st.session_state.scan_rows
+        rows   = st.session_state.scan_rows
+        failed = st.session_state.get("scan_failed", [])
+
         if rows:
-            # Sort by signal priority
-            rows_sorted = sorted(rows, key=lambda r: SIGNAL_ORDER.get(r["_sig_key"], 9))
-            df_display  = pd.DataFrame(rows_sorted)
+            # ── Sort ──
+            if sort_mode == "🔥 動能分數":
+                rows_sorted = sorted(rows, key=lambda r: -r["_mom"])
+            elif sort_mode == "📈 量比":
+                rows_sorted = sorted(rows, key=lambda r: -r["_vol_r"])
+            else:
+                rows_sorted = sorted(rows, key=lambda r: SIGNAL_ORDER.get(r["_sig_key"], 9))
 
-            # Drop internal key
-            show_cols = [c for c in df_display.columns if c != "_sig_key"]
+            df_display = pd.DataFrame(rows_sorted)
+            show_cols  = [c for c in df_display.columns if not c.startswith("_")]
             df_display = df_display[show_cols]
 
             st.dataframe(
                 df_display,
                 width='stretch',
-                height=520,
+                height=530,
                 column_config={
                     "漲跌%":    st.column_config.NumberColumn(format="%.2f%%"),
-                    "勝率%":    st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
+                    "動能分數": st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%.0f"),
+                    "勝率%":    st.column_config.ProgressColumn(
+                        min_value=0, max_value=100, format="%.1f%%"),
                     "平均報酬%": st.column_config.NumberColumn(format="%.2f%%"),
                 },
                 hide_index=True,
@@ -962,6 +1177,11 @@ def main():
                 file_name=f"sentinel_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
+            if failed:
+                with st.expander(f"⚠️ {len(failed)} 支股票載入失敗", expanded=False):
+                    for msg in failed:
+                        st.caption(f"• {msg}")
         else:
             st.info("按下「掃描 + 更新報價」開始分析自選股")
 
@@ -976,8 +1196,8 @@ def main():
             format_func=lambda x: x if x.upper().endswith((".TW", ".TWO"))
                                      else f"{x}.TW",
         )
-        custom_code = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 6531.TWO")
-        load_btn    = c3.button("📊 載入", type="primary", width='stretch')
+        custom_code = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 3661.TWO")
+        load_btn    = c3.button("📊 載入", type="primary", use_container_width=True)
 
         target = custom_code.strip() or sel_from_wl
 
@@ -1010,29 +1230,50 @@ def main():
                 )
 
                 # Metrics row
-                m1, m2, m3, m4, m5, m6 = st.columns(6)
+                m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
                 m1.metric("最新價", f"{price:.2f}",
                           f"{chg:+.2f}  ({chg_pct:+.2f}%)")
                 m2.metric(f"CCI({cci_period})",
                           f"{latest['CCI']:.1f}" if pd.notna(latest["CCI"]) else "-")
                 m3.metric(f"RSI({rsi_period})",
                           f"{latest['RSI']:.1f}" if pd.notna(latest["RSI"]) else "-")
-                m4.metric("量/均量",
+                k_now = latest.get("K", np.nan)
+                d_now = latest.get("D", np.nan)
+                m4.metric("K值", f"{k_now:.1f}" if pd.notna(k_now) else "-")
+                m5.metric("D值", f"{d_now:.1f}" if pd.notna(d_now) else "-")
+                m6.metric("量/均量",
                           f"{latest['Vol_Ratio']:.2f}x" if pd.notna(latest["Vol_Ratio"]) else "-")
-                m5.metric("訊號", SIGNAL_LABEL.get(latest["Signal"], "─"))
-                atr_val = latest["ATR"]
+                m7.metric("訊號", SIGNAL_LABEL.get(latest["Signal"], "─"))
+                atr_val  = latest.get("ATR", np.nan)
                 atr_stop = price - atr_val * 1.5 if pd.notna(atr_val) else None
-                m6.metric("ATR停損參考",
+                m8.metric("ATR停損參考",
                           f"{atr_stop:.2f}" if atr_stop else "-")
+
+                # Momentum score bar
+                mom_now = latest.get("MomScore", 0)
+                if pd.notna(mom_now):
+                    mom_color = "#00ff88" if mom_now >= 60 else "#f0a500" if mom_now >= 40 else "#ff3355"
+                    st.markdown(
+                        f'<div style="margin:6px 0 12px 0">'
+                        f'<span style="color:#5a8fb0;font-size:0.8rem;font-family:Space Mono,monospace">'
+                        f'動能分數 </span>'
+                        f'<span style="color:{mom_color};font-weight:700;font-size:1.1rem">{mom_now:.0f}</span>'
+                        f'<span style="color:#37474f;font-size:0.8rem"> / 100</span>'
+                        f'<div style="background:#1a2a3a;border-radius:4px;height:6px;margin-top:4px">'
+                        f'<div style="background:{mom_color};width:{min(mom_now,100):.0f}%;height:6px;border-radius:4px"></div>'
+                        f'</div></div>',
+                        unsafe_allow_html=True,
+                    )
 
                 # Chart
                 fig = build_chart(df_sig, target, params)
                 st.plotly_chart(fig, width='stretch')
 
                 # Recent signal log
-                sig_hist = df_sig[df_sig["Signal"] != "NEUTRAL"][
-                    ["Close", "Volume", "CCI", "RSI", "Vol_Ratio", "Signal", "Signal_Detail"]
-                ].tail(20)
+                sig_cols = ["Close", "Volume", "CCI", "RSI", "K", "D",
+                            "Vol_Ratio", "MomScore", "Signal", "Signal_Detail"]
+                available = [c for c in sig_cols if c in df_sig.columns]
+                sig_hist = df_sig[df_sig["Signal"] != "NEUTRAL"][available].tail(20)
                 if not sig_hist.empty:
                     st.markdown("##### 📋 近期訊號記錄（最新 20 筆）")
                     sig_hist = sig_hist.copy()
@@ -1053,8 +1294,8 @@ def main():
                                 format_func=lambda x: x if x.upper().endswith((".TW", ".TWO"))
                                                          else f"{x}.TW",
                                 key="bt_sym")
-        bt_cust = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 6531.TWO", key="bt_custom")
-        run_bt  = c3.button("🔬 執行", type="primary", width='stretch')
+        bt_cust = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 3661.TWO", key="bt_custom")
+        run_bt  = c3.button("🔬 執行", type="primary", use_container_width=True)
 
         bt_target = bt_cust.strip() or bt_sym
 
