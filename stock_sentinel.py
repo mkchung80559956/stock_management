@@ -485,33 +485,89 @@ def optimize_params(df: pd.DataFrame, base_p: dict) -> pd.DataFrame:
 # DATA FETCHING
 # ══════════════════════════════════════════════
 
+def _resolve_symbol(code: str) -> str:
+    """
+    Resolve a bare Taiwan stock code to its Yahoo Finance symbol.
+    If already has suffix (.TW / .TWO), return as-is.
+    Otherwise try .TW first; if that returns empty data try .TWO (OTC/櫃買).
+    """
+    if code.upper().endswith((".TW", ".TWO")):
+        return code
+    return code  # will be resolved with fallback in fetch_data
+
+
+@st.cache_data(ttl=60)
+def fetch_name(code: str) -> tuple[str, str]:
+    """Return (chinese_name, market_label) for a code.
+    market_label: '上市' | '上櫃' | ''
+    """
+    for suffix, label in [(".TW", "上市"), (".TWO", "上櫃")]:
+        sym = code if code.upper().endswith((".TW", ".TWO")) else code + suffix
+        try:
+            info = yf.Ticker(sym).fast_info
+            # fast_info doesn't have name; fall to .info for name
+            ticker_info = yf.Ticker(sym).info
+            name = (ticker_info.get("longName") or
+                    ticker_info.get("shortName") or "")
+            # Clean up common suffixes from yfinance
+            for strip in [" Co., Ltd.", " Co.,Ltd.", " Corporation",
+                           " Inc.", " Ltd.", "股份有限公司", "有限公司"]:
+                name = name.replace(strip, "")
+            if name:
+                return name.strip(), label
+        except Exception:
+            pass
+    return "", ""
+
+
 @st.cache_data(ttl=300)
 def fetch_data(symbol: str, period: str = "1y"):
-    sym = symbol if symbol.endswith((".TW", ".TWO")) else symbol + ".TW"
-    try:
-        df = yf.Ticker(sym).history(period=period)
-        if df.empty:
-            return None, f"{sym}: 無資料"
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return df, None
-    except Exception as e:
-        return None, str(e)
+    """Fetch OHLCV. Auto-tries .TW then .TWO for bare codes."""
+    if symbol.upper().endswith((".TW", ".TWO")):
+        candidates = [symbol]
+    else:
+        candidates = [symbol + ".TW", symbol + ".TWO"]
+
+    last_err = "無資料"
+    for sym in candidates:
+        try:
+            df = yf.Ticker(sym).history(period=period)
+            if df.empty:
+                last_err = f"{sym}: 無資料"
+                continue
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            if len(df) < 10:
+                last_err = f"{sym}: 資料不足"
+                continue
+            return df, None
+        except Exception as e:
+            last_err = str(e)
+    return None, last_err
 
 
 @st.cache_data(ttl=60)
 def fetch_quote(symbol: str) -> dict:
-    sym = symbol if symbol.endswith((".TW", ".TWO")) else symbol + ".TW"
-    try:
-        fi = yf.Ticker(sym).fast_info
-        last  = getattr(fi, "last_price",      None) or 0
-        prev  = getattr(fi, "previous_close",  None) or 0
-        chg   = last - prev
-        chg_p = chg / prev * 100 if prev else 0
-        return {"price": round(last, 2), "change": round(chg, 2),
-                "change_pct": round(chg_p, 2)}
-    except Exception:
-        return {}
+    """Fetch latest quote. Auto-tries .TW then .TWO."""
+    if symbol.upper().endswith((".TW", ".TWO")):
+        candidates = [symbol]
+    else:
+        candidates = [symbol + ".TW", symbol + ".TWO"]
+
+    for sym in candidates:
+        try:
+            fi = yf.Ticker(sym).fast_info
+            last = getattr(fi, "last_price",     None) or 0
+            prev = getattr(fi, "previous_close", None) or 0
+            if last == 0:
+                continue
+            chg   = last - prev
+            chg_p = chg / prev * 100 if prev else 0
+            return {"price": round(last, 2), "change": round(chg, 2),
+                    "change_pct": round(chg_p, 2)}
+        except Exception:
+            pass
+    return {}
 
 
 # ══════════════════════════════════════════════
@@ -594,7 +650,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
     fig.add_trace(go.Bar(
         x=df.index, y=df["CCI"], marker_color=cci_colors, name="CCI", showlegend=False,
     ), row=2, col=1)
-    for level, col in [(100, "#e8414e55"), (-100, "#22cc6655"), (0, "#37474f")]:
+    for level, col in [(100, "rgba(232,65,78,0.35)"), (-100, "rgba(34,204,102,0.35)"), (0, "#37474f")]:
         fig.add_hline(y=level, line_dash="dot", line_color=col, line_width=1, row=2, col=1)
 
     # ── Panel 3: RSI ──
@@ -602,7 +658,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
         x=df.index, y=df["RSI"], name="RSI",
         line=dict(color="#e040fb", width=1.5), showlegend=False,
     ), row=3, col=1)
-    for level, col in [(70, "#e8414e55"), (30, "#22cc6655"), (50, "#37474f")]:
+    for level, col in [(70, "rgba(232,65,78,0.35)"), (30, "rgba(34,204,102,0.35)"), (50, "#37474f")]:
         fig.add_hline(y=level, line_dash="dot", line_color=col, line_width=1, row=3, col=1)
 
     # ── Panel 4: MACD ──
@@ -684,8 +740,11 @@ def watchlist_from_excel(file) -> list[str]:
 # ══════════════════════════════════════════════
 
 DEFAULT_WATCHLIST = [
+    # 上市 (TSE)
     "2330","2317","2454","2382","3711",
     "2308","2303","6505","2886","2891",
+    # 上櫃 (OTC/TWO) — add .TWO suffix so auto-detect works instantly
+    "6531.TWO","3105.TWO","5439.TWO","6510.TWO","3034.TWO",
 ]
 
 
@@ -754,11 +813,11 @@ def main():
                 st.success(f"已匯入 {len(codes)} 支股票")
 
         wl_text = st.text_area(
-            "股票代號（每行一個，不需加 .TW）",
+            "股票代號（每行一個；上市不需加後綴，上櫃請加 .TWO）",
             value="\n".join(st.session_state.watchlist),
             height=220,
         )
-        if st.button("✅ 更新清單", use_container_width=True):
+        if st.button("✅ 更新清單", width='stretch'):
             st.session_state.watchlist = [
                 s.strip() for s in wl_text.strip().splitlines() if s.strip()
             ]
@@ -774,7 +833,7 @@ def main():
             data=to_excel(wl_export),
             file_name="watchlist.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width='stretch',
         )
 
     # ── Pack params ─────────────────────────────
@@ -801,7 +860,7 @@ def main():
     with tab_scan:
         c_hd, c_btn = st.columns([4, 1])
         c_hd.markdown("#### 📡 即時掃描 — 量價訊號")
-        run_scan = c_btn.button("🔄 掃描 + 更新報價", type="primary", use_container_width=True)
+        run_scan = c_btn.button("🔄 掃描 + 更新報價", type="primary", width='stretch')
 
         if run_scan or not st.session_state.scan_rows:
             rows     = []
@@ -817,6 +876,7 @@ def main():
                 df_sig = generate_signals(df_raw, params)
                 bt     = backtest(df_sig, holding_days, profit_target, stop_loss)
                 quote  = fetch_quote(code)
+                cn_name, mkt_label = fetch_name(code)
 
                 latest = df_sig.iloc[-1]
                 prev   = df_sig.iloc[-2]
@@ -835,8 +895,11 @@ def main():
                 # ATR-based stop
                 atr_stop = round(price - latest["ATR"] * 1.5, 2) if pd.notna(latest["ATR"]) else "-"
 
+                bare = code.upper().replace(".TW", "").replace(".TWO", "")
                 rows.append({
-                    "代號":     code,
+                    "代號":     bare,
+                    "名稱":     cn_name,
+                    "市場":     mkt_label,
                     "最新價":   price,
                     "漲跌%":    round(chg_p, 2),
                     f"CCI({cci_period})": round(latest["CCI"], 1) if pd.notna(latest["CCI"]) else "-",
@@ -866,7 +929,7 @@ def main():
 
             st.dataframe(
                 df_display,
-                use_container_width=True,
+                width='stretch',
                 height=520,
                 column_config={
                     "漲跌%":    st.column_config.NumberColumn(format="%.2f%%"),
@@ -910,10 +973,11 @@ def main():
         c1, c2, c3 = st.columns([3, 2, 1])
         sel_from_wl = c1.selectbox(
             "從自選股選擇", st.session_state.watchlist,
-            format_func=lambda x: f"{x}.TW",
+            format_func=lambda x: x if x.upper().endswith((".TW", ".TWO"))
+                                     else f"{x}.TW",
         )
-        custom_code = c2.text_input("或直接輸入代號", placeholder="e.g. 0050")
-        load_btn    = c3.button("📊 載入", type="primary", use_container_width=True)
+        custom_code = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 6531.TWO")
+        load_btn    = c3.button("📊 載入", type="primary", width='stretch')
 
         target = custom_code.strip() or sel_from_wl
 
@@ -927,10 +991,23 @@ def main():
                 latest = df_sig.iloc[-1]
                 prev   = df_sig.iloc[-2]
                 quote  = fetch_quote(target)
+                cn_name, mkt_label = fetch_name(target)
 
                 price   = quote.get("price")    or round(latest["Close"], 2)
                 chg     = quote.get("change")   or (latest["Close"] - prev["Close"])
                 chg_pct = quote.get("change_pct") or (chg / prev["Close"] * 100)
+
+                # Name / market banner
+                bare_t = target.upper().replace(".TW", "").replace(".TWO", "")
+                mkt_color = "#22cc66" if mkt_label == "上櫃" else "#00aaff"
+                st.markdown(
+                    f'<span style="font-size:1.1rem;font-weight:700;color:#e8f4fd">'
+                    f'{bare_t}</span> '
+                    f'<span style="background:{mkt_color};color:#000;padding:2px 8px;'
+                    f'border-radius:4px;font-size:0.75rem;font-weight:700">{mkt_label}</span> '
+                    f'<span style="color:#8a9bb5;font-size:0.95rem">{cn_name}</span>',
+                    unsafe_allow_html=True,
+                )
 
                 # Metrics row
                 m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -950,7 +1027,7 @@ def main():
 
                 # Chart
                 fig = build_chart(df_sig, target, params)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
                 # Recent signal log
                 sig_hist = df_sig[df_sig["Signal"] != "NEUTRAL"][
@@ -963,7 +1040,7 @@ def main():
                         lambda x: SIGNAL_LABEL.get(x, x)
                     )
                     sig_hist.index = sig_hist.index.date
-                    st.dataframe(sig_hist, use_container_width=True)
+                    st.dataframe(sig_hist, width='stretch')
 
     # ─────────────────────────────────────────
     # TAB 3  回測 & 優化
@@ -973,9 +1050,11 @@ def main():
 
         c1, c2, c3 = st.columns([3, 2, 1])
         bt_sym  = c1.selectbox("選擇回測標的", st.session_state.watchlist,
-                                format_func=lambda x: f"{x}.TW", key="bt_sym")
-        bt_cust = c2.text_input("或直接輸入代號", key="bt_custom")
-        run_bt  = c3.button("🔬 執行", type="primary", use_container_width=True)
+                                format_func=lambda x: x if x.upper().endswith((".TW", ".TWO"))
+                                                         else f"{x}.TW",
+                                key="bt_sym")
+        bt_cust = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 6531.TWO", key="bt_custom")
+        run_bt  = c3.button("🔬 執行", type="primary", width='stretch')
 
         bt_target = bt_cust.strip() or bt_sym
 
@@ -1003,10 +1082,10 @@ def main():
                 if not bt["trades"].empty:
                     sig_cnt = bt["trades"].groupby("訊號")["結果"].value_counts().unstack(fill_value=0)
                     st.markdown("##### 各訊號勝率分布")
-                    st.dataframe(sig_cnt, use_container_width=True)
+                    st.dataframe(sig_cnt, width='stretch')
 
                     with st.expander("📋 完整交易明細"):
-                        st.dataframe(bt["trades"], use_container_width=True, height=350)
+                        st.dataframe(bt["trades"], width='stretch', height=350)
                         dl = to_excel(bt["trades"])
                         st.download_button(
                             "📤 匯出交易明細 Excel", data=dl,
@@ -1027,7 +1106,7 @@ def main():
                 else:
                     st.dataframe(
                         opt_df.head(10),
-                        use_container_width=True,
+                        width='stretch',
                         column_config={
                             "勝率%": st.column_config.ProgressColumn(
                                 min_value=0, max_value=100, format="%.1f%%"
