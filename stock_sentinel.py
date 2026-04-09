@@ -18,7 +18,23 @@ import logging
 # ── Silence noisy library output in Streamlit Cloud logs ──
 warnings.filterwarnings("ignore")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("yfinance.base").setLevel(logging.CRITICAL)
+logging.getLogger("yfinance.utils").setLevel(logging.CRITICAL)
 logging.getLogger("peewee").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
+# Suppress the "$XXX: possibly delisted" stderr print that yfinance emits
+# by monkey-patching the print function in yfinance's namespace at import time
+import builtins as _builtins
+_orig_print = _builtins.print
+
+def _quiet_print(*args, **kwargs):
+    msg = " ".join(str(a) for a in args)
+    if "possibly delisted" in msg or "No data found" in msg or "period=" in msg:
+        return
+    _orig_print(*args, **kwargs)
+
+_builtins.print = _quiet_print
 
 # ──────────────────────────────────────────────
 # PAGE CONFIG
@@ -27,7 +43,7 @@ st.set_page_config(
     page_title="Sentinel Pro 🛡️",
     page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",   # mobile-friendly: sidebar hidden by default
 )
 
 # ──────────────────────────────────────────────
@@ -37,94 +53,119 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Noto+Sans+TC:wght@400;600&display=swap');
 
-html, body, [class*="css"] {
-    font-family: 'Noto Sans TC', sans-serif;
-}
+html, body, [class*="css"] { font-family: 'Noto Sans TC', sans-serif; }
 .stApp { background-color: #0a0e1a; }
 
+/* ── Header ── */
 .sentinel-header {
     background: linear-gradient(135deg, #0d1226 0%, #141d3a 50%, #0d1226 100%);
     border: 1px solid #1e3a5f;
-    border-radius: 12px;
-    padding: 20px 28px;
-    margin-bottom: 20px;
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-bottom: 14px;
     position: relative;
     overflow: hidden;
 }
 .sentinel-header::before {
     content: '';
     position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 2px;
+    top: 0; left: 0; right: 0; height: 2px;
     background: linear-gradient(90deg, transparent, #00d4ff, #0077ff, #00d4ff, transparent);
 }
 .sentinel-title {
     font-family: 'Space Mono', monospace;
-    font-size: 1.9rem;
+    font-size: 1.3rem;
     font-weight: 700;
     color: #e8f4fd;
     margin: 0;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.03em;
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 .sentinel-sub {
     color: #5a8fb0;
-    font-size: 0.85rem;
-    margin-top: 4px;
+    font-size: 0.75rem;
+    margin-top: 3px;
     font-family: 'Space Mono', monospace;
 }
 
-.sig-strong-buy   { color: #00ff88; font-weight: 700; font-size: 0.95rem; }
-.sig-buy          { color: #44ddff; font-weight: 600; }
-.sig-breakout     { color: #ff9900; font-weight: 700; font-size: 0.95rem; }
-.sig-fake         { color: #cc44ff; font-weight: 600; }
-.sig-strong-sell  { color: #ff3355; font-weight: 700; font-size: 0.95rem; }
-.sig-sell         { color: #ff8866; font-weight: 600; }
-.sig-watch        { color: #ffee44; font-weight: 500; }
-.sig-neutral      { color: #445566; }
+/* ── Signal text colours ── */
+.sig-strong-buy  { color: #00ff88; font-weight: 700; }
+.sig-buy         { color: #44ddff; font-weight: 600; }
+.sig-breakout    { color: #ff9900; font-weight: 700; }
+.sig-fake        { color: #cc44ff; font-weight: 600; }
+.sig-strong-sell { color: #ff3355; font-weight: 700; }
+.sig-sell        { color: #ff8866; font-weight: 600; }
+.sig-watch       { color: #ffee44; font-weight: 500; }
+.sig-neutral     { color: #445566; }
 
-.metric-box {
-    background: #0d1a2d;
-    border: 1px solid #1a3050;
-    border-radius: 8px;
-    padding: 12px 16px;
-    text-align: center;
-}
-.metric-label { color: #5a8fb0; font-size: 0.75rem; font-family: 'Space Mono', monospace; }
-.metric-value { color: #e8f4fd; font-size: 1.4rem; font-weight: 600; font-family: 'Space Mono', monospace; margin-top: 2px; }
-.metric-delta { font-size: 0.8rem; margin-top: 2px; }
-.metric-delta.pos { color: #ff4455; }
-.metric-delta.neg { color: #00cc66; }
-
+/* ── Signal legend ── */
 .signal-legend {
     background: #0d1a2d;
     border: 1px solid #1a3050;
     border-radius: 8px;
-    padding: 12px 16px;
-    font-size: 0.8rem;
-    line-height: 2;
+    padding: 10px 14px;
+    font-size: 0.75rem;
+    line-height: 1.9;
 }
 
+/* ── Optimisation card ── */
 .opt-card {
     background: linear-gradient(135deg, #0d2040, #0a1628);
     border: 1px solid #0066cc;
     border-radius: 10px;
-    padding: 16px 20px;
-    margin-top: 12px;
+    padding: 14px 18px;
+    margin-top: 10px;
 }
 .opt-card h4 { color: #00aaff; font-family: 'Space Mono', monospace; margin: 0 0 8px 0; }
 
+/* ── Tabs ── */
 div[data-testid="stTabs"] button {
     font-family: 'Space Mono', monospace;
-    font-size: 0.85rem;
+    font-size: 0.8rem;
     color: #5a8fb0;
+    padding: 6px 10px;
 }
 div[data-testid="stTabs"] button[aria-selected="true"] {
     color: #00d4ff;
     border-bottom-color: #00d4ff;
 }
 
+/* ── Dataframe ── */
 .stDataFrame { border-radius: 8px; overflow: hidden; }
-div[data-testid="metric-container"] { background: #0d1a2d; border-radius: 8px; padding: 12px; border: 1px solid #1a3050; }
+.stDataFrame td, .stDataFrame th { font-size: 0.78rem !important; }
+
+/* ── Metrics ── */
+div[data-testid="metric-container"] {
+    background: #0d1a2d;
+    border-radius: 8px;
+    padding: 8px 10px;
+    border: 1px solid #1a3050;
+}
+div[data-testid="metric-container"] label { font-size: 0.72rem !important; }
+div[data-testid="metric-container"] div[data-testid="stMetricValue"] { font-size: 1.05rem !important; }
+
+/* ── Buttons — larger touch targets on mobile ── */
+.stButton > button {
+    min-height: 42px;
+    font-size: 0.88rem;
+}
+.stDownloadButton > button { min-height: 38px; }
+
+/* ── Sidebar compact ── */
+section[data-testid="stSidebar"] { min-width: 240px !important; }
+section[data-testid="stSidebar"] .stSlider { padding-top: 4px !important; }
+section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
+
+/* ── Mobile overrides ── */
+@media (max-width: 768px) {
+    .sentinel-title { font-size: 1.1rem; }
+    .sentinel-sub   { font-size: 0.68rem; }
+    .stDataFrame td, .stDataFrame th { font-size: 0.72rem !important; }
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] { font-size: 0.95rem !important; }
+    .stButton > button { min-height: 46px; font-size: 0.92rem; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -308,22 +349,102 @@ def detect_bearish_divergence(price, cci, lookback=30):
 
 SIGNAL_ORDER = {
     "BREAKOUT_BUY": 0, "STRONG_BUY": 1, "BUY": 2, "DIV_BUY": 2,
-    "WATCH": 5, "NEUTRAL": 6,
-    "DIV_SELL": 3, "SELL": 3, "STRONG_SELL": 4, "FAKE_BREAKOUT": 5,
+    "KD_GOLDEN_ZONE": 2,
+    "BULL_ZONE": 3, "RISING": 4,
+    "WATCH": 7, "NEUTRAL": 8,
+    "FALLING": 5, "BEAR_ZONE": 5, "KD_HIGH": 6,
+    "DIV_SELL": 4, "SELL": 5, "STRONG_SELL": 4, "FAKE_BREAKOUT": 6,
 }
 
 SIGNAL_LABEL = {
-    "BREAKOUT_BUY":  "🟠 噴發買",
-    "STRONG_BUY":    "🟢 強買",
-    "BUY":           "🔵 買入",
-    "DIV_BUY":       "🟢 底背離",
-    "WATCH":         "⚪ 觀望",
-    "NEUTRAL":       "─",
-    "DIV_SELL":      "🔴 頂背離",
-    "SELL":          "🟡 賣出",
-    "STRONG_SELL":   "🔴 強賣",
-    "FAKE_BREAKOUT": "🟣 誘多",
+    "BREAKOUT_BUY":   "🟠 噴發買",
+    "STRONG_BUY":     "🟢 強買",
+    "BUY":            "🔵 買入",
+    "DIV_BUY":        "🟢 底背離",
+    "KD_GOLDEN_ZONE": "🟢 KD金叉",
+    "BULL_ZONE":      "🟡 強勢區",
+    "RISING":         "🔼 上升中",
+    "WATCH":          "⚪ 觀望",
+    "NEUTRAL":        "─",
+    "FALLING":        "🔽 下跌中",
+    "BEAR_ZONE":      "🔵 超賣區",
+    "KD_HIGH":        "🟡 KD高檔",
+    "DIV_SELL":       "🔴 頂背離",
+    "SELL":           "🟡 賣出",
+    "STRONG_SELL":    "🔴 強賣",
+    "FAKE_BREAKOUT":  "🟣 誘多",
 }
+
+# ── Map signal → concise zone for mobile display ──
+SIGNAL_ZONE = {
+    "BREAKOUT_BUY": "買", "STRONG_BUY": "買", "BUY": "買",
+    "DIV_BUY": "買", "KD_GOLDEN_ZONE": "買",
+    "BULL_ZONE": "持", "RISING": "漲",
+    "WATCH": "觀", "NEUTRAL": "–",
+    "FALLING": "跌", "BEAR_ZONE": "超賣",
+    "KD_HIGH": "高", "DIV_SELL": "賣",
+    "SELL": "賣", "STRONG_SELL": "賣", "FAKE_BREAKOUT": "誘",
+}
+
+
+def get_scan_signal(df_sig: pd.DataFrame, lookback: int = 5) -> tuple[str, str]:
+    """
+    Returns (signal_key, detail) for the scan table.
+    Priority:
+      1. Any non-neutral crossover event in the last `lookback` bars
+      2. Current zone state (always produces a meaningful label)
+    """
+    # ── 1. Recent event signal ──
+    for j in range(min(lookback, len(df_sig))):
+        s = df_sig.iloc[-(j + 1)]["Signal"]
+        if s not in ("NEUTRAL", "WATCH"):
+            return s, df_sig.iloc[-(j + 1)]["Signal_Detail"]
+        if s == "WATCH":   # return watch but keep scanning for stronger
+            pass
+
+    # ── 2. Zone state fallback ──
+    latest = df_sig.iloc[-1]
+    cci = float(latest.get("CCI", 0) or 0)
+    k   = float(latest.get("K",  50) or 50)
+    d   = float(latest.get("D",  50) or 50)
+    rsi = float(latest.get("RSI", 50) or 50)
+    obv_up = bool(latest.get("OBV_Rising", False))
+    vol_r  = float(latest.get("Vol_Ratio", 1) or 1)
+
+    # Strong bull zone
+    if cci > 100:
+        support = "OBV支撐" if obv_up else "OBV未支撐"
+        return "BULL_ZONE", f"強勢區：CCI {cci:.0f}>+100，{support}"
+
+    # Oversold zone
+    if cci < -100:
+        kd_txt = f"K={k:.0f}" + ("低檔" if k < 30 else "")
+        return "BEAR_ZONE", f"超賣區：CCI {cci:.0f}<-100，{kd_txt}（關注底部）"
+
+    # KD golden cross recently (look back 3 bars on KD_Golden column)
+    if "KD_Golden" in df_sig.columns:
+        for j in range(min(3, len(df_sig))):
+            if bool(df_sig.iloc[-(j + 1)].get("KD_Golden", False)):
+                return "KD_GOLDEN_ZONE", f"KD低檔金叉：K={k:.0f}，近{j+1}日發生"
+
+    # KD high zone
+    if k > 75 and k < d:
+        return "KD_HIGH", f"KD高檔轉弱：K={k:.0f}，K下穿D"
+
+    # Rising trend: CCI above 0, K above D
+    if cci > 0 and k > d and rsi > 50:
+        return "RISING", f"上升中：CCI {cci:.0f}，K>{d:.0f}，RSI={rsi:.0f}"
+
+    # Falling trend
+    if cci < 0 and k < d and rsi < 50:
+        return "FALLING", f"下跌中：CCI {cci:.0f}，K<{d:.0f}，RSI={rsi:.0f}"
+
+    # Watch: weak bounce (CCI crossed -100 but low volume earlier)
+    for j in range(min(lookback, len(df_sig))):
+        if df_sig.iloc[-(j + 1)]["Signal"] == "WATCH":
+            return "WATCH", df_sig.iloc[-(j + 1)]["Signal_Detail"]
+
+    return "NEUTRAL", "整理中"
 
 
 def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
@@ -566,23 +687,12 @@ def optimize_params(df: pd.DataFrame, base_p: dict) -> pd.DataFrame:
 # DATA FETCHING
 # ══════════════════════════════════════════════
 
-def _resolve_symbol(code: str) -> str:
-    """
-    Resolve a bare Taiwan stock code to its Yahoo Finance symbol.
-    If already has suffix (.TW / .TWO), return as-is.
-    Otherwise try .TW first; if that returns empty data try .TWO (OTC/櫃買).
-    """
-    if code.upper().endswith((".TW", ".TWO")):
-        return code
-    return code  # will be resolved with fallback in fetch_data
-
-
 @st.cache_data(ttl=3600)
 def fetch_name(code: str) -> tuple[str, str]:
     """
-    Return (display_name, market_label).
-    Uses fast_info.display_name when available (yfinance 1.2+),
-    falls back to info['shortName'] if needed.
+    Return (display_name, market_label). Fast-path only — no slow .info call.
+    Uses fast_info.display_name (yfinance 1.2+). Falls back to empty string
+    rather than making a slow HTTP request during scan.
     market_label: '上市' | '上櫃' | ''
     """
     if code.upper().endswith(".TWO"):
@@ -597,12 +707,13 @@ def fetch_name(code: str) -> tuple[str, str]:
 
     for sym, label in candidates:
         try:
-            t = yf.Ticker(sym)
-            # fast_info.display_name is cheapest (no extra HTTP call)
+            t    = yf.Ticker(sym)
             name = getattr(t.fast_info, "display_name", None) or ""
             if not name:
-                # fallback: one HTTP call
-                name = (t.info.get("shortName") or t.info.get("longName") or "")
+                # One additional attempt via .info but with a hard guard
+                info = t.info
+                if info and isinstance(info, dict) and len(info) > 5:
+                    name = (info.get("shortName") or info.get("longName") or "")
             for s in _STRIP:
                 name = name.replace(s, "")
             name = name.strip()
@@ -624,14 +735,7 @@ def fetch_data(symbol: str, period: str = "1y"):
     last_err = "無資料"
     for sym in candidates:
         try:
-            import io as _io, sys as _sys
-            _old_err = _sys.stderr
-            _sys.stderr = _io.StringIO()          # swallow "possibly delisted" spam
-            try:
-                df = yf.Ticker(sym).history(period=period)
-            finally:
-                _sys.stderr = _old_err
-
+            df = yf.Ticker(sym).history(period=period)  # stderr noise suppressed by monkey-patch
             if df.empty:
                 last_err = f"{sym}: 無資料"
                 continue
@@ -821,7 +925,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
 
     fig.update_layout(
         template="plotly_dark",
-        height=920,
+        height=820,
         paper_bgcolor="#0a0e1a",
         plot_bgcolor="#0d1226",
         xaxis_rangeslider_visible=False,
@@ -917,8 +1021,8 @@ def main():
     # ── Header ──────────────────────────────────
     st.markdown("""
     <div class="sentinel-header">
-      <div class="sentinel-title">🛡️ Sentinel Pro v2.0</div>
-      <div class="sentinel-sub">台股多股掃描器 ｜ CCI × 成交量 × 價格行為 ｜ 量價策略訊號系統</div>
+      <div class="sentinel-title">🛡️ Sentinel Pro <span style="color:#00d4ff;font-size:0.9em">v2.1</span></div>
+      <div class="sentinel-sub">台股掃描器 · CCI × KD × OBV × 成交量</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -993,7 +1097,7 @@ def main():
             value="\n".join(st.session_state.watchlist),
             height=220,
         )
-        if st.button("✅ 更新清單", use_container_width=True):
+        if st.button("✅ 更新清單", width='stretch'):
             st.session_state.watchlist = [
                 s.strip() for s in wl_text.strip().splitlines() if s.strip()
             ]
@@ -1009,7 +1113,7 @@ def main():
             data=to_excel(wl_export),
             file_name="watchlist.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width='stretch',
         )
 
     # ── Pack params ─────────────────────────────
@@ -1039,7 +1143,7 @@ def main():
     with tab_scan:
         c_hd, c_btn = st.columns([4, 1])
         c_hd.markdown("#### 📡 即時掃描 — 量價訊號")
-        run_scan = c_btn.button("🔄 掃描 + 更新報價", type="primary", use_container_width=True)
+        run_scan = c_btn.button("🔄 掃描", type="primary", width='stretch')
 
         # Sort mode selector
         sort_mode = st.radio(
@@ -1052,7 +1156,7 @@ def main():
             rows      = []
             failed    = []
             wl        = st.session_state.watchlist
-            total_n   = max(len(wl), 1)   # guard against empty list
+            total_n   = max(len(wl), 1)
             prog      = st.progress(0, text="初始化...")
 
             for i, code in enumerate(wl):
@@ -1079,14 +1183,8 @@ def main():
                     (latest["Close"] - prev["Close"]) / (prev["Close"] + 1e-8) * 100
                 )
 
-                # Latest signal (past 3 bars)
-                recent_sig, recent_detail = "NEUTRAL", ""
-                for j in range(min(3, len(df_sig))):
-                    s = df_sig.iloc[-(j + 1)]["Signal"]
-                    if s != "NEUTRAL":
-                        recent_sig    = s
-                        recent_detail = df_sig.iloc[-(j + 1)]["Signal_Detail"]
-                        break
+                # ── Signal: event in last 5 bars OR current zone ──
+                recent_sig, recent_detail = get_scan_signal(df_sig, lookback=5)
 
                 # ATR-based stop
                 atr_stop = round(price - latest["ATR"] * 1.5, 2) if pd.notna(latest.get("ATR")) else "-"
@@ -1098,21 +1196,20 @@ def main():
                 bare = code.upper().replace(".TW", "").replace(".TWO", "")
                 rows.append({
                     "代號":       bare,
-                    "名稱":       cn_name,
-                    "市場":       mkt_label,
+                    "訊號":       SIGNAL_LABEL.get(recent_sig, recent_sig),
+                    "動能":       mom,
                     "最新價":     price,
                     "漲跌%":      round(chg_p, 2),
+                    "名稱":       cn_name,
+                    "市場":       mkt_label,
                     f"CCI({cci_period})": round(latest["CCI"], 1) if pd.notna(latest["CCI"]) else "-",
                     f"RSI({rsi_period})": round(latest["RSI"], 1) if pd.notna(latest["RSI"]) else "-",
                     "K值":        k_val,
                     "D值":        d_val,
                     "量/均量":    vol_r,
-                    "訊號":       SIGNAL_LABEL.get(recent_sig, recent_sig),
                     "說明":       recent_detail,
-                    "動能分數":   mom,
                     "止損參考":   atr_stop,
                     "勝率%":      bt["win_rate"],
-                    "交易數":     bt["total"],
                     "平均報酬%":  bt["avg_return"],
                     "_sig_key":   recent_sig,
                     "_mom":       mom,
@@ -1120,11 +1217,13 @@ def main():
                 })
 
             prog.empty()
-            st.session_state.scan_rows   = rows
-            st.session_state.scan_failed = failed
+            st.session_state.scan_rows      = rows
+            st.session_state.scan_failed    = failed
+            st.session_state.scan_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        rows   = st.session_state.scan_rows
-        failed = st.session_state.get("scan_failed", [])
+        rows      = st.session_state.scan_rows
+        failed    = st.session_state.get("scan_failed", [])
+        scan_time = st.session_state.get("scan_timestamp", "")
 
         if rows:
             # ── Sort ──
@@ -1139,15 +1238,18 @@ def main():
             show_cols  = [c for c in df_display.columns if not c.startswith("_")]
             df_display = df_display[show_cols]
 
+            if scan_time:
+                st.caption(f"🕐 最後更新：{scan_time}　共 {len(rows)} 支")
+
             st.dataframe(
                 df_display,
                 width='stretch',
                 height=530,
                 column_config={
-                    "漲跌%":    st.column_config.NumberColumn(format="%.2f%%"),
-                    "動能分數": st.column_config.ProgressColumn(
+                    "漲跌%":  st.column_config.NumberColumn(format="%.2f%%"),
+                    "動能":   st.column_config.ProgressColumn(
                         min_value=0, max_value=100, format="%.0f"),
-                    "勝率%":    st.column_config.ProgressColumn(
+                    "勝率%":  st.column_config.ProgressColumn(
                         min_value=0, max_value=100, format="%.1f%%"),
                     "平均報酬%": st.column_config.NumberColumn(format="%.2f%%"),
                 },
@@ -1157,14 +1259,23 @@ def main():
             # Signal legend
             st.markdown("""
             <div class="signal-legend">
-            🟠 <b>噴發買</b>：CCI突破+100 + 強放量（追強訊號）　
-            🟢 <b>強買</b>：CCI突破-100 + 放量 + 止跌K　
-            🔵 <b>買入</b>：CCI突破0軸 + 放量　
-            🟢 <b>底背離</b>：股價創低但CCI抬高 + 放量　
-            ⚪ <b>觀望</b>：CCI突破-100 but 縮量（弱反彈）　
-            🔴 <b>強賣</b>：CCI跌破+100 + 量縮/黑K　
-            🟡 <b>賣出</b>：RSI超買+價漲量縮+上影線　
-            🟣 <b>誘多</b>：CCI突破+100 but 量不配合
+            <b>買入訊號：</b>
+            🟠 <b>噴發買</b> CCI突破+100強放量　
+            🟢 <b>強買</b> CCI突破-100放量止跌K　
+            🔵 <b>買入</b> CCI突破0軸放量　
+            🟢 <b>底背離/KD金叉</b> 底部確認<br>
+            <b>持倉/觀察：</b>
+            🟡 <b>強勢區</b> CCI&gt;100持續強勢　
+            🔼 <b>上升中</b> CCI&gt;0且K&gt;D　
+            ⚪ <b>觀望</b> CCI突破-100量縮弱反彈<br>
+            <b>賣出訊號：</b>
+            🔴 <b>強賣</b> CCI跌破+100或KD高檔死叉　
+            🟡 <b>賣出</b> RSI超買量縮上影線　
+            🔴 <b>頂背離</b> 量縮動能耗盡　
+            🟣 <b>誘多</b> CCI突破+100量不配合<br>
+            <b>弱勢：</b>
+            🔽 <b>下跌中</b> CCI&lt;0且K&lt;D　
+            🔵 <b>超賣區</b> CCI&lt;-100（關注底部）
             </div>
             """, unsafe_allow_html=True)
 
@@ -1183,13 +1294,23 @@ def main():
                     for msg in failed:
                         st.caption(f"• {msg}")
         else:
-            st.info("按下「掃描 + 更新報價」開始分析自選股")
+            st.markdown("""
+            <div style="text-align:center;padding:40px 20px;color:#37474f">
+              <div style="font-size:2.5rem">📡</div>
+              <div style="font-size:1rem;margin-top:8px;color:#5a8fb0">
+                點擊右上角「🔄 掃描」按鈕開始分析自選股
+              </div>
+              <div style="font-size:0.78rem;margin-top:6px;color:#37474f">
+                側欄可調整策略參數 · 支援 Excel 匯入自選股清單
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
 
     # ─────────────────────────────────────────
     # TAB 2  個股分析
     # ─────────────────────────────────────────
     with tab_drill:
-        st.markdown("#### 🔬 個股深度分析（130 根 K 線）")
+        st.markdown("#### 🔬 個股深度分析")
         c1, c2, c3 = st.columns([3, 2, 1])
         sel_from_wl = c1.selectbox(
             "從自選股選擇", st.session_state.watchlist,
@@ -1197,7 +1318,7 @@ def main():
                                      else f"{x}.TW",
         )
         custom_code = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 3661.TWO")
-        load_btn    = c3.button("📊 載入", type="primary", use_container_width=True)
+        load_btn    = c3.button("📊 載入", type="primary", width='stretch')
 
         target = custom_code.strip() or sel_from_wl
 
@@ -1207,79 +1328,88 @@ def main():
             if df_raw is None:
                 st.error(f"無法取得資料：{err}")
             else:
-                df_sig = generate_signals(df_raw, params)
-                latest = df_sig.iloc[-1]
-                prev   = df_sig.iloc[-2]
-                quote  = fetch_quote(target)
+                df_sig  = generate_signals(df_raw, params)
+                latest  = df_sig.iloc[-1]
+                prev    = df_sig.iloc[-2]
+                quote   = fetch_quote(target)
                 cn_name, mkt_label = fetch_name(target)
 
                 price   = quote.get("price")    or round(latest["Close"], 2)
-                chg     = quote.get("change")   or (latest["Close"] - prev["Close"])
-                chg_pct = quote.get("change_pct") or (chg / prev["Close"] * 100)
+                chg     = quote.get("change")   or float(latest["Close"] - prev["Close"])
+                chg_pct = quote.get("change_pct") or float(chg / (prev["Close"] + 1e-8) * 100)
 
-                # Name / market banner
-                bare_t = target.upper().replace(".TW", "").replace(".TWO", "")
+                # ── Name banner ──
+                bare_t    = target.upper().replace(".TW", "").replace(".TWO", "")
                 mkt_color = "#22cc66" if mkt_label == "上櫃" else "#00aaff"
+                chg_color = "#e8414e" if chg >= 0 else "#22cc66"
                 st.markdown(
-                    f'<span style="font-size:1.1rem;font-weight:700;color:#e8f4fd">'
-                    f'{bare_t}</span> '
-                    f'<span style="background:{mkt_color};color:#000;padding:2px 8px;'
-                    f'border-radius:4px;font-size:0.75rem;font-weight:700">{mkt_label}</span> '
-                    f'<span style="color:#8a9bb5;font-size:0.95rem">{cn_name}</span>',
+                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">'
+                    f'<span style="font-size:1.3rem;font-weight:700;color:#e8f4fd;font-family:Space Mono,monospace">{bare_t}</span>'
+                    f'<span style="background:{mkt_color};color:#000;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700">{mkt_label}</span>'
+                    f'<span style="color:#8a9bb5;font-size:0.9rem">{cn_name}</span>'
+                    f'<span style="color:{chg_color};font-size:1.1rem;font-weight:700;margin-left:auto">'
+                    f'{price:.2f}　<span style="font-size:0.85rem">{chg:+.2f} ({chg_pct:+.2f}%)</span></span>'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
 
-                # Metrics row
-                m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
-                m1.metric("最新價", f"{price:.2f}",
-                          f"{chg:+.2f}  ({chg_pct:+.2f}%)")
-                m2.metric(f"CCI({cci_period})",
-                          f"{latest['CCI']:.1f}" if pd.notna(latest["CCI"]) else "-")
-                m3.metric(f"RSI({rsi_period})",
-                          f"{latest['RSI']:.1f}" if pd.notna(latest["RSI"]) else "-")
-                k_now = latest.get("K", np.nan)
-                d_now = latest.get("D", np.nan)
-                m4.metric("K值", f"{k_now:.1f}" if pd.notna(k_now) else "-")
-                m5.metric("D值", f"{d_now:.1f}" if pd.notna(d_now) else "-")
-                m6.metric("量/均量",
-                          f"{latest['Vol_Ratio']:.2f}x" if pd.notna(latest["Vol_Ratio"]) else "-")
-                m7.metric("訊號", SIGNAL_LABEL.get(latest["Signal"], "─"))
-                atr_val  = latest.get("ATR", np.nan)
-                atr_stop = price - atr_val * 1.5 if pd.notna(atr_val) else None
-                m8.metric("ATR停損參考",
-                          f"{atr_stop:.2f}" if atr_stop else "-")
+                # ── Scan signal for this stock ──
+                scan_sig, scan_detail = get_scan_signal(df_sig, lookback=5)
 
-                # Momentum score bar
-                mom_now = latest.get("MomScore", 0)
-                if pd.notna(mom_now):
-                    mom_color = "#00ff88" if mom_now >= 60 else "#f0a500" if mom_now >= 40 else "#ff3355"
-                    st.markdown(
-                        f'<div style="margin:6px 0 12px 0">'
-                        f'<span style="color:#5a8fb0;font-size:0.8rem;font-family:Space Mono,monospace">'
-                        f'動能分數 </span>'
-                        f'<span style="color:{mom_color};font-weight:700;font-size:1.1rem">{mom_now:.0f}</span>'
-                        f'<span style="color:#37474f;font-size:0.8rem"> / 100</span>'
-                        f'<div style="background:#1a2a3a;border-radius:4px;height:6px;margin-top:4px">'
-                        f'<div style="background:{mom_color};width:{min(mom_now,100):.0f}%;height:6px;border-radius:4px"></div>'
-                        f'</div></div>',
-                        unsafe_allow_html=True,
-                    )
+                # ── Metrics — 2 rows of 4 (mobile-friendly) ──
+                r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+                r2c1, r2c2, r2c3, r2c4 = st.columns(4)
 
-                # Chart
+                cci_val = latest.get("CCI", np.nan)
+                rsi_val = latest.get("RSI", np.nan)
+                k_now   = latest.get("K",   np.nan)
+                d_now   = latest.get("D",   np.nan)
+                atr_val = latest.get("ATR", np.nan)
+                vol_r   = latest.get("Vol_Ratio", np.nan)
+                mom_now = float(latest.get("MomScore", 0) or 0)
+                atr_stop= round(price - atr_val * 1.5, 2) if pd.notna(atr_val) else None
+
+                r1c1.metric("訊號",       SIGNAL_LABEL.get(scan_sig, "─"))
+                r1c2.metric(f"CCI({cci_period})", f"{cci_val:.1f}" if pd.notna(cci_val) else "-")
+                r1c3.metric(f"RSI({rsi_period})", f"{rsi_val:.1f}" if pd.notna(rsi_val) else "-")
+                r1c4.metric("量/均量",    f"{vol_r:.2f}x"   if pd.notna(vol_r)  else "-")
+
+                r2c1.metric("動能分數",   f"{mom_now:.0f}/100")
+                r2c2.metric("K值",        f"{k_now:.1f}"    if pd.notna(k_now)  else "-")
+                r2c3.metric("D值",        f"{d_now:.1f}"    if pd.notna(d_now)  else "-")
+                r2c4.metric("ATR停損",    f"{atr_stop:.2f}" if atr_stop         else "-")
+
+                # ── Momentum bar ──
+                mom_color = "#00ff88" if mom_now >= 60 else "#f0a500" if mom_now >= 40 else "#ff3355"
+                st.markdown(
+                    f'<div style="margin:4px 0 10px 0;display:flex;align-items:center;gap:10px">'
+                    f'<span style="color:#5a8fb0;font-size:0.75rem;white-space:nowrap">動能 {mom_now:.0f}/100</span>'
+                    f'<div style="flex:1;background:#1a2a3a;border-radius:4px;height:5px">'
+                    f'<div style="background:{mom_color};width:{min(mom_now,100):.0f}%;height:5px;border-radius:4px"></div>'
+                    f'</div>'
+                    f'<span style="color:#5a8fb0;font-size:0.72rem;white-space:nowrap">{scan_detail[:40] + "…" if len(scan_detail) > 40 else scan_detail}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # ── Chart ──
                 fig = build_chart(df_sig, target, params)
                 st.plotly_chart(fig, width='stretch')
 
-                # Recent signal log
-                sig_cols = ["Close", "Volume", "CCI", "RSI", "K", "D",
-                            "Vol_Ratio", "MomScore", "Signal", "Signal_Detail"]
+                # ── Recent signal log (only crossover events) ──
+                sig_cols  = ["Close", "Volume", "CCI", "RSI", "K", "D",
+                             "Vol_Ratio", "MomScore", "Signal", "Signal_Detail"]
                 available = [c for c in sig_cols if c in df_sig.columns]
-                sig_hist = df_sig[df_sig["Signal"] != "NEUTRAL"][available].tail(20)
+                sig_hist  = df_sig[
+                    df_sig["Signal"].isin(
+                        list(BUY_SIGNALS) + list(SELL_SIGNALS) + ["WATCH", "FAKE_BREAKOUT"]
+                    )
+                ][available].tail(20)
                 if not sig_hist.empty:
                     st.markdown("##### 📋 近期訊號記錄（最新 20 筆）")
                     sig_hist = sig_hist.copy()
                     sig_hist["Signal"] = sig_hist["Signal"].map(
-                        lambda x: SIGNAL_LABEL.get(x, x)
-                    )
+                        lambda x: SIGNAL_LABEL.get(x, x))
                     sig_hist.index = sig_hist.index.date
                     st.dataframe(sig_hist, width='stretch')
 
@@ -1295,7 +1425,7 @@ def main():
                                                          else f"{x}.TW",
                                 key="bt_sym")
         bt_cust = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 3661.TWO", key="bt_custom")
-        run_bt  = c3.button("🔬 執行", type="primary", use_container_width=True)
+        run_bt  = c3.button("🔬 執行", type="primary", width='stretch')
 
         bt_target = bt_cust.strip() or bt_sym
 
