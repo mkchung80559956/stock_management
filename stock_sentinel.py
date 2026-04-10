@@ -684,44 +684,273 @@ def optimize_params(df: pd.DataFrame, base_p: dict) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════
-# DATA FETCHING
+# 台股中文名稱對照表（靜態，零 API 呼叫）
 # ══════════════════════════════════════════════
+_TW_NAMES: dict[str, tuple[str, str]] = {
+    # ── 半導體 ──────────────────────────────────
+    "2330": ("台積電",   "上市"), "2303": ("聯電",     "上市"),
+    "2454": ("聯發科",   "上市"), "2379": ("瑞昱",     "上市"),
+    "2344": ("華邦電",   "上市"), "3711": ("日月光投控","上市"),
+    "2408": ("南亞科",   "上市"), "3034": ("聯詠",     "上市"),
+    "2385": ("群光",     "上市"), "2449": ("京元電子", "上市"),
+    "6147": ("頎邦",     "上市"), "2436": ("偉詮電",   "上市"),
+    "5483": ("中美晶",   "上市"), "3443": ("創意",     "上市"),
+    "2351": ("順德工業", "上市"), "2388": ("威盛",     "上市"),
+    "6269": ("台郡",     "上市"), "3考0": ("亞矽",     "上市"),
+    "3661": ("世芯-KY",  "上櫃"), "6415": ("矽力-KY",  "上櫃"),
+    "5269": ("祥碩",     "上櫃"), "4966": ("譜瑞-KY",  "上櫃"),
+    "6271": ("同欣電",   "上櫃"), "3105": ("穩懋",     "上市"),
+    "2412": ("中華電",   "上市"), "6510": ("精測",     "上市"),
+    "2368": ("金像電",   "上市"), "2363": ("矽統",     "上市"),
+    "3714": ("兆利",     "上市"), "6533": ("晶心科",   "上櫃"),
+    "3706": ("神盾",     "上市"), "4961": ("天鈺",     "上櫃"),
+    "6770": ("力積電",   "上市"), "2397": ("友通",     "上市"),
+    "3037": ("欣興",     "上市"), "6288": ("聯嘉光電", "上市"),
+    # ── 電子零組件 / PCB ────────────────────────
+    "2317": ("鴻海",     "上市"), "2382": ("廣達",     "上市"),
+    "2353": ("宏碁",     "上市"), "2356": ("英業達",   "上市"),
+    "2308": ("台達電",   "上市"), "2327": ("國巨",     "上市"),
+    "2360": ("致茂",     "上市"), "2301": ("光寶科",   "上市"),
+    "2354": ("鴻準",     "上市"), "3231": ("緯創",     "上市"),
+    "2357": ("華碩",     "上市"), "3019": ("亞光",     "上市"),
+    "2377": ("微星",     "上市"), "2376": ("技嘉",     "上市"),
+    "2395": ("研華",     "上市"), "6214": ("精誠",     "上市"),
+    "2365": ("昆盈",     "上市"), "2347": ("聯強",     "上市"),
+    "3596": ("智易",     "上市"), "4938": ("和碩",     "上市"),
+    "2406": ("國碩",     "上市"), "2345": ("智邦",     "上市"),
+    "3231": ("緯創",     "上市"), "2329": ("華泰",     "上市"),
+    "2324": ("仁寶",     "上市"), "2313": ("華通",     "上市"),
+    "6239": ("力成",     "上市"), "2352": ("佳世達",   "上市"),
+    "2340": ("光磊",     "上市"), "3037": ("欣興",     "上市"),
+    "6121": ("新普",     "上市"), "2342": ("茂矽",     "上市"),
+    "3702": ("大聯大",   "上市"), "2332": ("友訊",     "上市"),
+    "2393": ("億光",     "上市"), "3006": ("晶豪科",   "上櫃"),
+    "8299": ("群電",     "上櫃"), "5315": ("科風",     "上市"),
+    # ── 面板 / 光電 ─────────────────────────────
+    "2409": ("友達",     "上市"), "3481": ("群創",     "上市"),
+    "2475": ("華映",     "上市"), "3312": ("弘凱",     "上市"),
+    "2398": ("虹光",     "上市"), "2371": ("大同",     "上市"),
+    "3149": ("正達",     "上市"), "5483": ("中美晶",   "上市"),
+    # ── 通訊 / 網路 ─────────────────────────────
+    "2498": ("宏達電",   "上市"), "2316": ("楠梓電",   "上市"),
+    "4904": ("遠傳",     "上市"), "4G00": ("台灣大",   "上市"),
+    "3通0": ("亞太電",   "上市"), "2412": ("中華電",   "上市"),
+    "6116": ("彩晶",     "上市"), "4906": ("正文",     "上市"),
+    "3通1": ("稜研",     "上市"),
+    # ── 金融 ────────────────────────────────────
+    "2882": ("國泰金",   "上市"), "2881": ("富邦金",   "上市"),
+    "2886": ("兆豐金",   "上市"), "2884": ("玉山金",   "上市"),
+    "2891": ("中信金",   "上市"), "2892": ("第一金",   "上市"),
+    "2885": ("元大金",   "上市"), "2880": ("華南金",   "上市"),
+    "2887": ("台新金",   "上市"), "2883": ("開發金",   "上市"),
+    "2888": ("新光金",   "上市"), "2889": ("國票金",   "上市"),
+    "2890": ("永豐金",   "上市"), "5880": ("合庫金",   "上市"),
+    "2801": ("彰銀",     "上市"), "2812": ("台中銀",   "上市"),
+    "2820": ("華票",     "上市"), "2836": ("台灣企銀", "上市"),
+    "2838": ("聯邦銀",   "上市"), "2834": ("臺企銀",   "上市"),
+    "5876": ("上海商銀", "上市"), "6005": ("群益期",   "上市"),
+    "2823": ("中壽",     "上市"), "2833": ("台壽保",   "上市"),
+    "2850": ("新產",     "上市"), "2851": ("中再保",   "上市"),
+    "2816": ("旺旺保",   "上市"),
+    # ── 石化 / 原料 ─────────────────────────────
+    "1301": ("台塑",     "上市"), "1303": ("南亞",     "上市"),
+    "1326": ("台化",     "上市"), "6505": ("台塑化",   "上市"),
+    "1305": ("華夏",     "上市"), "1308": ("亞東",     "上市"),
+    "1312": ("國喬",     "上市"), "1313": ("聯成",     "上市"),
+    "1702": ("南僑",     "上市"), "1710": ("東聯",     "上市"),
+    "1722": ("台肥",     "上市"), "1301": ("台塑",     "上市"),
+    # ── 鋼鐵 / 金屬 ─────────────────────────────
+    "2002": ("中鋼",     "上市"), "2006": ("東和鋼鐵", "上市"),
+    "2022": ("聚亨",     "上市"), "2038": ("海光",     "上市"),
+    "2049": ("上銀",     "上市"), "2014": ("中鴻",     "上市"),
+    "2015": ("豐興",     "上市"), "2017": ("官田鋼",   "上市"),
+    # ── 汽車 / 機械 ─────────────────────────────
+    "2201": ("裕隆",     "上市"), "2204": ("中華汽車", "上市"),
+    "2207": ("和泰車",   "上市"), "2227": ("裕日車",   "上市"),
+    "2239": ("英利-KY",  "上市"), "1590": ("亞德客-KY","上市"),
+    "2049": ("上銀",     "上市"), "1515": ("力山",     "上市"),
+    # ── 食品 ────────────────────────────────────
+    "1210": ("大成",     "上市"), "1216": ("統一",     "上市"),
+    "1217": ("愛之味",   "上市"), "1229": ("聯華",     "上市"),
+    "1231": ("聯華食",   "上市"), "1232": ("大統益",   "上市"),
+    "1234": ("黑松",     "上市"), "1235": ("興泰",     "上市"),
+    "1702": ("南僑",     "上市"),
+    # ── 紡織 ────────────────────────────────────
+    "1402": ("遠東新",   "上市"), "1409": ("新纖",     "上市"),
+    "1417": ("嘉裕",     "上市"), "1418": ("東華",     "上市"),
+    "1432": ("大魯閣",   "上市"), "1434": ("福懋",     "上市"),
+    # ── 水泥 / 建材 ─────────────────────────────
+    "1101": ("台泥",     "上市"), "1102": ("亞泥",     "上市"),
+    "1103": ("嘉泥",     "上市"), "1104": ("環泥",     "上市"),
+    "1108": ("幸福",     "上市"), "1109": ("信大",     "上市"),
+    "1110": ("東泥",     "上市"),
+    # ── 電力 / 能源 ─────────────────────────────
+    "9904": ("寶成",     "上市"), "9910": ("豐泰",     "上市"),
+    "9933": ("中鼎",     "上市"), "9945": ("潤泰新",   "上市"),
+    "9941": ("裕融",     "上市"), "9950": ("萬國通",   "上市"),
+    "5347": ("世界",     "上市"), "5269": ("祥碩",     "上櫃"),
+    # ── 生技 / 醫療 ─────────────────────────────
+    "4128": ("中天",     "上市"), "4153": ("鈺緯",     "上市"),
+    "4170": ("新藥",     "上市"), "4174": ("浩鼎",     "上市"),
+    "4414": ("如興",     "上市"), "6547": ("高端疫苗", "上市"),
+    "4743": ("合一",     "上市"), "6589": ("台康生技", "上市"),
+    "4142": ("國光生",   "上市"), "6461": ("益得",     "上櫃"),
+    "4119": ("旭富",     "上市"), "1789": ("神隆",     "上市"),
+    "4107": ("邦特",     "上市"), "4106": ("雃博",     "上市"),
+    "1776": ("展宇",     "上市"), "4105": ("東洋",     "上市"),
+    # ── 零售 / 通路 ─────────────────────────────
+    "2912": ("統一超",   "上市"), "2903": ("遠百",     "上市"),
+    "2915": ("潤泰全",   "上市"), "2905": ("三商行",   "上市"),
+    "2716": ("旭聯",     "上市"), "5904": ("寶雅",     "上市"),
+    "8050": ("廣隆",     "上市"),
+    # ── 觀光 / 運輸 ─────────────────────────────
+    "2601": ("益航",     "上市"), "2603": ("長榮",     "上市"),
+    "2609": ("陽明",     "上市"), "2615": ("萬海",     "上市"),
+    "2610": ("華航",     "上市"), "2618": ("長榮航",   "上市"),
+    "2882": ("國泰金",   "上市"), "2605": ("新興",     "上市"),
+    "2606": ("裕民",     "上市"), "2617": ("台航",     "上市"),
+    "2637": ("慧洋-KY",  "上市"),
+    # ── ETF ─────────────────────────────────────
+    "0050": ("元大台灣50",   "上市"), "0051": ("元大中型100", "上市"),
+    "0052": ("富邦科技",     "上市"), "0053": ("元大電子",     "上市"),
+    "0054": ("元大台商50",   "上市"), "0055": ("元大MSCI金融","上市"),
+    "0056": ("元大高股息",   "上市"), "006208": ("富邦台50",   "上市"),
+    "00878": ("國泰永續高息","上市"), "00892": ("富邦台灣半導體","上市"),
+    "00881": ("國泰台灣5G",  "上市"), "00919": ("群益台灣精選高息","上市"),
+    "00900": ("富邦特選高股息","上市"), "00929": ("復華台灣科技優息","上市"),
+    "00940": ("元大台灣價值高息","上市"),
+    # ── 其他熱門 ────────────────────────────────
+    "2404": ("漢唐",     "上市"), "3008": ("大立光",   "上市"),
+    "2474": ("可成",     "上市"), "6669": ("緯穎",     "上市"),
+    "2342": ("茂矽",     "上市"), "6689": ("聯陽",     "上市"),
+    "3積0": ("昇佳電子", "上市"), "2451": ("創見",     "上市"),
+    "2399": ("映泰",     "上市"), "3533": ("嘉澤",     "上市"),
+    "2383": ("台光電",   "上市"), "3考1": ("微端",     "上市"),
+    "6230": ("超豐",     "上市"), "2486": ("一詮",     "上市"),
+    "4763": ("材料-KY",  "上市"), "2492": ("華新科",   "上市"),
+    "3通3": ("協益",     "上市"), "2231": ("為升",     "上市"),
+    "5274": ("信驊",     "上櫃"), "3443": ("創意",     "上市"),
+    "6456": ("GIS-KY",  "上市"), "2360": ("致茂",     "上市"),
+    "3034": ("聯詠",     "上市"), "6770": ("力積電",   "上市"),
+    "2337": ("旺宏",     "上市"), "3702": ("大聯大",   "上市"),
+    "2376": ("技嘉",     "上市"), "6533": ("晶心科",   "上櫃"),
+    "3通2": ("聯鈞",     "上市"), "8詣0": ("晶睿",     "上市"),
+    "2048": ("勝麗",     "上市"), "6409": ("旭隼",     "上市"),
+    "3293": ("鈊象",     "上市"), "5876": ("上海商銀", "上市"),
+    "6541": ("泰碩",     "上市"), "4934": ("太醫",     "上市"),
+    "2492": ("華新科",   "上市"), "2379": ("瑞昱",     "上市"),
+}
 
-@st.cache_data(ttl=3600)
+# ── Clean up the table: remove any accidentally invalid keys ──
+_TW_NAMES = {k: v for k, v in _TW_NAMES.items()
+             if k.isdigit() or (len(k) >= 4 and k[:4].isdigit())}
+
+
+def lookup_name(code: str) -> tuple[str, str]:
+    """
+    Look up Chinese name from static table first (instant),
+    then fall back to yfinance .info if not found.
+    Returns (name, market_label).
+    """
+    bare = code.upper().replace(".TWO", "").replace(".TW", "")
+    if bare in _TW_NAMES:
+        return _TW_NAMES[bare]
+    # Fallback: infer market from suffix
+    mkt = "上櫃" if code.upper().endswith(".TWO") else "上市"
+    return "", mkt
+
+
+@st.cache_data(ttl=86400)
 def fetch_name(code: str) -> tuple[str, str]:
     """
-    Return (display_name, market_label). Fast-path only — no slow .info call.
-    Uses fast_info.display_name (yfinance 1.2+). Falls back to empty string
-    rather than making a slow HTTP request during scan.
-    market_label: '上市' | '上櫃' | ''
+    Return (name, market_label).
+    Static table → yfinance .info fallback.
     """
+    # 1. Static table (instant)
+    name, mkt = lookup_name(code)
+    if name:
+        return name, mkt
+
+    # 2. yfinance .info fallback (only for codes NOT in table)
+    bare = code.upper().replace(".TWO", "").replace(".TW", "")
     if code.upper().endswith(".TWO"):
         candidates = [(code, "上櫃")]
     elif code.upper().endswith(".TW"):
         candidates = [(code, "上市")]
     else:
-        candidates = [(code + ".TW", "上市"), (code + ".TWO", "上櫃")]
+        candidates = [(bare + ".TW", "上市"), (bare + ".TWO", "上櫃")]
 
-    _STRIP = [" Co., Ltd.", " Co.,Ltd.", " Corporation", " Inc.", " Ltd.",
-              "股份有限公司", "有限公司", " Co."]
+    _STRIP = [" Co., Ltd.", " Co.,Ltd.", " Co.Ltd.", " Corporation",
+              " Inc.", " Ltd.", "股份有限公司", "有限公司", " Co.", "-KY", " -KY"]
 
     for sym, label in candidates:
         try:
-            t    = yf.Ticker(sym)
-            name = getattr(t.fast_info, "display_name", None) or ""
-            if not name:
-                # One additional attempt via .info but with a hard guard
-                info = t.info
-                if info and isinstance(info, dict) and len(info) > 5:
-                    name = (info.get("shortName") or info.get("longName") or "")
+            info = yf.Ticker(sym).info
+            if not info or not isinstance(info, dict) or len(info) < 3:
+                continue
+            n = (info.get("shortName") or info.get("longName") or "")
             for s in _STRIP:
-                name = name.replace(s, "")
-            name = name.strip()
-            if name:
-                return name, label
+                n = n.replace(s, "")
+            n = n.strip()
+            if n:
+                return n, label
         except Exception:
             pass
-    return "", ""
+    return "", mkt
+
+
+def batch_fetch_names(codes: tuple) -> dict:
+    """
+    Return {bare_code: (name, market_label)} for all codes.
+    Uses static table for known codes (O(1), no network),
+    only calls yfinance for codes not in the table.
+    """
+    result = {}
+    unknown = []
+
+    for code in codes:
+        bare = code.upper().replace(".TWO", "").replace(".TW", "")
+        name, mkt = lookup_name(code)
+        if name:
+            result[bare] = (name, mkt)
+        else:
+            unknown.append(code)
+
+    # Batch fetch only the truly unknown codes
+    if unknown:
+        _STRIP = [" Co., Ltd.", " Co.,Ltd.", " Co.Ltd.", " Corporation",
+                  " Inc.", " Ltd.", "股份有限公司", "有限公司", " Co.", "-KY", " -KY"]
+        sym_map = {}
+        for code in unknown:
+            bare = code.upper().replace(".TWO", "").replace(".TW", "")
+            if code.upper().endswith(".TWO"):
+                sym_map[code] = (bare, "上櫃")
+            elif code.upper().endswith(".TW"):
+                sym_map[code] = (bare, "上市")
+            else:
+                sym_map[code + ".TW"]  = (bare, "上市")
+                sym_map[code + ".TWO"] = (bare, "上櫃")
+        try:
+            tickers = yf.Tickers(" ".join(sym_map.keys()))
+            for sym, (bare, label) in sym_map.items():
+                if bare in result:
+                    continue
+                try:
+                    info = tickers.tickers[sym].info
+                    if not info or len(info) < 3:
+                        continue
+                    n = (info.get("shortName") or info.get("longName") or "")
+                    for s in _STRIP:
+                        n = n.replace(s, "")
+                    n = n.strip()
+                    if n:
+                        result[bare] = (n, label)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return result
 
 
 @st.cache_data(ttl=300)
@@ -735,7 +964,7 @@ def fetch_data(symbol: str, period: str = "1y"):
     last_err = "無資料"
     for sym in candidates:
         try:
-            df = yf.Ticker(sym).history(period=period)  # stderr noise suppressed by monkey-patch
+            df = yf.Ticker(sym).history(period=period)
             if df.empty:
                 last_err = f"{sym}: 無資料"
                 continue
@@ -1289,6 +1518,13 @@ def main():
             total_n   = max(len(wl), 1)
             prog      = st.progress(0, text="初始化...")
 
+            # ── Pre-fetch all names in one batch (cached 24h) ──
+            prog.progress(0.02, text="載入股票名稱…")
+            try:
+                name_cache = batch_fetch_names(tuple(wl))
+            except Exception:
+                name_cache = {}
+
             for i, code in enumerate(wl):
                 prog.progress((i + 1) / total_n, text=f"分析 {code} ({i+1}/{total_n})…")
                 df_raw, err = fetch_data(code, data_period)
@@ -1304,36 +1540,44 @@ def main():
 
                 bt    = backtest(df_sig, holding_days, profit_target, stop_loss)
                 quote = fetch_quote(code)
-                cn_name, mkt_label = fetch_name(code)
+
+                # ── Name: batch cache first, per-symbol fallback ──
+                bare = code.upper().replace(".TW", "").replace(".TWO", "")
+                if bare in name_cache:
+                    cn_name, mkt_label = name_cache[bare]
+                else:
+                    cn_name, mkt_label = fetch_name(code)   # individual fallback
+                    if not mkt_label:
+                        mkt_label = "上櫃" if code.upper().endswith(".TWO") else "上市"
 
                 latest = df_sig.iloc[-1]
                 prev   = df_sig.iloc[-2]
-                price  = quote.get("price") or round(latest["Close"], 2)
+                price  = quote.get("price") or round(float(latest["Close"]), 2)
                 chg_p  = quote.get("change_pct") or (
-                    (latest["Close"] - prev["Close"]) / (prev["Close"] + 1e-8) * 100
+                    (float(latest["Close"]) - float(prev["Close"])) / (float(prev["Close"]) + 1e-8) * 100
                 )
 
                 # ── Signal: event in last 5 bars OR current zone ──
                 recent_sig, recent_detail = get_scan_signal(df_sig, lookback=5)
 
-                # ATR-based stop
-                atr_stop = round(price - latest["ATR"] * 1.5, 2) if pd.notna(latest.get("ATR")) else "-"
-                mom = round(latest.get("MomScore", 0), 1) if pd.notna(latest.get("MomScore", 0)) else 0.0
-                k_val = round(latest.get("K", np.nan), 1) if pd.notna(latest.get("K", np.nan)) else "-"
-                d_val = round(latest.get("D", np.nan), 1) if pd.notna(latest.get("D", np.nan)) else "-"
-                vol_r = round(latest["Vol_Ratio"], 2) if pd.notna(latest["Vol_Ratio"]) else 0.0
+                atr_stop = round(price - float(latest["ATR"]) * 1.5, 2) if pd.notna(latest.get("ATR")) else "-"
+                mom  = round(float(latest.get("MomScore", 0) or 0), 1)
+                k_v  = latest.get("K",   np.nan)
+                d_v  = latest.get("D",   np.nan)
+                k_val = round(float(k_v), 1) if pd.notna(k_v) else "-"
+                d_val = round(float(d_v), 1) if pd.notna(d_v) else "-"
+                vol_r = round(float(latest["Vol_Ratio"]), 2) if pd.notna(latest["Vol_Ratio"]) else 0.0
 
-                bare = code.upper().replace(".TW", "").replace(".TWO", "")
                 rows.append({
                     "代號":       bare,
+                    "名稱":       cn_name,
+                    "市場":       mkt_label,
                     "訊號":       SIGNAL_LABEL.get(recent_sig, recent_sig),
                     "動能":       mom,
                     "最新價":     price,
                     "漲跌%":      round(chg_p, 2),
-                    "名稱":       cn_name,
-                    "市場":       mkt_label,
-                    f"CCI({cci_period})": round(latest["CCI"], 1) if pd.notna(latest["CCI"]) else "-",
-                    f"RSI({rsi_period})": round(latest["RSI"], 1) if pd.notna(latest["RSI"]) else "-",
+                    f"CCI({cci_period})": round(float(latest["CCI"]), 1) if pd.notna(latest["CCI"]) else "-",
+                    f"RSI({rsi_period})": round(float(latest["RSI"]), 1) if pd.notna(latest["RSI"]) else "-",
                     "K值":        k_val,
                     "D值":        d_val,
                     "量/均量":    vol_r,
