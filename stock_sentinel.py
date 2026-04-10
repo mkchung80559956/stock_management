@@ -1224,29 +1224,45 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
     fig.add_trace(go.Bar(
         x=df.index, y=df["CCI"], marker_color=cci_colors, name="CCI", showlegend=False,
     ), row=3, col=1)
-    # Trend zone overlays on CCI panel
+    # Trend zone overlays on CCI panel — use add_shape (more compatible than add_vrect)
     if "TrendScore" in df.columns:
         uptrend_mask  = df["TrendScore"] >= 2
         dwntrend_mask = df["TrendScore"] <= -2
-        for mask, fill_col in [(uptrend_mask, "rgba(34,204,102,0.08)"),
-                               (dwntrend_mask, "rgba(232,65,78,0.08)")]:
-            if mask.any():
-                # group consecutive True runs and shade each run
-                runs_x, runs_start = [], None
-                for idx, val in enumerate(mask):
-                    if val and runs_start is None:
-                        runs_start = idx
-                    elif not val and runs_start is not None:
-                        runs_x.append((runs_start, idx - 1))
-                        runs_start = None
-                if runs_start is not None:
-                    runs_x.append((runs_start, len(mask) - 1))
-                for start, end in runs_x[:30]:   # cap at 30 shapes for performance
-                    fig.add_vrect(
-                        x0=df.index[start], x1=df.index[end],
-                        fillcolor=fill_col, opacity=1, line_width=0,
-                        row=3, col=1,
+        for mask, fill_col in [(uptrend_mask, "rgba(34,204,102,0.07)"),
+                               (dwntrend_mask, "rgba(232,65,78,0.07)")]:
+            if not mask.any():
+                continue
+            # Find consecutive runs and add one shape per run
+            runs_start = None
+            prev_val   = False
+            for idx, val in enumerate(mask):
+                if val and not prev_val:
+                    runs_start = idx
+                elif not val and prev_val and runs_start is not None:
+                    try:
+                        fig.add_shape(
+                            type="rect",
+                            xref="x3", yref="y3 domain",
+                            x0=df.index[runs_start], x1=df.index[idx - 1],
+                            y0=0, y1=1,
+                            fillcolor=fill_col, line_width=0, layer="below",
+                        )
+                    except Exception:
+                        pass
+                    runs_start = None
+                prev_val = bool(val)
+            # Last run reaches end of data
+            if runs_start is not None:
+                try:
+                    fig.add_shape(
+                        type="rect",
+                        xref="x3", yref="y3 domain",
+                        x0=df.index[runs_start], x1=df.index[-1],
+                        y0=0, y1=1,
+                        fillcolor=fill_col, line_width=0, layer="below",
                     )
+                except Exception:
+                    pass
     for level, col in [(100, "rgba(232,65,78,0.35)"), (-100, "rgba(34,204,102,0.35)"), (0, "#37474f")]:
         fig.add_hline(y=level, line_dash="dot", line_color=col, line_width=1, row=3, col=1)
 
@@ -1677,7 +1693,7 @@ def main():
             horizontal=True, label_visibility="collapsed",
         )
 
-        if run_scan or not st.session_state.scan_rows:
+        if run_scan:
             rows      = []
             failed    = []
             wl        = st.session_state.watchlist
