@@ -813,7 +813,7 @@ def optimize_params(df: pd.DataFrame, base_p: dict) -> pd.DataFrame:
 
     for cp, vm in itertools.product(cci_choices, vol_choices):
         p2 = {**base_p, "cci_period": cp, "vol_multiplier": vm,
-              "use_divergence": False}  # skip slow divergence in grid
+              "use_divergence": False}
         try:
             df2 = generate_signals(df, p2)
             bt  = backtest(df2, base_p["holding_days"],
@@ -833,6 +833,57 @@ def optimize_params(df: pd.DataFrame, base_p: dict) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("勝率%", ascending=False).reset_index(drop=True)
+
+
+@st.cache_data(ttl=86400)
+def auto_optimize_cci(symbol: str, period: str, base_params: dict) -> dict:
+    """
+    Per-stock CCI auto-optimisation (cached 24h).
+    Searches 5 CCI periods × 3 vol thresholds = 15 combinations.
+    Returns the best {cci_period, vol_multiplier, win_rate, avg_return, total}.
+    Falls back to global params if not enough trades found.
+    """
+    df_raw, _ = fetch_data(symbol, period)
+    if df_raw is None or len(df_raw) < 80:
+        return {"cci_period": base_params["cci_period"],
+                "vol_multiplier": base_params["vol_multiplier"],
+                "win_rate": 0, "avg_return": 0, "total": 0,
+                "optimised": False}
+
+    best = None
+    for cp in [14, 20, 26, 39, 52]:
+        for vm in [1.2, 1.5, 2.0]:
+            p2 = {**base_params, "cci_period": cp, "vol_multiplier": vm,
+                  "use_divergence": False}
+            try:
+                df2 = generate_signals(df_raw, p2)
+                bt  = backtest(df2,
+                               base_params["holding_days"],
+                               base_params["profit_target"],
+                               base_params["stop_loss"])
+                if bt["total"] < 3:
+                    continue
+                # Score = win_rate weighted by avg_return (penalise low sample)
+                score = bt["win_rate"] + max(bt["avg_return"], 0) * 2
+                if best is None or score > best["_score"]:
+                    best = {
+                        "cci_period":    cp,
+                        "vol_multiplier": vm,
+                        "win_rate":      bt["win_rate"],
+                        "avg_return":    bt["avg_return"],
+                        "total":         bt["total"],
+                        "optimised":     True,
+                        "_score":        score,
+                    }
+            except Exception:
+                pass
+
+    if best is None:
+        return {"cci_period": base_params["cci_period"],
+                "vol_multiplier": base_params["vol_multiplier"],
+                "win_rate": 0, "avg_return": 0, "total": 0,
+                "optimised": False}
+    return best
 
 
 # ══════════════════════════════════════════════
@@ -1753,7 +1804,6 @@ def main():
             total_n   = max(len(wl), 1)
             prog      = st.progress(0, text="初始化...")
 
-            # ── Pre-fetch all names in one batch (cached 24h) ──
             prog.progress(0.02, text="載入股票名稱…")
             try:
                 name_cache = batch_fetch_names(tuple(wl))
@@ -1761,28 +1811,35 @@ def main():
                 name_cache = {}
 
             for i, code in enumerate(wl):
-                prog.progress((i + 1) / total_n, text=f"分析 {code} ({i+1}/{total_n})…")
+                prog.progress((i + 1) / total_n,
+                              text=f"分析 {code} ({i+1}/{total_n})…")
                 df_raw, err = fetch_data(code, data_period)
                 if df_raw is None or len(df_raw) < 60:
                     failed.append(f"{code}: {err or '資料不足'}")
                     continue
 
+                # ── ① Auto-optimise CCI for this stock (cached 24h) ──
+                opt = auto_optimize_cci(code, data_period, params)
+                stock_params = {**params,
+                                "cci_period":    opt["cci_period"],
+                                "vol_multiplier": opt["vol_multiplier"]}
+
                 try:
-                    df_sig = generate_signals(df_raw, params)
+                    df_sig = generate_signals(df_raw, stock_params)
                 except Exception as e:
                     failed.append(f"{code}: 訊號計算失敗 ({e})")
                     continue
 
-                bt    = backtest(df_sig, holding_days, profit_target, stop_loss)
+                bt    = backtest(df_sig,
+                                 holding_days, profit_target, stop_loss)
                 quote = fetch_quote(code)
 
-                # ── Name: static table first, yfinance fallback for unknowns ──
-                bare = code.upper().replace(".TW", "").replace(".TWO", "")
+                bare   = code.upper().replace(".TW", "").replace(".TWO", "")
                 cached = name_cache.get(bare)
-                if cached and cached[0]:          # non-empty name from static table
+                if cached and cached[0]:
                     cn_name, mkt_label = cached
                 else:
-                    cn_name, mkt_label = fetch_name(code)   # yfinance fallback (cached 24h)
+                    cn_name, mkt_label = fetch_name(code)
                     if not mkt_label:
                         mkt_label = "上櫃" if code.upper().endswith(".TWO") else "上市"
 
@@ -1790,46 +1847,59 @@ def main():
                 prev   = df_sig.iloc[-2]
                 price  = quote.get("price") or round(float(latest["Close"]), 2)
                 chg_p  = quote.get("change_pct") or (
-                    (float(latest["Close"]) - float(prev["Close"])) / (float(prev["Close"]) + 1e-8) * 100
+                    (float(latest["Close"]) - float(prev["Close"])) /
+                    (float(prev["Close"]) + 1e-8) * 100
                 )
 
-                # ── Signal: event in last 5 bars OR current zone ──
                 recent_sig, recent_detail = get_scan_signal(df_sig, lookback=5)
 
                 atr_stop = round(price - float(latest["ATR"]) * 1.5, 2) if pd.notna(latest.get("ATR")) else "-"
                 mom  = round(float(latest.get("MomScore",       0) or 0), 1)
                 conf = int(  float(latest.get("ConfluenceScore", 0) or 0))
                 trnd = int(  float(latest.get("TrendScore",      0) or 0))
-                accl = round(float(latest.get("MomAccel",        0) or 0), 2)
                 k_v  = latest.get("K",   np.nan)
                 d_v  = latest.get("D",   np.nan)
                 k_val = round(float(k_v), 1) if pd.notna(k_v) else "-"
                 d_val = round(float(d_v), 1) if pd.notna(d_v) else "-"
                 vol_r = round(float(latest["Vol_Ratio"]), 2) if pd.notna(latest["Vol_Ratio"]) else 0.0
 
+                # Win rate: use per-stock optimised result if available
+                win_rate   = opt["win_rate"]   if opt["optimised"] else bt["win_rate"]
+                avg_return = opt["avg_return"] if opt["optimised"] else bt["avg_return"]
+                best_cci   = opt["cci_period"]
+                opt_flag   = "✓" if opt["optimised"] else ""
+
                 rows.append({
-                    "代號":       bare,
-                    "名稱":       cn_name,
-                    "市場":       mkt_label,
-                    "訊號":       SIGNAL_LABEL.get(recent_sig, recent_sig),
-                    "動能":       mom,
-                    "共振":       conf,
-                    "趨勢":       trnd,
-                    "最新價":     price,
-                    "漲跌%":      round(chg_p, 2),
-                    f"CCI({cci_period})": round(float(latest["CCI"]), 1) if pd.notna(latest["CCI"]) else "-",
+                    "代號":     bare,
+                    "名稱":     cn_name,
+                    "市場":     mkt_label,
+                    "訊號":     SIGNAL_LABEL.get(recent_sig, recent_sig),
+                    "動能":     mom,
+                    "共振":     conf,
+                    "趨勢":     trnd,
+                    "最新價":   price,
+                    "漲跌%":    round(chg_p, 2),
+                    f"CCI({best_cci})": round(float(latest["CCI"]), 1) if pd.notna(latest["CCI"]) else "-",
                     f"RSI({rsi_period})": round(float(latest["RSI"]), 1) if pd.notna(latest["RSI"]) else "-",
-                    "K值":        k_val,
-                    "D值":        d_val,
-                    "量/均量":    vol_r,
-                    "說明":       recent_detail,
-                    "止損參考":   atr_stop,
-                    "勝率%":      bt["win_rate"],
-                    "平均報酬%":  bt["avg_return"],
-                    "_sig_key":   recent_sig,
-                    "_mom":       mom,
-                    "_vol_r":     vol_r,
-                    "_conf":      conf,
+                    "K值":      k_val,
+                    "D值":      d_val,
+                    "量/均量":  vol_r,
+                    "說明":     recent_detail,
+                    "止損參考": atr_stop,
+                    "勝率%":    win_rate,
+                    "平均報酬%": avg_return,
+                    "最佳CCI":  best_cci,
+                    "_sig_key": recent_sig,
+                    "_mom":     mom,
+                    "_vol_r":   vol_r,
+                    "_conf":    conf,
+                    # For today's signal panel
+                    "_price":   price,
+                    "_chg_p":   round(chg_p, 2),
+                    "_cn_name": cn_name,
+                    "_atr_stop": atr_stop,
+                    "_win_rate": win_rate,
+                    "_detail":  recent_detail,
                 })
 
             prog.empty()
@@ -1842,6 +1912,106 @@ def main():
         scan_time = st.session_state.get("scan_timestamp", "")
 
         if rows:
+            # ══════════════════════════════════════════════════════
+            # 今日訊號高亮面板 — 只顯示有明確買賣訊號的股票
+            # ══════════════════════════════════════════════════════
+            ACTION_BUY  = {"HIGH_CONF_BUY", "BREAKOUT_BUY", "STRONG_BUY",
+                           "BUY", "DIV_BUY", "KD_GOLDEN_ZONE"}
+            ACTION_SELL = {"STRONG_SELL", "SELL", "DIV_SELL"}
+            ACTION_WARN = {"FAKE_BREAKOUT", "KD_HIGH"}
+
+            today_buy  = [r for r in rows if r["_sig_key"] in ACTION_BUY]
+            today_sell = [r for r in rows if r["_sig_key"] in ACTION_SELL]
+            today_warn = [r for r in rows if r["_sig_key"] in ACTION_WARN]
+
+            # Sort buy by signal priority then win_rate
+            today_buy  = sorted(today_buy,  key=lambda r: (SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_win_rate"]))
+            today_sell = sorted(today_sell, key=lambda r: (SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_win_rate"]))
+
+            if today_buy or today_sell:
+                st.markdown(f"""
+                <div style="background:linear-gradient(135deg,#0d1f12,#0a1628);
+                    border:1px solid #1e4030;border-radius:10px;
+                    padding:12px 16px;margin-bottom:12px">
+                <div style="font-family:'Space Mono',monospace;font-size:0.9rem;
+                    color:#00ff88;font-weight:700;margin-bottom:8px">
+                📢 今日訊號股票 — {scan_time}</div>
+                </div>""", unsafe_allow_html=True)
+
+                # Buy signal cards
+                if today_buy:
+                    st.markdown("**🟢 買入訊號**")
+                    cols_per_row = 2
+                    for start in range(0, min(len(today_buy), 8), cols_per_row):
+                        chunk = today_buy[start:start + cols_per_row]
+                        cols  = st.columns(cols_per_row)
+                        for ci, r in enumerate(chunk):
+                            sig_key   = r["_sig_key"]
+                            chg_color = "#e8414e" if r["_chg_p"] >= 0 else "#22cc66"
+                            wr_color  = "#00ff88" if r["_win_rate"] >= 60 else "#f0a500" if r["_win_rate"] >= 45 else "#aaaaaa"
+                            border    = "#ffd700" if sig_key == "HIGH_CONF_BUY" else "#00ff88"
+                            with cols[ci]:
+                                st.markdown(f"""
+                                <div style="background:#0d1a2d;border:1.5px solid {border};
+                                    border-radius:10px;padding:12px 14px;margin-bottom:8px">
+                                <div style="display:flex;justify-content:space-between;
+                                    align-items:baseline;margin-bottom:4px">
+                                <span style="font-size:1.05rem;font-weight:700;
+                                    color:#e8f4fd;font-family:'Space Mono',monospace">
+                                {r['代號']}</span>
+                                <span style="font-size:0.75rem;color:{chg_color};font-weight:600">
+                                {r['_price']:.2f}　{r['_chg_p']:+.2f}%</span>
+                                </div>
+                                <div style="font-size:0.78rem;color:#8a9bb5;margin-bottom:4px">
+                                {r['_cn_name'] or ''}</div>
+                                <div style="font-size:0.82rem;font-weight:700;color:{border};
+                                    margin-bottom:6px">{SIGNAL_LABEL.get(sig_key,'')}</div>
+                                <div style="display:flex;gap:8px;font-size:0.72rem;flex-wrap:wrap">
+                                <span style="color:{wr_color}">勝率 {r['_win_rate']:.0f}%</span>
+                                <span style="color:#5a8fb0">CCI{r['最佳CCI']}</span>
+                                <span style="color:#5a8fb0">止損 {r['_atr_stop']}</span>
+                                </div>
+                                <div style="font-size:0.68rem;color:#37474f;margin-top:4px;
+                                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+                                {r['_detail'][:45]}</div>
+                                </div>""", unsafe_allow_html=True)
+
+                # Sell signal cards
+                if today_sell:
+                    st.markdown("**🔴 賣出訊號**")
+                    cols_per_row = 2
+                    for start in range(0, min(len(today_sell), 6), cols_per_row):
+                        chunk = today_sell[start:start + cols_per_row]
+                        cols  = st.columns(cols_per_row)
+                        for ci, r in enumerate(chunk):
+                            chg_color = "#e8414e" if r["_chg_p"] >= 0 else "#22cc66"
+                            with cols[ci]:
+                                st.markdown(f"""
+                                <div style="background:#1a0d0d;border:1.5px solid #ff3355;
+                                    border-radius:10px;padding:12px 14px;margin-bottom:8px">
+                                <div style="display:flex;justify-content:space-between;
+                                    align-items:baseline;margin-bottom:4px">
+                                <span style="font-size:1.05rem;font-weight:700;
+                                    color:#e8f4fd;font-family:'Space Mono',monospace">
+                                {r['代號']}</span>
+                                <span style="font-size:0.75rem;color:{chg_color};font-weight:600">
+                                {r['_price']:.2f}　{r['_chg_p']:+.2f}%</span>
+                                </div>
+                                <div style="font-size:0.78rem;color:#8a9bb5;margin-bottom:4px">
+                                {r['_cn_name'] or ''}</div>
+                                <div style="font-size:0.82rem;font-weight:700;
+                                    color:#ff3355;margin-bottom:6px">
+                                {SIGNAL_LABEL.get(r['_sig_key'],'')}</div>
+                                <div style="font-size:0.68rem;color:#37474f;margin-top:4px">
+                                {r['_detail'][:45]}</div>
+                                </div>""", unsafe_allow_html=True)
+
+                if today_warn:
+                    st.caption(f"⚠️ 注意：{len(today_warn)} 支出現誘多/KD高檔警示 — " +
+                               "、".join(r["代號"] for r in today_warn[:6]))
+
+                st.divider()
+
             # ── Sort ──
             if sort_mode == "⭐ 共振分數":
                 rows_sorted = sorted(rows, key=lambda r: (-SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_conf"], -r["_mom"]))
@@ -1857,19 +2027,21 @@ def main():
             df_display = df_display[show_cols]
 
             if scan_time:
-                st.caption(f"🕐 最後更新：{scan_time}　共 {len(rows)} 支")
+                st.caption(f"🕐 最後更新：{scan_time}　共 {len(rows)} 支　"
+                           f"買入訊號 {len(today_buy)} 支　賣出訊號 {len(today_sell)} 支")
 
             st.dataframe(
                 df_display,
                 width='stretch',
-                height=530,
+                height=480,
                 column_config={
-                    "漲跌%":  st.column_config.NumberColumn(format="%.2f%%"),
-                    "動能":   st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
-                    "共振":   st.column_config.ProgressColumn(min_value=0, max_value=7,   format="%d/7"),
-                    "趨勢":   st.column_config.NumberColumn(format="%+d"),
-                    "勝率%":  st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
+                    "漲跌%":    st.column_config.NumberColumn(format="%.2f%%"),
+                    "動能":     st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
+                    "共振":     st.column_config.ProgressColumn(min_value=0, max_value=7, format="%d/7"),
+                    "趨勢":     st.column_config.NumberColumn(format="%+d"),
+                    "勝率%":    st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
                     "平均報酬%": st.column_config.NumberColumn(format="%.2f%%"),
+                    "最佳CCI":  st.column_config.NumberColumn(format="%d"),
                 },
                 hide_index=True,
             )
