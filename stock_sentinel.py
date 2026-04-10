@@ -507,64 +507,61 @@ SIGNAL_ZONE = {
 }
 
 
+def _html_safe(s: str) -> str:
+    """Escape & < > so a plain-text string is safe to embed in HTML."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def get_scan_signal(df_sig: pd.DataFrame, lookback: int = 5) -> tuple[str, str]:
     """
-    Returns (signal_key, detail) for the scan table.
-    Priority:
-      1. Any non-neutral crossover event in the last `lookback` bars
-      2. Current zone state — always produces a meaningful label
+    Returns (signal_key, detail).
+    detail strings must NOT contain raw HTML special chars (< > &).
     """
-    # ── 1. Recent event signal ──
+    # ── 1. Recent crossover event ──
     for j in range(min(lookback, len(df_sig))):
         s = df_sig.iloc[-(j + 1)]["Signal"]
         if s not in ("NEUTRAL", "WATCH"):
             return s, df_sig.iloc[-(j + 1)]["Signal_Detail"]
 
     # ── 2. Zone state fallback ──
-    latest  = df_sig.iloc[-1]
-    cci     = float(latest.get("CCI",     0) or 0)
-    k       = float(latest.get("K",      50) or 50)
-    d       = float(latest.get("D",      50) or 50)
-    rsi     = float(latest.get("RSI",    50) or 50)
-    obv_up  = bool(latest.get("OBV_Rising", False))
-    trnd    = int(float(latest.get("TrendScore",      0) or 0))
-    conf    = int(float(latest.get("ConfluenceScore", 0) or 0))
-    accl    = float(latest.get("MomAccel", 0) or 0)
+    latest = df_sig.iloc[-1]
+    cci    = float(latest.get("CCI",     0) or 0)
+    k      = float(latest.get("K",      50) or 50)
+    d      = float(latest.get("D",      50) or 50)
+    rsi    = float(latest.get("RSI",    50) or 50)
+    obv_up = bool(latest.get("OBV_Rising", False))
+    trnd   = int(float(latest.get("TrendScore",      0) or 0))
+    conf   = int(float(latest.get("ConfluenceScore", 0) or 0))
+    accl   = float(latest.get("MomAccel", 0) or 0)
 
-    trend_txt = {3:"強多頭↑↑", 2:"多頭↑", 1:"弱多頭", 0:"中性",
-                 -1:"弱空頭", -2:"強空頭↓↓"}.get(trnd, str(trnd))
+    trend_txt = {3:"強多頭++", 2:"多頭+", 1:"弱多頭", 0:"中性",
+                 -1:"弱空頭", -2:"強空頭--"}.get(trnd, str(trnd))
     conf_txt  = f"共振{conf}/7"
     accel_txt = f"加速{accl:+.1f}" if abs(accl) > 0.2 else ""
 
-    # Strong bull zone
     if cci > 100:
-        extra = "OBV支撐" if obv_up else "OBV未支撐"
-        return "BULL_ZONE", f"強勢區 CCI{cci:.0f}>{'+100'} · {trend_txt} · {conf_txt}"
+        support = "OBV支撐" if obv_up else "OBV未支撐"
+        return "BULL_ZONE", f"強勢區 CCI {cci:.0f} · {support} · {trend_txt} · {conf_txt}"
 
-    # Oversold zone
     if cci < -100:
-        return "BEAR_ZONE", f"超賣區 CCI{cci:.0f}<-100 · K={k:.0f}{'低檔' if k < 30 else ''} · {conf_txt}"
+        kd_note = "低檔" if k < 30 else ""
+        return "BEAR_ZONE", f"超賣區 CCI {cci:.0f} · K={k:.0f}{kd_note} · {conf_txt}"
 
-    # KD golden cross recently
     if "KD_Golden" in df_sig.columns:
         for j in range(min(3, len(df_sig))):
             if bool(df_sig.iloc[-(j + 1)].get("KD_Golden", False)):
                 return "KD_GOLDEN_ZONE", f"KD低檔金叉 K={k:.0f} · {trend_txt} · {conf_txt}"
 
-    # KD high zone
     if k > 75 and k < d:
         return "KD_HIGH", f"KD高檔轉弱 K={k:.0f} · {conf_txt}"
 
-    # Rising trend
     if cci > 0 and k > d and rsi > 50:
         extras = " · ".join(filter(None, [trend_txt, conf_txt, accel_txt]))
-        return "RISING", f"上升中 CCI{cci:.0f} · {extras}"
+        return "RISING", f"上升中 CCI {cci:.0f} · {extras}"
 
-    # Falling trend
     if cci < 0 and k < d and rsi < 50:
-        return "FALLING", f"下跌中 CCI{cci:.0f} · {trend_txt} · {conf_txt}"
+        return "FALLING", f"下跌中 CCI {cci:.0f} · {trend_txt} · {conf_txt}"
 
-    # Watch
     for j in range(min(lookback, len(df_sig))):
         if df_sig.iloc[-(j + 1)]["Signal"] == "WATCH":
             return "WATCH", df_sig.iloc[-(j + 1)]["Signal_Detail"]
@@ -665,12 +662,13 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     #    條件：上升趨勢 + 5+/7 指標共振 + 動能加速 + CCI剛突破0軸或-100軸
     hc_trigger = (df["CCI_X_zero_UP"] | df["CCI_X_neg100_UP"]) & df["Vol_High"]
     m0 = hc_trigger & in_uptrend & high_conf & accel_positive
-    sig[m0]    = "HIGH_CONF_BUY"
-    detail[m0] = (
-        "★三重共振：趨勢↑ + " +
-        df.loc[m0, "ConfluenceScore"].apply(lambda c: f"{int(c)}/7共振") +
-        " + 動能加速"
-    )
+    sig[m0] = "HIGH_CONF_BUY"
+    # Simple scalar assignment — avoid pandas Series arithmetic that can fail on NaN
+    if m0.any():
+        for idx in df.index[m0]:
+            c = df.at[idx, "ConfluenceScore"]
+            c_int = int(c) if pd.notna(c) else 0
+            detail.at[idx] = f"三重共振：趨勢+ + {c_int}/7共振 + 動能加速"
 
     # 1. 噴發買：CCI突破+100 + 強放量 + OBV + 趨勢確認
     m1 = df["CCI_X_pos100_UP"] & df["Vol_Strong"] & df["OBV_Rising"] & ~in_downtrend
@@ -694,7 +692,7 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     # 3b. KD低檔金叉強買
     m3b = df["KD_Golden"] & df["Vol_High"] & (df["LowerShadow"] | df["BullEngulf"]) & ~in_downtrend
     sig[m3b & (sig == "NEUTRAL")] = "STRONG_BUY"
-    detail[m3b & (sig == "STRONG_BUY")] = "強買：KD低檔金叉(<20) + 放量 + 止跌K"
+    detail[m3b & (sig == "STRONG_BUY")] = "強買：KD低檔金叉(K低於20) + 放量 + 止跌K"
 
     # 4. 底背離買入
     m4 = df["BullDiv"] & df["Vol_High"]
@@ -1056,54 +1054,16 @@ def fetch_name(code: str) -> tuple[str, str]:
 def batch_fetch_names(codes: tuple) -> dict:
     """
     Return {bare_code: (name, market_label)} for all codes.
-    Uses static table for known codes (O(1), no network),
-    only calls yfinance for codes not in the table.
+    Uses ONLY the static _TW_NAMES table (instant, zero network).
+    For codes not in the table, the per-stock fetch_name() fallback
+    in the scan loop will handle them individually with 24h caching.
+    This avoids the yf.Tickers() bulk call that triggers rate-limiting.
     """
     result = {}
-    unknown = []
-
     for code in codes:
         bare = code.upper().replace(".TWO", "").replace(".TW", "")
         name, mkt = lookup_name(code)
-        if name:
-            result[bare] = (name, mkt)
-        else:
-            unknown.append(code)
-
-    # Batch fetch only the truly unknown codes
-    if unknown:
-        _STRIP = [" Co., Ltd.", " Co.,Ltd.", " Co.Ltd.", " Corporation",
-                  " Inc.", " Ltd.", "股份有限公司", "有限公司", " Co.", "-KY", " -KY"]
-        sym_map = {}
-        for code in unknown:
-            bare = code.upper().replace(".TWO", "").replace(".TW", "")
-            if code.upper().endswith(".TWO"):
-                sym_map[code] = (bare, "上櫃")
-            elif code.upper().endswith(".TW"):
-                sym_map[code] = (bare, "上市")
-            else:
-                sym_map[code + ".TW"]  = (bare, "上市")
-                sym_map[code + ".TWO"] = (bare, "上櫃")
-        try:
-            tickers = yf.Tickers(" ".join(sym_map.keys()))
-            for sym, (bare, label) in sym_map.items():
-                if bare in result:
-                    continue
-                try:
-                    info = tickers.tickers[sym].info
-                    if not info or len(info) < 3:
-                        continue
-                    n = (info.get("shortName") or info.get("longName") or "")
-                    for s in _STRIP:
-                        n = n.replace(s, "")
-                    n = n.strip()
-                    if n:
-                        result[bare] = (n, label)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
+        result[bare] = (name, mkt)   # name may be "" for unknown codes — fallback handles it
     return result
 
 
@@ -1855,8 +1815,8 @@ def main():
             🔵 <b>買入</b> CCI突破0軸放量　
             🟢 <b>底背離/KD金叉</b> 底部確認<br>
             <b>持倉/觀察：</b>
-            🟡 <b>強勢區</b> CCI>100持續強勢　
-            🔼 <b>上升中</b> CCI>0且K>D　
+            🟡 <b>強勢區</b> CCI&gt;100持續強勢　
+            🔼 <b>上升中</b> CCI&gt;0且K&gt;D　
             ⚪ <b>觀望</b> CCI突破-100量縮弱反彈<br>
             <b>賣出訊號：</b>
             🔴 <b>強賣</b> CCI跌破+100或KD高檔死叉　
@@ -1864,8 +1824,8 @@ def main():
             🔴 <b>頂背離</b> 量縮動能耗盡　
             🟣 <b>誘多</b> CCI突破+100量不配合<br>
             <b>弱勢：</b>
-            🔽 <b>下跌中</b> CCI<0且K<D　
-            🔵 <b>超賣區</b> CCI<-100（關注底部）
+            🔽 <b>下跌中</b> CCI&lt;0且K&lt;D　
+            🔵 <b>超賣區</b> CCI&lt;-100（關注底部）
             </div>
             """, unsafe_allow_html=True)
 
@@ -1987,7 +1947,7 @@ def main():
                     f'<div style="flex:1;min-width:60px;background:#1a2a3a;border-radius:3px;height:5px">'
                     f'<div style="background:{conf_color};width:{conf_now/7*100:.0f}%;height:5px;border-radius:3px"></div></div>'
                     f'<span style="color:#5a8fb0;font-size:0.68rem;white-space:nowrap">'
-                    f'{scan_detail[:35] + "…" if len(scan_detail) > 35 else scan_detail}</span>'
+                    f'{_html_safe(scan_detail[:35] + "…" if len(scan_detail) > 35 else scan_detail)}</span>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
