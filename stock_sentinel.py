@@ -743,45 +743,56 @@ SELL_SIGNALS = {"STRONG_SELL", "SELL", "DIV_SELL"}
 
 
 def backtest(df: pd.DataFrame, holding_days: int, profit_pct: float, stop_pct: float) -> dict:
+    """
+    Backtest buy signals. Entry is at the NEXT bar's open (simulated as next
+    bar's close) to avoid look-ahead bias — you can only act after the signal
+    bar closes.
+    """
     buy_idx = df.index[df["Signal"].isin(BUY_SIGNALS)]
     if len(buy_idx) == 0:
         return {"win_rate": 0, "total": 0, "wins": 0, "losses": 0,
                 "avg_return": 0, "max_return": 0, "min_return": 0, "trades": pd.DataFrame()}
 
     prices = df["Close"].values
+    opens  = df["Open"].values
     dates  = df.index
     rows   = []
 
     for entry_date in buy_idx:
         pos = df.index.get_loc(entry_date)
-        ep  = prices[pos]
+        # Enter at NEXT bar's open to eliminate look-ahead bias
+        entry_pos = pos + 1
+        if entry_pos >= len(prices):
+            continue
+        ep  = opens[entry_pos]          # next bar open
         outcome = "HOLD"
-        xp, xd, held = ep, entry_date, 0
+        xp, xd, held = ep, dates[entry_pos], 0
 
-        for d in range(1, min(holding_days + 1, len(prices) - pos)):
-            fp  = prices[pos + d]
+        for d in range(1, min(holding_days + 1, len(prices) - entry_pos)):
+            fp  = prices[entry_pos + d]
             ret = (fp - ep) / ep * 100
             if ret >= profit_pct:
-                outcome, xp, xd, held = "WIN",  fp, dates[pos + d], d; break
+                outcome, xp, xd, held = "WIN",  fp, dates[entry_pos + d], d; break
             elif ret <= -stop_pct:
-                outcome, xp, xd, held = "LOSS", fp, dates[pos + d], d; break
+                outcome, xp, xd, held = "LOSS", fp, dates[entry_pos + d], d; break
 
-        if outcome == "HOLD" and pos + holding_days < len(prices):
-            xp   = prices[pos + holding_days]
-            held = holding_days
-            xd   = dates[pos + holding_days] if pos + holding_days < len(dates) else entry_date
+        if outcome == "HOLD" and entry_pos + holding_days < len(prices):
+            xp      = prices[entry_pos + holding_days]
+            held    = holding_days
+            xd_idx  = entry_pos + holding_days
+            xd      = dates[xd_idx] if xd_idx < len(dates) else dates[-1]
             outcome = "WIN" if xp > ep else "LOSS"
 
         ret_pct = (xp - ep) / ep * 100
         rows.append({
-            "進場日":   entry_date.date(),
-            "訊號":     df.loc[entry_date, "Signal"],
-            "進場價":   round(ep, 2),
-            "出場價":   round(xp, 2),
-            "出場日":   xd.date() if hasattr(xd, "date") else xd,
-            "持有天":   held,
-            "報酬%":    round(ret_pct, 2),
-            "結果":     outcome,
+            "進場日":  entry_date.date(),
+            "訊號":    df.loc[entry_date, "Signal"],
+            "進場價":  round(ep, 2),
+            "出場價":  round(xp, 2),
+            "出場日":  xd.date() if hasattr(xd, "date") else xd,
+            "持有天":  held,
+            "報酬%":   round(ret_pct, 2),
+            "結果":    outcome,
         })
 
     if not rows:
@@ -836,268 +847,339 @@ def optimize_params(df: pd.DataFrame, base_p: dict) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400)
-def auto_optimize_cci(symbol: str, period: str, base_params: dict) -> dict:
+def auto_optimize_cci(symbol: str, period: str,
+                      holding_days: int, profit_target: float, stop_loss: float,
+                      vol_ma_period: int, rsi_period: int,
+                      kd_period: int, ema2: int) -> dict:
     """
-    Per-stock CCI auto-optimisation (cached 24h).
-    Searches 5 CCI periods × 3 vol thresholds = 15 combinations.
-    Returns the best {cci_period, vol_multiplier, win_rate, avg_return, total}.
-    Falls back to global params if not enough trades found.
+    Per-stock CCI optimisation — searches 5 CCI × 3 vol = 15 combinations.
+    Cache key uses only the params that affect optimisation outcome (scalar args,
+    not a dict — dict args prevent reliable st.cache_data caching).
+    Changing holding_days/profit_target/stop_loss correctly invalidates the cache.
     """
     df_raw, _ = fetch_data(symbol, period)
     if df_raw is None or len(df_raw) < 80:
-        return {"cci_period": base_params["cci_period"],
-                "vol_multiplier": base_params["vol_multiplier"],
-                "win_rate": 0, "avg_return": 0, "total": 0,
-                "optimised": False}
+        return {"cci_period": 39, "vol_multiplier": 1.5,
+                "win_rate": 0, "avg_return": 0, "total": 0, "optimised": False}
+
+    # Minimal param set for optimisation (no divergence = fast)
+    base = dict(
+        vol_ma_period=vol_ma_period, vol_strong_multiplier=2.5,
+        rsi_period=rsi_period, rsi_oversold=30, rsi_overbought=70,
+        macd_fast=12, macd_slow=26, macd_signal=9,
+        kd_period=kd_period, kd_smooth=3, kd_d=3,
+        kd_oversold=20, kd_overbought=80, obv_ma=20,
+        ema1=10, ema2=ema2, bb_period=20,
+        use_divergence=False, div_lookback=25,
+        min_confluence=5, accel_threshold=0.3, trend_filter=True,
+        holding_days=holding_days,
+        profit_target=profit_target,
+        stop_loss=stop_loss,
+    )
 
     best = None
     for cp in [14, 20, 26, 39, 52]:
         for vm in [1.2, 1.5, 2.0]:
-            p2 = {**base_params, "cci_period": cp, "vol_multiplier": vm,
-                  "use_divergence": False}
             try:
+                p2  = {**base, "cci_period": cp, "vol_multiplier": vm}
                 df2 = generate_signals(df_raw, p2)
-                bt  = backtest(df2,
-                               base_params["holding_days"],
-                               base_params["profit_target"],
-                               base_params["stop_loss"])
+                bt  = backtest(df2, holding_days, profit_target, stop_loss)
                 if bt["total"] < 3:
                     continue
-                # Score = win_rate weighted by avg_return (penalise low sample)
                 score = bt["win_rate"] + max(bt["avg_return"], 0) * 2
                 if best is None or score > best["_score"]:
-                    best = {
-                        "cci_period":    cp,
-                        "vol_multiplier": vm,
-                        "win_rate":      bt["win_rate"],
-                        "avg_return":    bt["avg_return"],
-                        "total":         bt["total"],
-                        "optimised":     True,
-                        "_score":        score,
-                    }
+                    best = {"cci_period": cp, "vol_multiplier": vm,
+                            "win_rate": bt["win_rate"], "avg_return": bt["avg_return"],
+                            "total": bt["total"], "optimised": True, "_score": score}
             except Exception:
                 pass
 
-    if best is None:
-        return {"cci_period": base_params["cci_period"],
-                "vol_multiplier": base_params["vol_multiplier"],
-                "win_rate": 0, "avg_return": 0, "total": 0,
-                "optimised": False}
-    return best
+    return best or {"cci_period": 39, "vol_multiplier": 1.5,
+                    "win_rate": 0, "avg_return": 0, "total": 0, "optimised": False}
 
 
 # ══════════════════════════════════════════════
 # 台股中文名稱對照表（靜態，零 API 呼叫）
 # ══════════════════════════════════════════════
 _TW_NAMES: dict[str, tuple[str, str]] = {
-    # ── 半導體 ──────────────────────────────────
-    "2330": ("台積電",   "上市"), "2303": ("聯電",     "上市"),
-    "2454": ("聯發科",   "上市"), "2379": ("瑞昱",     "上市"),
-    "2344": ("華邦電",   "上市"), "3711": ("日月光投控","上市"),
-    "2408": ("南亞科",   "上市"), "3034": ("聯詠",     "上市"),
-    "2385": ("群光",     "上市"), "2449": ("京元電子", "上市"),
-    "6147": ("頎邦",     "上市"), "2436": ("偉詮電",   "上市"),
-    "5483": ("中美晶",   "上市"), "3443": ("創意",     "上市"),
-    "2351": ("順德工業", "上市"), "2388": ("威盛",     "上市"),
-    "6269": ("台郡",     "上市"), "3考0": ("亞矽",     "上市"),
-    "3661": ("世芯-KY",  "上櫃"), "6415": ("矽力-KY",  "上櫃"),
-    "5269": ("祥碩",     "上櫃"), "4966": ("譜瑞-KY",  "上櫃"),
-    "6271": ("同欣電",   "上櫃"), "3105": ("穩懋",     "上市"),
-    "2412": ("中華電",   "上市"), "6510": ("精測",     "上市"),
-    "2368": ("金像電",   "上市"), "2363": ("矽統",     "上市"),
-    "3714": ("兆利",     "上市"), "6533": ("晶心科",   "上櫃"),
-    "3706": ("神盾",     "上市"), "4961": ("天鈺",     "上櫃"),
-    "6770": ("力積電",   "上市"), "2397": ("友通",     "上市"),
-    "3037": ("欣興",     "上市"), "6288": ("聯嘉光電", "上市"),
-    # ── 電子零組件 / PCB ────────────────────────
-    "2317": ("鴻海",     "上市"), "2382": ("廣達",     "上市"),
-    "2353": ("宏碁",     "上市"), "2356": ("英業達",   "上市"),
-    "2308": ("台達電",   "上市"), "2327": ("國巨",     "上市"),
-    "2360": ("致茂",     "上市"), "2301": ("光寶科",   "上市"),
-    "2354": ("鴻準",     "上市"), "3231": ("緯創",     "上市"),
-    "2357": ("華碩",     "上市"), "3019": ("亞光",     "上市"),
-    "2377": ("微星",     "上市"), "2376": ("技嘉",     "上市"),
-    "2395": ("研華",     "上市"), "6214": ("精誠",     "上市"),
-    "2365": ("昆盈",     "上市"), "2347": ("聯強",     "上市"),
-    "3596": ("智易",     "上市"), "4938": ("和碩",     "上市"),
-    "2406": ("國碩",     "上市"), "2345": ("智邦",     "上市"),
-    "3231": ("緯創",     "上市"), "2329": ("華泰",     "上市"),
-    "2324": ("仁寶",     "上市"), "2313": ("華通",     "上市"),
-    "6239": ("力成",     "上市"), "2352": ("佳世達",   "上市"),
-    "2340": ("光磊",     "上市"), "3037": ("欣興",     "上市"),
-    "6121": ("新普",     "上市"), "2342": ("茂矽",     "上市"),
-    "3702": ("大聯大",   "上市"), "2332": ("友訊",     "上市"),
-    "2393": ("億光",     "上市"), "3006": ("晶豪科",   "上櫃"),
-    "8299": ("群電",     "上櫃"), "5315": ("科風",     "上市"),
-    # ── 面板 / 光電 ─────────────────────────────
-    "2409": ("友達",     "上市"), "3481": ("群創",     "上市"),
-    "2475": ("華映",     "上市"), "3312": ("弘凱",     "上市"),
-    "2398": ("虹光",     "上市"), "2371": ("大同",     "上市"),
-    "3149": ("正達",     "上市"), "5483": ("中美晶",   "上市"),
-    # ── 通訊 / 網路 ─────────────────────────────
-    "2498": ("宏達電",   "上市"), "2316": ("楠梓電",   "上市"),
-    "4904": ("遠傳",     "上市"), "4G00": ("台灣大",   "上市"),
-    "3通0": ("亞太電",   "上市"), "2412": ("中華電",   "上市"),
-    "6116": ("彩晶",     "上市"), "4906": ("正文",     "上市"),
-    "3通1": ("稜研",     "上市"),
-    # ── 金融 ────────────────────────────────────
-    "2882": ("國泰金",   "上市"), "2881": ("富邦金",   "上市"),
-    "2886": ("兆豐金",   "上市"), "2884": ("玉山金",   "上市"),
-    "2891": ("中信金",   "上市"), "2892": ("第一金",   "上市"),
-    "2885": ("元大金",   "上市"), "2880": ("華南金",   "上市"),
-    "2887": ("台新金",   "上市"), "2883": ("開發金",   "上市"),
-    "2888": ("新光金",   "上市"), "2889": ("國票金",   "上市"),
-    "2890": ("永豐金",   "上市"), "5880": ("合庫金",   "上市"),
-    "2801": ("彰銀",     "上市"), "2812": ("台中銀",   "上市"),
-    "2820": ("華票",     "上市"), "2836": ("台灣企銀", "上市"),
-    "2838": ("聯邦銀",   "上市"), "2834": ("臺企銀",   "上市"),
-    "5876": ("上海商銀", "上市"), "6005": ("群益期",   "上市"),
-    "2823": ("中壽",     "上市"), "2833": ("台壽保",   "上市"),
-    "2850": ("新產",     "上市"), "2851": ("中再保",   "上市"),
-    "2816": ("旺旺保",   "上市"),
-    # ── 石化 / 原料 ─────────────────────────────
-    "1301": ("台塑",     "上市"), "1303": ("南亞",     "上市"),
-    "1326": ("台化",     "上市"), "6505": ("台塑化",   "上市"),
-    "1305": ("華夏",     "上市"), "1308": ("亞東",     "上市"),
-    "1312": ("國喬",     "上市"), "1313": ("聯成",     "上市"),
-    "1702": ("南僑",     "上市"), "1710": ("東聯",     "上市"),
-    "1722": ("台肥",     "上市"), "1301": ("台塑",     "上市"),
-    # ── 鋼鐵 / 金屬 ─────────────────────────────
-    "2002": ("中鋼",     "上市"), "2006": ("東和鋼鐵", "上市"),
-    "2022": ("聚亨",     "上市"), "2038": ("海光",     "上市"),
-    "2049": ("上銀",     "上市"), "2014": ("中鴻",     "上市"),
-    "2015": ("豐興",     "上市"), "2017": ("官田鋼",   "上市"),
-    # ── 汽車 / 機械 ─────────────────────────────
-    "2201": ("裕隆",     "上市"), "2204": ("中華汽車", "上市"),
-    "2207": ("和泰車",   "上市"), "2227": ("裕日車",   "上市"),
-    "2239": ("英利-KY",  "上市"), "1590": ("亞德客-KY","上市"),
-    "2049": ("上銀",     "上市"), "1515": ("力山",     "上市"),
-    # ── 食品 ────────────────────────────────────
-    "1210": ("大成",     "上市"), "1216": ("統一",     "上市"),
-    "1217": ("愛之味",   "上市"), "1229": ("聯華",     "上市"),
-    "1231": ("聯華食",   "上市"), "1232": ("大統益",   "上市"),
-    "1234": ("黑松",     "上市"), "1235": ("興泰",     "上市"),
-    "1702": ("南僑",     "上市"),
-    # ── 紡織 ────────────────────────────────────
-    "1402": ("遠東新",   "上市"), "1409": ("新纖",     "上市"),
-    "1417": ("嘉裕",     "上市"), "1418": ("東華",     "上市"),
-    "1432": ("大魯閣",   "上市"), "1434": ("福懋",     "上市"),
-    # ── 水泥 / 建材 ─────────────────────────────
-    "1101": ("台泥",     "上市"), "1102": ("亞泥",     "上市"),
-    "1103": ("嘉泥",     "上市"), "1104": ("環泥",     "上市"),
-    "1108": ("幸福",     "上市"), "1109": ("信大",     "上市"),
-    "1110": ("東泥",     "上市"),
-    # ── 電力 / 能源 ─────────────────────────────
-    "9904": ("寶成",     "上市"), "9910": ("豐泰",     "上市"),
-    "9933": ("中鼎",     "上市"), "9945": ("潤泰新",   "上市"),
-    "9941": ("裕融",     "上市"), "9950": ("萬國通",   "上市"),
-    "5347": ("世界",     "上市"), "5269": ("祥碩",     "上櫃"),
-    # ── 生技 / 醫療 ─────────────────────────────
-    "4128": ("中天",     "上市"), "4153": ("鈺緯",     "上市"),
-    "4170": ("新藥",     "上市"), "4174": ("浩鼎",     "上市"),
-    "4414": ("如興",     "上市"), "6547": ("高端疫苗", "上市"),
-    "4743": ("合一",     "上市"), "6589": ("台康生技", "上市"),
-    "4142": ("國光生",   "上市"), "6461": ("益得",     "上櫃"),
-    "4119": ("旭富",     "上市"), "1789": ("神隆",     "上市"),
-    "4107": ("邦特",     "上市"), "4106": ("雃博",     "上市"),
-    "1776": ("展宇",     "上市"), "4105": ("東洋",     "上市"),
-    # ── 零售 / 通路 ─────────────────────────────
-    "2912": ("統一超",   "上市"), "2903": ("遠百",     "上市"),
-    "2915": ("潤泰全",   "上市"), "2905": ("三商行",   "上市"),
-    "2716": ("旭聯",     "上市"), "5904": ("寶雅",     "上市"),
-    "8050": ("廣隆",     "上市"),
-    # ── 觀光 / 運輸 ─────────────────────────────
-    "2601": ("益航",     "上市"), "2603": ("長榮",     "上市"),
-    "2609": ("陽明",     "上市"), "2615": ("萬海",     "上市"),
-    "2610": ("華航",     "上市"), "2618": ("長榮航",   "上市"),
-    "2882": ("國泰金",   "上市"), "2605": ("新興",     "上市"),
-    "2606": ("裕民",     "上市"), "2617": ("台航",     "上市"),
-    "2637": ("慧洋-KY",  "上市"),
-    # ── ETF ─────────────────────────────────────
-    "0050": ("元大台灣50",   "上市"), "0051": ("元大中型100", "上市"),
-    "0052": ("富邦科技",     "上市"), "0053": ("元大電子",     "上市"),
-    "0054": ("元大台商50",   "上市"), "0055": ("元大MSCI金融","上市"),
-    "0056": ("元大高股息",   "上市"), "006208": ("富邦台50",   "上市"),
-    "00878": ("國泰永續高息","上市"), "00892": ("富邦台灣半導體","上市"),
-    "00881": ("國泰台灣5G",  "上市"), "00919": ("群益台灣精選高息","上市"),
-    "00900": ("富邦特選高股息","上市"), "00929": ("復華台灣科技優息","上市"),
-    "00940": ("元大台灣價值高息","上市"),
-    # ── 化工 / 材料 ──────────────────────────────
-    "1717": ("長興",     "上市"), "1711": ("永光",     "上市"),
-    "1712": ("興農",     "上市"), "1714": ("和桐",     "上市"),
-    "1718": ("中纖",     "上市"), "1723": ("中碳",     "上市"),
-    "1725": ("元禎",     "上市"), "1730": ("花仙子",   "上市"),
-    "1737": ("台鹽",     "上市"), "1773": ("勝一",     "上市"),
-    "4806": ("昱展新藥", "上市"), "4532": ("瑞友",     "上市"),
-    # ── PCB / 電路板 ─────────────────────────────
-    "6274": ("台燿",     "上市"), "3037": ("欣興",     "上市"),
-    "2367": ("燿華",     "上市"), "6269": ("台郡",     "上市"),
-    "2365": ("昆盈",     "上市"), "3189": ("景碩",     "上市"),
-    "8046": ("南電",     "上市"), "4966": ("譜瑞-KY",  "上櫃"),
-    "3374": ("精材",     "上市"), "3706": ("神盾",     "上市"),
-    "6153": ("嘉聯益",   "上市"), "3016": ("嘉晶",     "上市"),
-    "2367": ("燿華電子", "上市"), "3035": ("智原",     "上市"),
-    # ── 被動元件 ─────────────────────────────────
-    "2317": ("鴻海",     "上市"), "2330": ("台積電",   "上市"),
-    "2338": ("光罩",     "上市"), "2457": ("飛信半導體","上市"),
-    "6271": ("同欣電",   "上市"), "2409": ("友達",     "上市"),
-    "3044": ("健鼎",     "上市"), "3324": ("雙鴻",     "上市"),
-    "3443": ("創意",     "上市"), "3030": ("聯鈞",     "上市"),
-    "3152": ("璟德",     "上市"), "3264": ("欣銓",     "上市"),
-    # ── 電源 / 散熱 ──────────────────────────────
-    "3515": ("華擎",     "上市"), "3481": ("群創",     "上市"),
-    "6415": ("矽力-KY",  "上櫃"), "3533": ("嘉澤",     "上市"),
-    "3576": ("新日興",   "上市"), "3680": ("家登",     "上市"),
-    "3587": ("貿聯-KY",  "上市"), "3591": ("艾訊",     "上市"),
-    "3596": ("智易",     "上市"), "3605": ("宏致",     "上市"),
-    "3607": ("顯示科技", "上市"), "3617": ("碩天",     "上市"),
-    "3622": ("洋華",     "上市"), "3673": ("TPK-KY",  "上市"),
-    "3675": ("德微",     "上市"), "3679": ("天虹",     "上市"),
-    "3686": ("達能",     "上市"), "3689": ("湧德電子", "上市"),
-    "3698": ("隆達",     "上市"), "3701": ("大眾電腦", "上市"),
-    "3702": ("大聯大",   "上市"), "3704": ("合勤科技", "上市"),
-    "3706": ("神盾",     "上市"), "3711": ("日月光投控","上市"),
-    "3714": ("兆利",     "上市"), "3715": ("定穎投控", "上市"),
-    "3720": ("力致",     "上市"), "3722": ("同致",     "上市"),
-    "3726": ("本土科技", "上市"), "3729": ("群電",     "上市"),
-    "3731": ("明泰",     "上市"), "3737": ("友達光電", "上市"),
-    # ── 更多上市熱門 ─────────────────────────────
-    "1303": ("南亞",     "上市"), "1301": ("台塑",     "上市"),
-    "1326": ("台化",     "上市"), "2002": ("中鋼",     "上市"),
-    "2207": ("和泰車",   "上市"), "2357": ("華碩",     "上市"),
-    "2360": ("致茂",     "上市"), "2376": ("技嘉",     "上市"),
-    "2383": ("台光電",   "上市"), "2395": ("研華",     "上市"),
-    "2408": ("南亞科",   "上市"), "2474": ("可成",     "上市"),
-    "2492": ("華新科",   "上市"), "2498": ("宏達電",   "上市"),
-    "2603": ("長榮",     "上市"), "2609": ("陽明",     "上市"),
-    "2615": ("萬海",     "上市"), "2618": ("長榮航",   "上市"),
-    "2882": ("國泰金",   "上市"), "2884": ("玉山金",   "上市"),
-    "2885": ("元大金",   "上市"), "2886": ("兆豐金",   "上市"),
-    "2891": ("中信金",   "上市"), "2892": ("第一金",   "上市"),
-    "3008": ("大立光",   "上市"), "3034": ("聯詠",     "上市"),
-    "3037": ("欣興",     "上市"), "3293": ("鈊象",     "上市"),
-    "4904": ("遠傳",     "上市"), "5274": ("信驊",     "上櫃"),
-    "5880": ("合庫金",   "上市"), "6230": ("超豐",     "上市"),
-    "6409": ("旭隼",     "上市"), "6451": ("訊芯-KY",  "上市"),
-    "6456": ("GIS-KY",  "上市"), "6533": ("晶心科",   "上櫃"),
-    "6541": ("泰碩",     "上市"), "6669": ("緯穎",     "上市"),
-    "6770": ("力積電",   "上市"), "8016": ("矽創",     "上市"),
-    "8046": ("南電",     "上市"), "8299": ("群電",     "上櫃"),
-    # ── 其他熱門 ────────────────────────────────
-    "2404": ("漢唐",     "上市"), "2451": ("創見",     "上市"),
-    "2399": ("映泰",     "上市"), "2231": ("為升",     "上市"),
-    "4763": ("材料-KY",  "上市"), "2337": ("旺宏",     "上市"),
-    "2048": ("勝麗",     "上市"), "4934": ("太醫",     "上市"),
-    "2379": ("瑞昱",     "上市"), "3533": ("嘉澤",     "上市"),
-    "2486": ("一詮",     "上市"), "6689": ("聯陽",     "上市"),
-    "5876": ("上海商銀", "上市"), "2360": ("致茂",     "上市"),
-    "6409": ("旭隼",     "上市"), "3293": ("鈊象",     "上市"),
-    "4966": ("譜瑞-KY",  "上櫃"), "6271": ("同欣電",   "上櫃"),
-    "3661": ("世芯-KY",  "上櫃"), "5269": ("祥碩",     "上櫃"),
-    "3105": ("穩懋",     "上市"), "6510": ("精測",     "上市"),
-}
-
-# ── Clean up the table: remove any accidentally invalid keys ──
+    "0050": ("元大台灣50", "上市"),
+    "0051": ("元大中型100", "上市"),
+    "0052": ("富邦科技", "上市"),
+    "0053": ("元大電子", "上市"),
+    "0054": ("元大台商50", "上市"),
+    "0056": ("元大高股息", "上市"),
+    "006208": ("富邦台50", "上市"),
+    "00881": ("國泰台灣5G", "上市"),
+    "1101": ("台泥", "上市"),
+    "1102": ("亞泥", "上市"),
+    "1103": ("嘉泥", "上市"),
+    "1104": ("環泥", "上市"),
+    "1108": ("幸福", "上市"),
+    "1109": ("信大", "上市"),
+    "1110": ("東泥", "上市"),
+    "1210": ("大成", "上市"),
+    "1216": ("統一", "上市"),
+    "1217": ("愛之味", "上市"),
+    "1229": ("聯華", "上市"),
+    "1231": ("聯華食", "上市"),
+    "1232": ("大統益", "上市"),
+    "1234": ("黑松", "上市"),
+    "1235": ("興泰", "上市"),
+    "1301": ("台塑", "上市"),
+    "1303": ("南亞", "上市"),
+    "1305": ("華夏", "上市"),
+    "1308": ("亞東", "上市"),
+    "1312": ("國喬", "上市"),
+    "1313": ("聯成", "上市"),
+    "1326": ("台化", "上市"),
+    "1402": ("遠東新", "上市"),
+    "1409": ("新纖", "上市"),
+    "1417": ("嘉裕", "上市"),
+    "1418": ("東華", "上市"),
+    "1432": ("大魯閣", "上市"),
+    "1434": ("福懋", "上市"),
+    "1515": ("力山", "上市"),
+    "1702": ("南僑", "上市"),
+    "1710": ("東聯", "上市"),
+    "1711": ("永光", "上市"),
+    "1712": ("興農", "上市"),
+    "1714": ("和桐", "上市"),
+    "1717": ("長興", "上市"),
+    "1718": ("中纖", "上市"),
+    "1722": ("台肥", "上市"),
+    "1723": ("中碳", "上市"),
+    "1725": ("元禎", "上市"),
+    "1730": ("花仙子", "上市"),
+    "1737": ("台鹽", "上市"),
+    "1773": ("勝一", "上市"),
+    "1776": ("展宇", "上市"),
+    "1789": ("神隆", "上市"),
+    "2002": ("中鋼", "上市"),
+    "2006": ("東和鋼鐵", "上市"),
+    "2014": ("中鴻", "上市"),
+    "2015": ("豐興", "上市"),
+    "2017": ("官田鋼", "上市"),
+    "2022": ("聚亨", "上市"),
+    "2038": ("海光", "上市"),
+    "2048": ("勝麗", "上市"),
+    "2049": ("上銀", "上市"),
+    "2201": ("裕隆", "上市"),
+    "2204": ("中華汽車", "上市"),
+    "2207": ("和泰車", "上市"),
+    "2227": ("裕日車", "上市"),
+    "2231": ("為升", "上市"),
+    "2239": ("英利-KY", "上市"),
+    "2301": ("光寶科", "上市"),
+    "2303": ("聯電", "上市"),
+    "2308": ("台達電", "上市"),
+    "2313": ("華通", "上市"),
+    "2316": ("楠梓電", "上市"),
+    "2317": ("鴻海", "上市"),
+    "2324": ("仁寶", "上市"),
+    "2327": ("國巨", "上市"),
+    "2329": ("華泰", "上市"),
+    "2330": ("台積電", "上市"),
+    "2332": ("友訊", "上市"),
+    "2337": ("旺宏", "上市"),
+    "2338": ("光罩", "上市"),
+    "2340": ("光磊", "上市"),
+    "2342": ("茂矽", "上市"),
+    "2344": ("華邦電", "上市"),
+    "2345": ("智邦", "上市"),
+    "2347": ("聯強", "上市"),
+    "2351": ("順德工業", "上市"),
+    "2352": ("佳世達", "上市"),
+    "2353": ("宏碁", "上市"),
+    "2354": ("鴻準", "上市"),
+    "2356": ("英業達", "上市"),
+    "2357": ("華碩", "上市"),
+    "2360": ("致茂", "上市"),
+    "2363": ("矽統", "上市"),
+    "2365": ("昆盈", "上市"),
+    "2367": ("燿華", "上市"),
+    "2368": ("金像電", "上市"),
+    "2371": ("大同", "上市"),
+    "2376": ("技嘉", "上市"),
+    "2377": ("微星", "上市"),
+    "2379": ("瑞昱", "上市"),
+    "2382": ("廣達", "上市"),
+    "2383": ("台光電", "上市"),
+    "2385": ("群光", "上市"),
+    "2388": ("威盛", "上市"),
+    "2393": ("億光", "上市"),
+    "2395": ("研華", "上市"),
+    "2397": ("友通", "上市"),
+    "2398": ("虹光", "上市"),
+    "2399": ("映泰", "上市"),
+    "2404": ("漢唐", "上市"),
+    "2406": ("國碩", "上市"),
+    "2408": ("南亞科", "上市"),
+    "2409": ("友達", "上市"),
+    "2412": ("中華電", "上市"),
+    "2436": ("偉詮電", "上市"),
+    "2449": ("京元電子", "上市"),
+    "2451": ("創見", "上市"),
+    "2454": ("聯發科", "上市"),
+    "2474": ("可成", "上市"),
+    "2475": ("華映", "上市"),
+    "2486": ("一詮", "上市"),
+    "2492": ("華新科", "上市"),
+    "2498": ("宏達電", "上市"),
+    "2601": ("益航", "上市"),
+    "2603": ("長榮", "上市"),
+    "2605": ("新興", "上市"),
+    "2606": ("裕民", "上市"),
+    "2609": ("陽明", "上市"),
+    "2610": ("華航", "上市"),
+    "2615": ("萬海", "上市"),
+    "2617": ("台航", "上市"),
+    "2618": ("長榮航", "上市"),
+    "2637": ("慧洋-KY", "上市"),
+    "2716": ("旭聯", "上市"),
+    "2801": ("彰銀", "上市"),
+    "2812": ("台中銀", "上市"),
+    "2816": ("旺旺保", "上市"),
+    "2820": ("華票", "上市"),
+    "2823": ("中壽", "上市"),
+    "2833": ("台壽保", "上市"),
+    "2834": ("臺企銀", "上市"),
+    "2836": ("台灣企銀", "上市"),
+    "2838": ("聯邦銀", "上市"),
+    "2850": ("新產", "上市"),
+    "2851": ("中再保", "上市"),
+    "2880": ("華南金", "上市"),
+    "2881": ("富邦金", "上市"),
+    "2882": ("國泰金", "上市"),
+    "2883": ("開發金", "上市"),
+    "2884": ("玉山金", "上市"),
+    "2885": ("元大金", "上市"),
+    "2886": ("兆豐金", "上市"),
+    "2887": ("台新金", "上市"),
+    "2888": ("新光金", "上市"),
+    "2889": ("國票金", "上市"),
+    "2890": ("永豐金", "上市"),
+    "2891": ("中信金", "上市"),
+    "2892": ("第一金", "上市"),
+    "2903": ("遠百", "上市"),
+    "2905": ("三商行", "上市"),
+    "2912": ("統一超", "上市"),
+    "2915": ("潤泰全", "上市"),
+    "3006": ("晶豪科", "上櫃"),
+    "3008": ("大立光", "上市"),
+    "3016": ("嘉晶", "上市"),
+    "3019": ("亞光", "上市"),
+    "3030": ("聯鈞", "上市"),
+    "3034": ("聯詠", "上市"),
+    "3035": ("智原", "上市"),
+    "3037": ("欣興", "上市"),
+    "3044": ("健鼎", "上市"),
+    "3105": ("穩懋", "上市"),
+    "3149": ("正達", "上市"),
+    "3152": ("璟德", "上市"),
+    "3189": ("景碩", "上市"),
+    "3231": ("緯創", "上市"),
+    "3264": ("欣銓", "上市"),
+    "3293": ("鈊象", "上市"),
+    "3312": ("弘凱", "上市"),
+    "3324": ("雙鴻", "上市"),
+    "3374": ("精材", "上市"),
+    "3443": ("創意", "上市"),
+    "3481": ("群創", "上市"),
+    "3515": ("華擎", "上市"),
+    "3533": ("嘉澤", "上市"),
+    "3576": ("新日興", "上市"),
+    "3587": ("貿聯-KY", "上市"),
+    "3591": ("艾訊", "上市"),
+    "3596": ("智易", "上市"),
+    "3605": ("宏致", "上市"),
+    "3607": ("顯示科技", "上市"),
+    "3617": ("碩天", "上市"),
+    "3622": ("洋華", "上市"),
+    "3661": ("世芯-KY", "上櫃"),
+    "3673": ("TPK-KY", "上市"),
+    "3675": ("德微", "上市"),
+    "3679": ("天虹", "上市"),
+    "3680": ("家登", "上市"),
+    "3686": ("達能", "上市"),
+    "3689": ("湧德電子", "上市"),
+    "3698": ("隆達", "上市"),
+    "3701": ("大眾電腦", "上市"),
+    "3702": ("大聯大", "上市"),
+    "3704": ("合勤科技", "上市"),
+    "3706": ("神盾", "上市"),
+    "3714": ("兆利", "上市"),
+    "3715": ("定穎投控", "上市"),
+    "3720": ("力致", "上市"),
+    "3722": ("同致", "上市"),
+    "3726": ("本土科技", "上市"),
+    "3729": ("群電", "上市"),
+    "3731": ("明泰", "上市"),
+    "3737": ("友達光電", "上市"),
+    "4105": ("東洋", "上市"),
+    "4106": ("雃博", "上市"),
+    "4107": ("邦特", "上市"),
+    "4119": ("旭富", "上市"),
+    "4128": ("中天", "上市"),
+    "4142": ("國光生", "上市"),
+    "4153": ("鈺緯", "上市"),
+    "4170": ("新藥", "上市"),
+    "4174": ("浩鼎", "上市"),
+    "4414": ("如興", "上市"),
+    "4532": ("瑞友", "上市"),
+    "4743": ("合一", "上市"),
+    "4763": ("材料-KY", "上市"),
+    "4806": ("昱展新藥", "上市"),
+    "4904": ("遠傳", "上市"),
+    "4906": ("正文", "上市"),
+    "4934": ("太醫", "上市"),
+    "4938": ("和碩", "上市"),
+    "4961": ("天鈺", "上櫃"),
+    "4966": ("譜瑞-KY", "上櫃"),
+    "5269": ("祥碩", "上櫃"),
+    "5274": ("信驊", "上櫃"),
+    "5315": ("科風", "上市"),
+    "5347": ("世界", "上市"),
+    "5483": ("中美晶", "上市"),
+    "5876": ("上海商銀", "上市"),
+    "5880": ("合庫金", "上市"),
+    "5904": ("寶雅", "上市"),
+    "6005": ("群益期", "上市"),
+    "6116": ("彩晶", "上市"),
+    "6121": ("新普", "上市"),
+    "6147": ("頎邦", "上市"),
+    "6153": ("嘉聯益", "上市"),
+    "6214": ("精誠", "上市"),
+    "6230": ("超豐", "上市"),
+    "6239": ("力成", "上市"),
+    "6269": ("台郡", "上市"),
+    "6271": ("同欣電", "上櫃"),
+    "6274": ("台燿", "上市"),
+    "6288": ("聯嘉光電", "上市"),
+    "6409": ("旭隼", "上市"),
+    "6415": ("矽力-KY", "上櫃"),
+    "6451": ("訊芯-KY", "上市"),
+    "6456": ("GIS-KY", "上市"),
+    "6461": ("益得", "上櫃"),
+    "6505": ("台塑化", "上市"),
+    "6510": ("精測", "上市"),
+    "6533": ("晶心科", "上櫃"),
+    "6541": ("泰碩", "上市"),
+    "6547": ("高端疫苗", "上市"),
+    "6589": ("台康生技", "上市"),
+    "6669": ("緯穎", "上市"),
+    "6689": ("聯陽", "上市"),
+    "6770": ("力積電", "上市"),
+    "8016": ("矽創", "上市"),
+    "8046": ("南電", "上市"),
+    "8050": ("廣隆", "上市"),
+    "8299": ("群電", "上櫃"),
+    "9904": ("寶成", "上市"),
+    "9910": ("豐泰", "上市"),
+    "9933": ("中鼎", "上市"),
+    "9941": ("裕融", "上市"),
+    "9945": ("潤泰新", "上市"),
+    "9950": ("萬國通", "上市"),
+}# ── Clean up the table: remove any accidentally invalid keys ──
 _TW_NAMES = {k: v for k, v in _TW_NAMES.items()
              if k.isdigit() or (len(k) >= 4 and k[:4].isdigit())}
 
@@ -1328,7 +1410,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
     fig.add_trace(go.Bar(
         x=df.index, y=df["CCI"], marker_color=cci_colors, name="CCI", showlegend=False,
     ), row=3, col=1)
-    # Trend zone overlays on CCI panel — use add_shape (more compatible than add_vrect)
+    # Trend zone overlays on CCI panel — use add_shape with correct xref
     if "TrendScore" in df.columns:
         uptrend_mask  = df["TrendScore"] >= 2
         dwntrend_mask = df["TrendScore"] <= -2
@@ -1336,7 +1418,6 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
                                (dwntrend_mask, "rgba(232,65,78,0.07)")]:
             if not mask.any():
                 continue
-            # Find consecutive runs and add one shape per run
             runs_start = None
             prev_val   = False
             for idx, val in enumerate(mask):
@@ -1346,7 +1427,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
                     try:
                         fig.add_shape(
                             type="rect",
-                            xref="x3", yref="y3 domain",
+                            xref="x", yref="y3 domain",   # shared x-axis = "x"
                             x0=df.index[runs_start], x1=df.index[idx - 1],
                             y0=0, y1=1,
                             fillcolor=fill_col, line_width=0, layer="below",
@@ -1355,12 +1436,11 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
                         pass
                     runs_start = None
                 prev_val = bool(val)
-            # Last run reaches end of data
             if runs_start is not None:
                 try:
                     fig.add_shape(
                         type="rect",
-                        xref="x3", yref="y3 domain",
+                        xref="x", yref="y3 domain",
                         x0=df.index[runs_start], x1=df.index[-1],
                         y0=0, y1=1,
                         fillcolor=fill_col, line_width=0, layer="below",
@@ -1786,9 +1866,11 @@ def main():
     # TAB 1  訊號掃描
     # ─────────────────────────────────────────
     with tab_scan:
-        c_hd, c_btn = st.columns([4, 1])
+        c_hd, c_scan, c_opt = st.columns([3, 1, 1])
         c_hd.markdown("#### 📡 即時掃描 — 量價訊號")
-        run_scan = c_btn.button("🔄 掃描", type="primary", width='stretch')
+        run_scan = c_scan.button("🔄 掃描", type="primary", width='stretch')
+        run_opt  = c_opt.button("⚡ 優化CCI", width='stretch',
+                                help="為每支股票獨立回測，找出最佳CCI週期（約1-2分鐘）")
 
         # Sort mode selector
         sort_mode = st.radio(
@@ -1797,18 +1879,49 @@ def main():
             horizontal=True, label_visibility="collapsed",
         )
 
+        # ── ⚡ Optimise CCI per stock (separate, deferred) ──────────────────
+        if run_opt and st.session_state.get("scan_rows"):
+            wl      = st.session_state.watchlist
+            total_n = max(len(wl), 1)
+            opt_map = {}
+            prog2   = st.progress(0, text="個股CCI優化中…")
+            for i, code in enumerate(wl):
+                prog2.progress((i + 1) / total_n,
+                               text=f"優化 {code} ({i+1}/{total_n})…")
+                try:
+                    opt = auto_optimize_cci(
+                        code, data_period,
+                        holding_days, profit_target, stop_loss,
+                        vol_ma_period, rsi_period, kd_period, ema2
+                    )
+                    bare = code.upper().replace(".TW","").replace(".TWO","")
+                    opt_map[bare] = opt
+                except Exception:
+                    pass
+            prog2.empty()
+            st.session_state.cci_opt_map = opt_map
+            # Patch rows with optimised results
+            for row in st.session_state.scan_rows:
+                o = opt_map.get(row["代號"])
+                if o and o["optimised"]:
+                    row["最佳CCI"]  = o["cci_period"]
+                    row["勝率%"]    = o["win_rate"]
+                    row["平均報酬%"] = o["avg_return"]
+                    row["_win_rate"] = o["win_rate"]
+            st.success(f"✅ 優化完成 — {len(opt_map)} 支股票已更新最佳CCI")
+
+        # ── 🔄 Main scan ────────────────────────────────────────────────────
         if run_scan:
             rows      = []
             failed    = []
             wl        = st.session_state.watchlist
             total_n   = max(len(wl), 1)
-            prog      = st.progress(0, text="初始化...")
-
-            prog.progress(0.02, text="載入股票名稱…")
+            # ▶ Load names first (no progress advance — prevents backwards bar)
             try:
                 name_cache = batch_fetch_names(tuple(wl))
             except Exception:
                 name_cache = {}
+            prog = st.progress(0, text="掃描中…")
 
             for i, code in enumerate(wl):
                 prog.progress((i + 1) / total_n,
@@ -1818,11 +1931,16 @@ def main():
                     failed.append(f"{code}: {err or '資料不足'}")
                     continue
 
-                # ── ① Auto-optimise CCI for this stock (cached 24h) ──
-                opt = auto_optimize_cci(code, data_period, params)
+                # Use globally-cached per-stock CCI if already optimised,
+                # otherwise fall back to global params
+                bare        = code.upper().replace(".TW","").replace(".TWO","")
+                opt_map     = st.session_state.get("cci_opt_map", {})
+                opt         = opt_map.get(bare, {})
+                best_cci    = opt.get("cci_period",    cci_period)
+                best_vm     = opt.get("vol_multiplier", vol_multiplier)
                 stock_params = {**params,
-                                "cci_period":    opt["cci_period"],
-                                "vol_multiplier": opt["vol_multiplier"]}
+                                "cci_period":    best_cci,
+                                "vol_multiplier": best_vm}
 
                 try:
                     df_sig = generate_signals(df_raw, stock_params)
@@ -1830,11 +1948,9 @@ def main():
                     failed.append(f"{code}: 訊號計算失敗 ({e})")
                     continue
 
-                bt    = backtest(df_sig,
-                                 holding_days, profit_target, stop_loss)
+                bt    = backtest(df_sig, holding_days, profit_target, stop_loss)
                 quote = fetch_quote(code)
 
-                bare   = code.upper().replace(".TW", "").replace(".TWO", "")
                 cached = name_cache.get(bare)
                 if cached and cached[0]:
                     cn_name, mkt_label = cached
@@ -1857,18 +1973,16 @@ def main():
                 mom  = round(float(latest.get("MomScore",       0) or 0), 1)
                 conf = int(  float(latest.get("ConfluenceScore", 0) or 0))
                 trnd = int(  float(latest.get("TrendScore",      0) or 0))
-                k_v  = latest.get("K",   np.nan)
-                d_v  = latest.get("D",   np.nan)
+                k_v  = latest.get("K", np.nan)
+                d_v  = latest.get("D", np.nan)
                 k_val = round(float(k_v), 1) if pd.notna(k_v) else "-"
                 d_val = round(float(d_v), 1) if pd.notna(d_v) else "-"
                 vol_r = round(float(latest["Vol_Ratio"]), 2) if pd.notna(latest["Vol_Ratio"]) else 0.0
 
-                # Win rate: use per-stock optimised result if available
-                win_rate   = opt["win_rate"]   if opt["optimised"] else bt["win_rate"]
-                avg_return = opt["avg_return"] if opt["optimised"] else bt["avg_return"]
-                best_cci   = opt["cci_period"]
-                opt_flag   = "✓" if opt["optimised"] else ""
+                win_rate   = opt.get("win_rate",   bt["win_rate"])   if opt.get("optimised") else bt["win_rate"]
+                avg_return = opt.get("avg_return", bt["avg_return"]) if opt.get("optimised") else bt["avg_return"]
 
+                # Fix 3: always use fixed "CCI" column name
                 rows.append({
                     "代號":     bare,
                     "名稱":     cn_name,
@@ -1879,7 +1993,7 @@ def main():
                     "趨勢":     trnd,
                     "最新價":   price,
                     "漲跌%":    round(chg_p, 2),
-                    f"CCI({best_cci})": round(float(latest["CCI"]), 1) if pd.notna(latest["CCI"]) else "-",
+                    "CCI":      round(float(latest["CCI"]), 1) if pd.notna(latest["CCI"]) else "-",
                     f"RSI({rsi_period})": round(float(latest["RSI"]), 1) if pd.notna(latest["RSI"]) else "-",
                     "K值":      k_val,
                     "D值":      d_val,
@@ -1893,7 +2007,6 @@ def main():
                     "_mom":     mom,
                     "_vol_r":   vol_r,
                     "_conf":    conf,
-                    # For today's signal panel
                     "_price":   price,
                     "_chg_p":   round(chg_p, 2),
                     "_cn_name": cn_name,
@@ -1907,13 +2020,18 @@ def main():
             st.session_state.scan_failed    = failed
             st.session_state.scan_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+            prog.empty()
+            st.session_state.scan_rows      = rows
+            st.session_state.scan_failed    = failed
+            st.session_state.scan_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
         rows      = st.session_state.scan_rows
         failed    = st.session_state.get("scan_failed", [])
         scan_time = st.session_state.get("scan_timestamp", "")
 
         if rows:
             # ══════════════════════════════════════════════════════
-            # 今日訊號高亮面板 — 只顯示有明確買賣訊號的股票
+            # 近期訊號高亮面板 — 有明確買賣訊號的股票 (近5日內)
             # ══════════════════════════════════════════════════════
             ACTION_BUY  = {"HIGH_CONF_BUY", "BREAKOUT_BUY", "STRONG_BUY",
                            "BUY", "DIV_BUY", "KD_GOLDEN_ZONE"}
@@ -1924,18 +2042,20 @@ def main():
             today_sell = [r for r in rows if r["_sig_key"] in ACTION_SELL]
             today_warn = [r for r in rows if r["_sig_key"] in ACTION_WARN]
 
-            # Sort buy by signal priority then win_rate
             today_buy  = sorted(today_buy,  key=lambda r: (SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_win_rate"]))
             today_sell = sorted(today_sell, key=lambda r: (SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_win_rate"]))
 
+            opt_done = bool(st.session_state.get("cci_opt_map"))
+
             if today_buy or today_sell:
+                opt_badge = ' <span style="background:#1a3a20;color:#00ff88;padding:1px 7px;border-radius:4px;font-size:0.7rem">⚡ CCI已優化</span>' if opt_done else ' <span style="background:#1a2a3a;color:#5a8fb0;padding:1px 7px;border-radius:4px;font-size:0.7rem">點「優化CCI」獲得最佳參數</span>'
                 st.markdown(f"""
                 <div style="background:linear-gradient(135deg,#0d1f12,#0a1628);
                     border:1px solid #1e4030;border-radius:10px;
-                    padding:12px 16px;margin-bottom:12px">
-                <div style="font-family:'Space Mono',monospace;font-size:0.9rem;
-                    color:#00ff88;font-weight:700;margin-bottom:8px">
-                📢 今日訊號股票 — {scan_time}</div>
+                    padding:10px 16px;margin-bottom:10px">
+                <div style="font-family:'Space Mono',monospace;font-size:0.88rem;
+                    color:#00ff88;font-weight:700">
+                📢 近期訊號 (5日內) — {scan_time}{opt_badge}</div>
                 </div>""", unsafe_allow_html=True)
 
                 # Buy signal cards
