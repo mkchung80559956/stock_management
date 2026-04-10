@@ -7,13 +7,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
 import itertools
 import warnings
 import logging
+import pytz
 
 # ── Silence noisy library output in Streamlit Cloud logs ──
 warnings.filterwarnings("ignore")
@@ -1561,6 +1562,53 @@ def watchlist_from_excel(file) -> list[str]:
 
 
 # ══════════════════════════════════════════════
+# 市場時段 & 自動更新
+# ══════════════════════════════════════════════
+
+_TZ_TW = pytz.timezone("Asia/Taipei")
+AUTO_REFRESH_INTERVAL = 15 * 60   # 15 minutes in seconds
+
+
+def tw_now() -> datetime:
+    return datetime.now(_TZ_TW)
+
+
+def is_market_open() -> bool:
+    """台股盤中：週一到週五 09:00–13:30 台北時間"""
+    now = tw_now()
+    if now.weekday() >= 5:          # Saturday / Sunday
+        return False
+    t = now.time()
+    import datetime as _dt
+    return _dt.time(9, 0) <= t <= _dt.time(13, 30)
+
+
+def is_market_day() -> bool:
+    """今天是台股交易日（不含假日，僅排除週末）"""
+    return tw_now().weekday() < 5
+
+
+def seconds_to_next_refresh(last_ts: str, interval: int = AUTO_REFRESH_INTERVAL) -> int:
+    """Return seconds until next auto-refresh (negative = overdue)."""
+    if not last_ts:
+        return 0
+    try:
+        last_dt = _TZ_TW.localize(datetime.strptime(last_ts, "%Y-%m-%d %H:%M"))
+        next_dt = last_dt + timedelta(seconds=interval)
+        remaining = int((next_dt - tw_now()).total_seconds())
+        return remaining
+    except Exception:
+        return 0
+
+
+def format_countdown(seconds: int) -> str:
+    if seconds <= 0:
+        return "即將更新"
+    m, s = divmod(abs(seconds), 60)
+    return f"{m:02d}:{s:02d}"
+
+
+# ══════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════
 
@@ -1729,6 +1777,10 @@ def main():
         st.session_state.watchlist = DEFAULT_WATCHLIST.copy()
     if "scan_rows" not in st.session_state:
         st.session_state.scan_rows = []
+    if "auto_refresh" not in st.session_state:
+        st.session_state.auto_refresh = False
+    if "prev_sig_keys" not in st.session_state:
+        st.session_state.prev_sig_keys = {}   # {代號: sig_key} from last scan
 
     # ══════════════════════════════════════════
     # SIDEBAR
@@ -1866,11 +1918,59 @@ def main():
     # TAB 1  訊號掃描
     # ─────────────────────────────────────────
     with tab_scan:
+        # ── Header row: title + scan + opt + auto-refresh ──
         c_hd, c_scan, c_opt = st.columns([3, 1, 1])
         c_hd.markdown("#### 📡 即時掃描 — 量價訊號")
         run_scan = c_scan.button("🔄 掃描", type="primary", width='stretch')
         run_opt  = c_opt.button("⚡ 優化CCI", width='stretch',
                                 help="為每支股票獨立回測，找出最佳CCI週期（約1-2分鐘）")
+
+        # ── Auto-refresh control row ──
+        ar_col, status_col = st.columns([1, 3])
+        auto_refresh = ar_col.toggle(
+            "🔁 自動更新",
+            value=st.session_state.auto_refresh,
+            help="盤中（09:00-13:30）每15分鐘自動重掃。非盤中時自動停止。",
+        )
+        st.session_state.auto_refresh = auto_refresh
+
+        # Market status + countdown
+        market_open  = is_market_open()
+        market_day   = is_market_day()
+        scan_time    = st.session_state.get("scan_timestamp", "")
+        secs_left    = seconds_to_next_refresh(scan_time)
+        countdown    = format_countdown(secs_left)
+
+        if market_open:
+            mkt_badge = '<span style="background:#0d3a1a;color:#00ff88;padding:1px 8px;border-radius:4px;font-size:0.72rem;font-weight:700">● 盤中</span>'
+        elif market_day:
+            mkt_badge = '<span style="background:#1a2a3a;color:#f0a500;padding:1px 8px;border-radius:4px;font-size:0.72rem;font-weight:700">○ 盤後</span>'
+        else:
+            mkt_badge = '<span style="background:#1a1a2a;color:#5a8fb0;padding:1px 8px;border-radius:4px;font-size:0.72rem">○ 休市</span>'
+
+        status_txt = ""
+        if scan_time:
+            if auto_refresh and market_open:
+                status_txt = f'更新於 {scan_time}　下次 <b>{countdown}</b>'
+            elif auto_refresh and not market_open:
+                status_txt = f'更新於 {scan_time}　（盤後暫停自動更新）'
+            else:
+                status_txt = f'更新於 {scan_time}'
+
+        status_col.markdown(
+            f'{mkt_badge} <span style="font-size:0.75rem;color:#5a8fb0">{status_txt}</span>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Auto-refresh trigger (only during market hours) ──
+        should_auto_scan = (
+            auto_refresh
+            and market_open
+            and bool(st.session_state.scan_rows)  # only re-scan if we have prior data
+            and secs_left <= 0
+        )
+        if should_auto_scan:
+            run_scan = True   # piggyback on existing scan logic below
 
         # Sort mode selector
         sort_mode = st.radio(
@@ -2013,21 +2113,51 @@ def main():
                     "_atr_stop": atr_stop,
                     "_win_rate": win_rate,
                     "_detail":  recent_detail,
+                    "_is_new":  False,   # will be updated after loop
                 })
 
             prog.empty()
-            st.session_state.scan_rows      = rows
-            st.session_state.scan_failed    = failed
-            st.session_state.scan_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            # Track which signals changed since the previous scan (NEW badge)
+            prev_keys = st.session_state.get("prev_sig_keys", {})
+            new_signals = set()
+            for r in rows:
+                old_sig = prev_keys.get(r["代號"])
+                if old_sig != r["_sig_key"] and r["_sig_key"] not in ("NEUTRAL", "RISING", "FALLING", "BULL_ZONE", "BEAR_ZONE"):
+                    new_signals.add(r["代號"])
+                r["_is_new"] = r["代號"] in new_signals
 
-            prog.empty()
+            # Save current signals as previous for next comparison
+            st.session_state.prev_sig_keys  = {r["代號"]: r["_sig_key"] for r in rows}
             st.session_state.scan_rows      = rows
             st.session_state.scan_failed    = failed
-            st.session_state.scan_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            st.session_state.scan_timestamp = tw_now().strftime("%Y-%m-%d %H:%M")
+            # NOTE: do NOT call st.rerun() here — the scan just completed;
+            # next auto-refresh is triggered when user returns to the page
+            # and secs_left <= 0 fires the should_auto_scan flag above.
 
         rows      = st.session_state.scan_rows
         failed    = st.session_state.get("scan_failed", [])
         scan_time = st.session_state.get("scan_timestamp", "")
+
+        # ── Auto-rerun countdown (only while market open + auto on) ──
+        if auto_refresh and market_open and scan_time:
+            secs = seconds_to_next_refresh(scan_time)
+            if secs > 0:
+                # Show countdown — use JS meta-refresh to reload page after N seconds
+                # This avoids blocking the server thread (no sleep)
+                st.caption(
+                    f"⏱ 自動更新倒數：**{format_countdown(secs)}** "
+                    f"（每{AUTO_REFRESH_INTERVAL//60}分鐘）"
+                )
+                # Inject a lightweight JS refresh — only fires in user's own browser
+                st.markdown(
+                    f'<meta http-equiv="refresh" content="{max(secs, 30)}">',
+                    unsafe_allow_html=True,
+                )
+            else:
+                # Interval elapsed — trigger a scan on this page load
+                if not run_scan:   # avoid double-scan if user also clicked button
+                    st.rerun()     # rerun triggers should_auto_scan → run_scan = True
 
         if rows:
             # ══════════════════════════════════════════════════════
@@ -2070,6 +2200,7 @@ def main():
                             chg_color = "#e8414e" if r["_chg_p"] >= 0 else "#22cc66"
                             wr_color  = "#00ff88" if r["_win_rate"] >= 60 else "#f0a500" if r["_win_rate"] >= 45 else "#aaaaaa"
                             border    = "#ffd700" if sig_key == "HIGH_CONF_BUY" else "#00ff88"
+                            new_badge = '<span style="background:#ff9900;color:#000;padding:1px 6px;border-radius:3px;font-size:0.65rem;font-weight:700;margin-left:4px">NEW</span>' if r.get("_is_new") else ""
                             with cols[ci]:
                                 st.markdown(f"""
                                 <div style="background:#0d1a2d;border:1.5px solid {border};
@@ -2078,7 +2209,7 @@ def main():
                                     align-items:baseline;margin-bottom:4px">
                                 <span style="font-size:1.05rem;font-weight:700;
                                     color:#e8f4fd;font-family:'Space Mono',monospace">
-                                {r['代號']}</span>
+                                {r['代號']}{new_badge}</span>
                                 <span style="font-size:0.75rem;color:{chg_color};font-weight:600">
                                 {r['_price']:.2f}　{r['_chg_p']:+.2f}%</span>
                                 </div>
