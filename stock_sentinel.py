@@ -3299,13 +3299,10 @@ def main():
                         req = {"type", "code", "date", "price", "shares"}
                         if req.issubset(df_imp.columns):
                             imported = df_imp.to_dict("records")
-                            next_id  = 1
-                            for r in imported:
-                                try:
-                                    r["id"] = int(float(r["id"])) if "id" in r and not pd.isna(r.get("id", float("nan"))) else next_id
-                                except Exception:
-                                    r["id"] = next_id
-                                next_id = max(next_id, r["id"]) + 1
+                            # Always reassign IDs from 1 on import — avoids
+                            # stale IDs (e.g. 7,8,9) from previous sessions
+                            for idx, r in enumerate(imported, start=1):
+                                r["id"] = idx
                                 r["fee"]    = float(r.get("fee",  0) or 0)
                                 r["shares"] = int(float(r.get("shares", 0) or 0))
                                 r["price"]  = float(r.get("price", 0) or 0)
@@ -3799,8 +3796,7 @@ def main():
                 <div style="background:#0a1220;border:2px solid {color};
                     border-radius:14px;padding:16px;margin-bottom:14px">
 
-                  {{/* Header */}}
-                  <div style="display:flex;justify-content:space-between;
+                                  <div style="display:flex;justify-content:space-between;
                       align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
                     <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px">
                       <span style="font-size:1.15rem;font-weight:700;
@@ -3818,8 +3814,7 @@ def main():
                     </div>
                   </div>
 
-                  {{/* P&L summary */}}
-                  <div style="display:flex;gap:16px;font-size:0.78rem;flex-wrap:wrap;
+                                  <div style="display:flex;gap:16px;font-size:0.78rem;flex-wrap:wrap;
                       margin-bottom:10px;padding:6px 10px;background:#05080f;border-radius:8px">
                     <span>現價 <b style="color:#e8f4fd">{card['cur_price']:.2f}</b></span>
                     <span>均成本 <b style="color:#8a9bb5">{card['avg_px']:.2f}</b></span>
@@ -3829,23 +3824,20 @@ def main():
                     <span>市值 <b style="color:#e8f4fd">{card['mkt_val']:,}元</b></span>
                   </div>
 
-                  {{/* 5-dimension analysis */}}
-                  <div style="margin-bottom:10px">
+                                  <div style="margin-bottom:10px">
                     <div style="font-size:0.72rem;color:#37474f;margin-bottom:4px">
                       ▸ 五維度分析
                     </div>
                     {step_html}
                   </div>
 
-                  {{/* Execution plan */}}
-                  <div style="background:#0b1520;border-left:3px solid {color};
+                                  <div style="background:#0b1520;border-left:3px solid {color};
                       padding:8px 12px;border-radius:0 8px 8px 0;font-size:0.78rem;
                       color:#8a9bb5;line-height:1.7">
                     {exec_lines}
                   </div>
 
-                  {{/* Technical reference row */}}
-                  <div style="display:flex;gap:12px;font-size:0.7rem;
+                                  <div style="display:flex;gap:12px;font-size:0.7rem;
                       color:#37474f;margin-top:8px;flex-wrap:wrap">
                     <span>CCI {cci_txt}</span>
                     <span>RSI {rsi_txt}</span>
