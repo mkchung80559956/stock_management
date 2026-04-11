@@ -12,6 +12,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
 import itertools
+import json
+import os
 import warnings
 import logging
 import pytz
@@ -1887,6 +1889,80 @@ def format_countdown(seconds: int) -> str:
 # MAIN
 # ══════════════════════════════════════════════
 
+
+
+# ══════════════════════════════════════════════
+# PERSISTENT TRADE STORE  (3-layer resilience)
+# ══════════════════════════════════════════════
+_TRADE_FILE = "/tmp/sentinel_trades.json"
+
+
+@st.cache_resource
+def _get_trade_store() -> dict:
+    """
+    Singleton dict living in cache_resource — survives st.rerun() and
+    browser tab changes within the same Streamlit server process.
+    On first call we try to restore from the /tmp backup file.
+    Structure: {"trades": [...], "next_id": int}
+    """
+    store = {"trades": [], "next_id": 1}
+    try:
+        if os.path.exists(_TRADE_FILE):
+            with open(_TRADE_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded.get("trades"), list):
+                store["trades"]  = loaded["trades"]
+                store["next_id"] = int(loaded.get("next_id", 1))
+    except Exception:
+        pass   # corrupt file — start fresh
+    return store
+
+
+def _save_trades(store: dict) -> None:
+    """Atomically write the store to the /tmp backup file."""
+    try:
+        tmp = _TRADE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"trades": store["trades"],
+                       "next_id": store["next_id"]}, f, ensure_ascii=False)
+        os.replace(tmp, _TRADE_FILE)   # atomic rename
+    except Exception:
+        pass
+
+
+def port_add_trade(trade: dict) -> None:
+    store = _get_trade_store()
+    store["trades"].append(trade)
+    store["next_id"] += 1
+    _save_trades(store)
+
+
+def port_delete_trade(trade_id: int) -> bool:
+    store = _get_trade_store()
+    before = len(store["trades"])
+    store["trades"] = [t for t in store["trades"] if t["id"] != trade_id]
+    changed = len(store["trades"]) < before
+    if changed:
+        _save_trades(store)
+    return changed
+
+
+def port_replace_trades(new_list: list, reset_id: bool = False) -> None:
+    store = _get_trade_store()
+    store["trades"] = new_list
+    if reset_id:
+        store["next_id"] = max((t.get("id", 0) for t in new_list), default=0) + 1
+    _save_trades(store)
+
+
+def port_get_trades() -> list:
+    return _get_trade_store()["trades"]
+
+
+def port_next_id() -> int:
+    return _get_trade_store()["next_id"]
+
+
 DEFAULT_WATCHLIST = [
     # 上市 (TSE .TW) ─────────────────────────────
     "2330",   # 台積電
@@ -2056,11 +2132,8 @@ def main():
         st.session_state.auto_refresh = False
     if "prev_sig_keys" not in st.session_state:
         st.session_state.prev_sig_keys = {}
-    # Portfolio / trade journal state
-    if "portfolio_trades" not in st.session_state:
-        st.session_state.portfolio_trades = []   # list of trade dicts
-    if "portfolio_next_id" not in st.session_state:
-        st.session_state.portfolio_next_id = 1
+    # Portfolio trades now managed via port_get_trades() / port_add_trade()
+    # No session_state needed — cache_resource + /tmp file handle persistence
 
     # ══════════════════════════════════════════
     # SIDEBAR
@@ -3147,7 +3220,7 @@ def main():
                     })
             return closed
 
-        trades_all = st.session_state.portfolio_trades
+        trades_all = port_get_trades()
 
         # ══════════════════════════════════════════════════════
         # SECTION A — 新增交易記錄
@@ -3182,7 +3255,7 @@ def main():
                 code_final = (t_cust.strip() or t_code).upper().replace(".TW","").replace(".TWO","")
                 cn, _ = fetch_name(code_final)
                 new_trade = {
-                    "id":     st.session_state.portfolio_next_id,
+                    "id":     port_next_id(),
                     "type":   t_type,
                     "code":   code_final,
                     "name":   cn or code_final,
@@ -3191,21 +3264,18 @@ def main():
                     "shares": int(t_shares),
                     "fee":    float(t_fee),
                 }
-                # Validate sell doesn't exceed position
                 if t_type == "賣出":
                     pos_now = get_open_positions(trades_all)
                     held    = pos_now.get(code_final, {}).get("shares", 0)
                     if t_shares > held:
                         st.error(f"⚠️ 持倉只有 {held} 股，無法賣出 {t_shares} 股")
                     else:
-                        st.session_state.portfolio_trades.append(new_trade)
-                        st.session_state.portfolio_next_id += 1
-                        st.success(f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}")
+                        port_add_trade(new_trade)
+                        st.success(f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}　（已自動儲存）")
                         st.rerun()
                 else:
-                    st.session_state.portfolio_trades.append(new_trade)
-                    st.session_state.portfolio_next_id += 1
-                    st.success(f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}")
+                    port_add_trade(new_trade)
+                    st.success(f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}　（已自動儲存）")
                     st.rerun()
 
         # Import / Export
@@ -3232,14 +3302,15 @@ def main():
                     req = {"type","code","date","price","shares"}
                     if req.issubset(df_imp.columns):
                         imported = df_imp.to_dict("records")
+                        next_id  = 1
                         for r in imported:
                             if "id" not in r or pd.isna(r.get("id")):
-                                r["id"] = st.session_state.portfolio_next_id
-                                st.session_state.portfolio_next_id += 1
-                            r["fee"] = float(r.get("fee", 0) or 0)
-                            r["name"] = str(r.get("name",""))
-                        st.session_state.portfolio_trades = imported
-                        st.success(f"✅ 已匯入 {len(imported)} 筆交易")
+                                r["id"] = next_id
+                            next_id = max(next_id, int(r.get("id", 0))) + 1
+                            r["fee"]  = float(r.get("fee", 0) or 0)
+                            r["name"] = str(r.get("name", ""))
+                        port_replace_trades(imported, reset_id=True)
+                        st.success(f"✅ 已匯入 {len(imported)} 筆交易（已自動儲存）")
                         st.rerun()
                     else:
                         st.error(f"欄位不足，需包含：{req}")
@@ -3506,25 +3577,59 @@ def main():
         # SECTION D — 完整交易明細 & 刪除
         # ══════════════════════════════════════════════════════
         with st.expander("📑 所有交易記錄（可刪除）"):
-            if trades_all:
-                df_all = pd.DataFrame(trades_all)
+            trades_now = port_get_trades()
+            if trades_now:
+                df_all = pd.DataFrame(trades_now)
                 st.dataframe(df_all[["id","type","code","name","date",
                                       "price","shares","fee"]],
                              width='stretch', hide_index=True)
                 del_id = st.number_input("刪除指定 ID", min_value=1,
                                          step=1, key="del_id")
                 if st.button("🗑 刪除此筆記錄", key="del_btn"):
-                    before = len(trades_all)
-                    st.session_state.portfolio_trades = [
-                        t for t in trades_all if t["id"] != int(del_id)]
-                    after = len(st.session_state.portfolio_trades)
-                    if before != after:
-                        st.success(f"已刪除 ID={del_id}")
+                    ok = port_delete_trade(int(del_id))
+                    if ok:
+                        st.success(f"已刪除 ID={del_id}（已自動儲存）")
                         st.rerun()
                     else:
                         st.warning(f"找不到 ID={del_id}")
             else:
                 st.info("暫無交易記錄")
+
+        # ── Emergency export + storage status ──────────────────
+        st.markdown("---")
+        trades_now = port_get_trades()
+        file_ok    = os.path.exists(_TRADE_FILE)
+        n_trades   = len(trades_now)
+
+        if n_trades > 0:
+            store_color = "#00ff88" if file_ok else "#f0a500"
+            store_msg   = (f"✅ 已自動儲存 {n_trades} 筆記錄 到本地備份"
+                           if file_ok else
+                           f"⚠️ 本地備份未建立 — 請立即匯出 Excel 保存資料")
+            st.markdown(
+                f'<div style="background:#0a1a0f;border:1.5px solid {store_color};'
+                f'border-radius:8px;padding:10px 14px;display:flex;'
+                f'align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
+                f'<span style="color:{store_color};font-size:0.82rem">{store_msg}</span>'
+                f'<span style="color:#37474f;font-size:0.72rem">'
+                f'重要：容器重啟（每天）後備份消失 — 請定期匯出 Excel 永久儲存</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            # Always-visible emergency export button
+            dl_em = to_excel(pd.DataFrame(trades_now))
+            st.download_button(
+                label=f"🆘 立即匯出備份 ({n_trades} 筆交易)",
+                data=dl_em,
+                file_name=f"sentinel_trades_backup_{tw_now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                width='stretch',
+            )
+            st.caption(
+                "💡 匯出的 Excel 可在下次重啟後用「📥 匯入交易記錄 Excel」按鈕還原所有記錄。"
+                "建議每次新增交易後都匯出一次備份。"
+            )
 
 
 if __name__ == "__main__":
