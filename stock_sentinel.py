@@ -3764,90 +3764,69 @@ def main():
                              "下次交易日":"#f0a500","觀察":"#5a8fb0"}
                 urg_col   = urg_colors.get(urgency, "#5a8fb0")
 
-                # Build step pills HTML
-                step_html = ""
-                for step_lbl, step_txt in rec["steps"]:
-                    step_html += (
-                        f'<div style="background:#0d1a2d;border-radius:6px;'
-                        f'padding:4px 10px;margin:3px 0;font-size:0.75rem">'
-                        f'<span style="color:#8a9bb5;font-weight:600">{step_lbl}</span>'
-                        f'<span style="color:#5a7a90;margin-left:6px">{step_txt}</span>'
-                        f'</div>'
-                    )
+                exec_plan_lines = rec["exec_plan"].strip().split("\n")
 
-                # Sell quantity badge
-                sell_badge = ""
-                if rec["sell_shares"] > 0:
-                    sell_badge = (
-                        f'<span style="background:#ff1a44;color:#fff;padding:2px 10px;'
-                        f'border-radius:4px;font-size:0.78rem;font-weight:700;margin-left:8px">'
-                        f'賣 {rec["sell_shares"]:,} 股 ({rec["sell_pct"]}%)</span>'
-                    )
-                elif rec["entry_add_pct"] > 0:
-                    sell_badge = (
-                        f'<span style="background:#00aa55;color:#fff;padding:2px 10px;'
-                        f'border-radius:4px;font-size:0.78rem;font-weight:700;margin-left:8px">'
-                        f'加 {rec["entry_add_pct"]}% 部位</span>'
-                    )
+                # ── Card using native Streamlit (no raw HTML) ──
+                border_css = (
+                    f"border-left:4px solid {color};"
+                    f"padding:10px 14px;margin-bottom:12px;"
+                    f"background:#0a1220;border-radius:0 10px 10px 0"
+                )
+                st.markdown(
+                    f'<div style="{border_css}">'
+                    f'<span style="font-size:1.1rem;font-weight:700;color:#e8f4fd;'
+                    f'font-family:Space Mono,monospace">{card["code"]}</span>'
+                    f'&nbsp;&nbsp;<span style="color:#8a9bb5;font-size:0.85rem">'
+                    f'{card["name"]}</span>'
+                    f'&nbsp;&nbsp;<span style="font-size:1.0rem;font-weight:700;'
+                    f'color:{color}">{rec["action"]}</span>'
+                    f'&nbsp;&nbsp;<span style="color:{urg_col};font-size:0.72rem;'
+                    f'border:1px solid {urg_col};padding:1px 6px;border-radius:4px">'
+                    f'⏰ {urgency}</span>'
+                    + (f'&nbsp;&nbsp;<span style="background:#ff1a44;color:#fff;'
+                       f'padding:1px 8px;border-radius:4px;font-size:0.75rem">'
+                       f'賣 {rec["sell_shares"]:,}股 ({rec["sell_pct"]}%)</span>'
+                       if rec["sell_shares"] > 0 else
+                       f'&nbsp;&nbsp;<span style="background:#006633;color:#fff;'
+                       f'padding:1px 8px;border-radius:4px;font-size:0.75rem">'
+                       f'加 {rec["entry_add_pct"]}% 部位</span>'
+                       if rec["entry_add_pct"] > 0 else "")
+                    + f'</div>',
+                    unsafe_allow_html=True,
+                )
 
-                exec_lines = rec["exec_plan"].replace("\n", "<br>").replace("   ", "&nbsp;&nbsp;&nbsp;")
+                # P&L row
+                ca, cb, cc, cd, ce = st.columns(5)
+                ca.metric("現價",   f"{card['cur_price']:.2f}")
+                cb.metric("均成本", f"{card['avg_px']:.2f}")
+                cc.metric("持股",   f"{card['shares']:,}股")
+                cd.metric("損益",   f"{card['unreal_p']:+.1f}%",
+                          f"{card['unreal']:+,}元")
+                ce.metric("市值",   f"{card['mkt_val']//10000:.1f}萬")
 
-                st.markdown(f"""
-                <div style="background:#0a1220;border:2px solid {color};
-                    border-radius:14px;padding:16px;margin-bottom:14px">
+                # 5-dimension steps
+                with st.expander("▸ 五維度分析", expanded=False):
+                    for step_lbl, step_txt in rec["steps"]:
+                        st.caption(f"**{step_lbl}** {step_txt}")
 
-                                  <div style="display:flex;justify-content:space-between;
-                      align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
-                    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px">
-                      <span style="font-size:1.15rem;font-weight:700;
-                          color:#e8f4fd;font-family:Space Mono,monospace">{card['code']}</span>
-                      <span style="color:#8a9bb5;font-size:0.85rem">{card['name']}</span>
-                      {sell_badge}
-                    </div>
-                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                      <span style="color:{urg_col};font-size:0.72rem;font-weight:700;
-                          padding:1px 8px;border:1px solid {urg_col};border-radius:4px">
-                        ⏰ {urgency}</span>
-                      <span style="font-size:1.0rem;font-weight:700;
-                          color:{color};padding:3px 14px;
-                          background:rgba(0,0,0,0.35);border-radius:8px">{rec['action']}</span>
-                    </div>
-                  </div>
+                # Execution plan
+                st.markdown(
+                    f'<div style="background:#0b1520;border-left:3px solid {color};'
+                    f'padding:8px 12px;border-radius:0 6px 6px 0;'
+                    f'font-size:0.78rem;color:#8a9bb5;line-height:1.8;'
+                    f'white-space:pre-line">'
+                    + "\n".join(l.strip() for l in exec_plan_lines)
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
 
-                                  <div style="display:flex;gap:16px;font-size:0.78rem;flex-wrap:wrap;
-                      margin-bottom:10px;padding:6px 10px;background:#05080f;border-radius:8px">
-                    <span>現價 <b style="color:#e8f4fd">{card['cur_price']:.2f}</b></span>
-                    <span>均成本 <b style="color:#8a9bb5">{card['avg_px']:.2f}</b></span>
-                    <span>持股 <b style="color:#e8f4fd">{card['shares']:,}</b> 股</span>
-                    <span>損益 <b style="color:{pnl_col}">{card['unreal_p']:+.1f}%</b>
-                      <b style="color:{pnl_col};font-size:0.72rem">（{card['unreal']:+,}元）</b></span>
-                    <span>市值 <b style="color:#e8f4fd">{card['mkt_val']:,}元</b></span>
-                  </div>
-
-                                  <div style="margin-bottom:10px">
-                    <div style="font-size:0.72rem;color:#37474f;margin-bottom:4px">
-                      ▸ 五維度分析
-                    </div>
-                    {step_html}
-                  </div>
-
-                                  <div style="background:#0b1520;border-left:3px solid {color};
-                      padding:8px 12px;border-radius:0 8px 8px 0;font-size:0.78rem;
-                      color:#8a9bb5;line-height:1.7">
-                    {exec_lines}
-                  </div>
-
-                                  <div style="display:flex;gap:12px;font-size:0.7rem;
-                      color:#37474f;margin-top:8px;flex-wrap:wrap">
-                    <span>CCI {cci_txt}</span>
-                    <span>RSI {rsi_txt}</span>
-                    <span>K值 {k_txt}</span>
-                    <span>共振 {card['conf']}/7</span>
-                    <span>加速 {card['accel']:+.2f}</span>
-                    <span>訊號 {SIGNAL_LABEL.get(card['sig_key'],'─')}</span>
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
+                # Technical reference
+                st.caption(
+                    f"CCI {cci_txt} · RSI {rsi_txt} · K值 {k_txt} · "
+                    f"共振 {card['conf']}/7 · 加速 {card['accel']:+.2f} · "
+                    f"訊號 {SIGNAL_LABEL.get(card['sig_key'], '─')}"
+                )
+                st.markdown("---")
 
         # ══════════════════════════════════════════════════════
         # SECTION C — 歷史交易績效
