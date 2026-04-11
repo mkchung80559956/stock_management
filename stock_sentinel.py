@@ -3630,11 +3630,10 @@ def main():
         if not trades_all:
             st.info("🔍 尚無交易記錄 — 點上方「➕ 新增交易」開始記錄")
 
-        if trades_all:
-          # ══════════════════════════════════════════════════════
-          # SECTION B — 持倉總覽 + 即時損益 + 策略建議
-          # ══════════════════════════════════════════════════════
-          open_pos = get_open_positions(trades_all)
+        # ══════════════════════════════════════════════════════
+        # SECTION B — 持倉總覽 + 即時損益 + 策略建議
+        # ══════════════════════════════════════════════════════
+        open_pos = get_open_positions(trades_all) if trades_all else {}
 
         if open_pos:
             st.markdown("---")
