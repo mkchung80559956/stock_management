@@ -3651,7 +3651,7 @@ def main():
                 # Live price
                 q           = fetch_quote(code)
                 quote_live  = bool(q.get("price"))
-                cur_price   = q.get("price") or round(float(df_raw["Close"].iloc[-1]), 2) if df_raw is not None else avg_px
+                cur_price   = q.get("price") or avg_px   # df_raw fetched below
                 chg_pct     = q.get("change_pct") or 0.0
 
                 # Unrealised P&L
@@ -3661,6 +3661,9 @@ def main():
 
                 # Technical signal
                 df_raw, _ = fetch_data(code, "6mo")
+                # Refine cur_price fallback now that df_raw is available
+                if not quote_live and df_raw is not None and len(df_raw) > 0:
+                    cur_price = round(float(df_raw["Close"].iloc[-1]), 2)
                 sig_key, sig_detail = "NEUTRAL", ""
                 trend, conf, accel  = 0, 0, 0.0
                 cci_v, rsi_v, k_v   = np.nan, np.nan, np.nan
