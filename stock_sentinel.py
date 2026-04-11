@@ -3271,51 +3271,68 @@ def main():
                         st.error(f"⚠️ 持倉只有 {held} 股，無法賣出 {t_shares} 股")
                     else:
                         port_add_trade(new_trade)
-                        st.success(f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}　（已自動儲存）")
+                        st.session_state["_port_msg"] = f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}　（已自動儲存）"
                         st.rerun()
                 else:
                     port_add_trade(new_trade)
-                    st.success(f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}　（已自動儲存）")
+                    st.session_state["_port_msg"] = f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}　（已自動儲存）"
                     st.rerun()
+
+        # ── Persistent status message (shown after rerun) ──
+        if "_port_msg" in st.session_state:
+            st.success(st.session_state.pop("_port_msg"))
 
         # Import / Export
         col_imp, col_exp = st.columns(2)
-        with col_exp:
-            if trades_all:
-                df_export = pd.DataFrame(trades_all)
-                st.download_button(
-                    "📤 匯出交易記錄 Excel",
-                    data=to_excel(df_export),
-                    file_name=f"trades_{tw_now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width='stretch',
-                )
         with col_imp:
             up_trades = st.file_uploader(
                 "📥 匯入交易記錄 Excel",
                 type=["xlsx"],
                 key="port_import",
             )
-            if up_trades:
-                try:
-                    df_imp = pd.read_excel(up_trades)
-                    req = {"type","code","date","price","shares"}
-                    if req.issubset(df_imp.columns):
-                        imported = df_imp.to_dict("records")
-                        next_id  = 1
-                        for r in imported:
-                            if "id" not in r or pd.isna(r.get("id")):
-                                r["id"] = next_id
-                            next_id = max(next_id, int(r.get("id", 0))) + 1
-                            r["fee"]  = float(r.get("fee", 0) or 0)
-                            r["name"] = str(r.get("name", ""))
-                        port_replace_trades(imported, reset_id=True)
-                        st.success(f"✅ 已匯入 {len(imported)} 筆交易（已自動儲存）")
-                        st.rerun()
-                    else:
-                        st.error(f"欄位不足，需包含：{req}")
-                except Exception as e:
-                    st.error(f"匯入失敗：{e}")
+            if up_trades is not None:
+                # Guard: only process if we haven't already imported this file this run
+                file_sig = f"{up_trades.name}_{up_trades.size}"
+                if st.session_state.get("_last_import_sig") != file_sig:
+                    try:
+                        df_imp = pd.read_excel(up_trades)
+                        req = {"type", "code", "date", "price", "shares"}
+                        if req.issubset(df_imp.columns):
+                            imported = df_imp.to_dict("records")
+                            next_id  = 1
+                            for r in imported:
+                                try:
+                                    r["id"] = int(float(r["id"])) if "id" in r and not pd.isna(r.get("id", float("nan"))) else next_id
+                                except Exception:
+                                    r["id"] = next_id
+                                next_id = max(next_id, r["id"]) + 1
+                                r["fee"]    = float(r.get("fee",  0) or 0)
+                                r["shares"] = int(float(r.get("shares", 0) or 0))
+                                r["price"]  = float(r.get("price", 0) or 0)
+                                r["name"]   = str(r.get("name", ""))
+                                r["type"]   = str(r.get("type", "買入"))
+                                r["code"]   = str(r.get("code", ""))
+                                r["date"]   = str(r.get("date", ""))
+                            port_replace_trades(imported, reset_id=True)
+                            st.session_state["_last_import_sig"] = file_sig
+                            st.session_state["_port_msg"] = f"✅ 已成功匯入 {len(imported)} 筆交易記錄並自動儲存"
+                            # Rerun to refresh display with new data
+                            st.rerun()
+                        else:
+                            missing = req - set(df_imp.columns)
+                            st.error(f"欄位不足，缺少：{missing}")
+                    except Exception as e:
+                        st.error(f"匯入失敗：{e}")
+        with col_exp:
+            if trades_all:
+                with st.expander("📤 匯出交易記錄", expanded=False):
+                    st.download_button(
+                        "📤 匯出 Excel",
+                        data=to_excel(pd.DataFrame(trades_all)),
+                        file_name=f"trades_{tw_now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width='stretch',
+                    )
 
         if not trades_all:
             st.info("🔍 尚無交易記錄 — 點上方「➕ 新增交易」開始記錄")
@@ -3588,7 +3605,7 @@ def main():
                 if st.button("🗑 刪除此筆記錄", key="del_btn"):
                     ok = port_delete_trade(int(del_id))
                     if ok:
-                        st.success(f"已刪除 ID={del_id}（已自動儲存）")
+                        st.session_state["_port_msg"] = f"已刪除 ID={del_id}（已自動儲存）"
                         st.rerun()
                     else:
                         st.warning(f"找不到 ID={del_id}")
@@ -3603,33 +3620,30 @@ def main():
 
         if n_trades > 0:
             store_color = "#00ff88" if file_ok else "#f0a500"
-            store_msg   = (f"✅ 已自動儲存 {n_trades} 筆記錄 到本地備份"
+            store_msg   = (f"✅ 已自動儲存 {n_trades} 筆記錄到本地備份"
                            if file_ok else
-                           f"⚠️ 本地備份未建立 — 請立即匯出 Excel 保存資料")
+                           f"⚠️ 本地備份未建立 — 請立即匯出 Excel 儲存")
             st.markdown(
                 f'<div style="background:#0a1a0f;border:1.5px solid {store_color};'
-                f'border-radius:8px;padding:10px 14px;display:flex;'
-                f'align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
-                f'<span style="color:{store_color};font-size:0.82rem">{store_msg}</span>'
+                f'border-radius:8px;padding:10px 14px;margin-bottom:8px">'
+                f'<span style="color:{store_color};font-size:0.82rem">{store_msg}</span><br>'
                 f'<span style="color:#37474f;font-size:0.72rem">'
-                f'重要：容器重啟（每天）後備份消失 — 請定期匯出 Excel 永久儲存</span>'
+                f'容器每天重啟後本地備份消失 — 展開下方「立即匯出備份」定期儲存</span>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
-            # Always-visible emergency export button
-            dl_em = to_excel(pd.DataFrame(trades_now))
-            st.download_button(
-                label=f"🆘 立即匯出備份 ({n_trades} 筆交易)",
-                data=dl_em,
-                file_name=f"sentinel_trades_backup_{tw_now().strftime('%Y%m%d_%H%M')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                width='stretch',
-            )
-            st.caption(
-                "💡 匯出的 Excel 可在下次重啟後用「📥 匯入交易記錄 Excel」按鈕還原所有記錄。"
-                "建議每次新增交易後都匯出一次備份。"
-            )
+            # Put download button inside expander — prevents MediaFileHandler spam
+            # from auto-refresh (meta-refresh regenerates file IDs every cycle)
+            with st.expander(f"🆘 立即匯出備份（{n_trades} 筆交易）", expanded=False):
+                st.caption("每次新增/修改交易後請點此匯出，下次重啟後可用匯入還原。")
+                st.download_button(
+                    label="📥 下載備份 Excel",
+                    data=to_excel(pd.DataFrame(trades_now)),
+                    file_name=f"sentinel_trades_{tw_now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    width='stretch',
+                )
 
 
 if __name__ == "__main__":
