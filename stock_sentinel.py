@@ -3385,89 +3385,334 @@ def main():
                     except Exception:
                         pass
 
-                # ── Strategy recommendation engine ──────────────────
-                def _strategy(sig_k, trend_s, conf_s, accel_s, unreal_pct, cur_px, avg_px):
+                # ── Professional Strategy Engine ─────────────────────
+                def _pro_strategy(sig_k, trend_s, conf_s, accel_s,
+                                  unreal_pct, cur_px, avg_px,
+                                  shares_held, atr):
                     """
-                    Returns (action, color, reason) based on 4 dimensions:
-                    訊號強度 + 趨勢 + 共振 + 持倉成本位置
+                    Professional 5-dimension strategy engine.
+                    Returns dict:
+                      action        — badge text
+                      color         — hex colour
+                      sell_pct      — 0/25/50/75/100 % of position to sell
+                      sell_shares   — exact share count (rounded to lot of 1000)
+                      entry_add_pct — % of position to ADD (0 if no add)
+                      steps         — list of (step_label, detail) decision steps
+                      exec_plan     — concrete execution instruction string
+                      urgency       — "立即" / "本週" / "下次交易日" / "觀察"
                     """
-                    sell_sigs = {"STRONG_SELL","DIV_SELL","SELL","FAKE_BREAKOUT","KD_HIGH"}
-                    buy_sigs  = {"HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY","BUY","DIV_BUY"}
-                    strong_buy= {"HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY"}
-                    in_profit = unreal_pct > 0
-                    big_profit= unreal_pct > 15
-                    loss_warn = unreal_pct < -7
+                    sell_sigs   = {"STRONG_SELL","DIV_SELL","SELL","FAKE_BREAKOUT","KD_HIGH"}
+                    strong_sell = {"STRONG_SELL","DIV_SELL"}
+                    warn_sell   = {"SELL","FAKE_BREAKOUT","KD_HIGH"}
+                    buy_sigs    = {"HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY","BUY","DIV_BUY"}
+                    prime_buy   = {"HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY"}
 
-                    # Priority 1: Sell signals + in profit → lock profits
-                    if sig_k in sell_sigs and in_profit:
-                        return ("🔴 建議出場",  "#ff3355",
-                                f"出現{SIGNAL_LABEL.get(sig_k,sig_k)}訊號 + 已獲利 {unreal_pct:.1f}% → 考慮鎖定獲利")
+                    # ATR-based stop (if available)
+                    atr_stop = round(avg_px - atr * 1.5, 2) if pd.notna(atr) and atr > 0 else None
+                    stop_triggered = cur_px < atr_stop if atr_stop else False
 
-                    # Priority 2: Sell signal + in loss → stop loss
-                    if sig_k in sell_sigs and not in_profit:
-                        return ("🔴 考慮停損",  "#ff3355",
-                                f"出現{SIGNAL_LABEL.get(sig_k,sig_k)}訊號 + 虧損 {unreal_pct:.1f}% → 考慮停損保護")
+                    # Profit tiers
+                    small_profit  = 3 < unreal_pct <= 8
+                    mid_profit    = 8 < unreal_pct <= 15
+                    big_profit    = 15 < unreal_pct <= 25
+                    huge_profit   = unreal_pct > 25
+                    small_loss    = -7 <= unreal_pct < 0
+                    mid_loss      = -15 <= unreal_pct < -7
+                    big_loss      = unreal_pct < -15
 
-                    # Priority 3: Strong downtrend
-                    if trend_s <= -2 and not in_profit:
-                        return ("🟡 減碼警示",  "#f0a500",
-                                f"強空頭趨勢 + 虧損 {unreal_pct:.1f}% → 考慮減碼或停損")
+                    steps = []
 
-                    # Priority 4: Big profit + weakening
-                    if big_profit and (conf_s < 4 or accel_s < -0.2):
-                        return ("🟡 部分獲利",  "#f0a500",
-                                f"獲利 {unreal_pct:.1f}% 但動能減弱 → 考慮分批出場鎖定")
+                    # ── DIMENSION 1: 技術訊號 ──────────────────────────
+                    if sig_k in strong_sell:
+                        sig_score = -3
+                        steps.append(("📉 訊號",
+                            f"強力賣出訊號「{SIGNAL_LABEL.get(sig_k,sig_k)}」— 趨勢反轉風險高"))
+                    elif sig_k in warn_sell:
+                        sig_score = -2
+                        steps.append(("⚠️ 訊號",
+                            f"賣出警示「{SIGNAL_LABEL.get(sig_k,sig_k)}」— 動能轉弱"))
+                    elif sig_k in prime_buy:
+                        sig_score = 3
+                        steps.append(("⭐ 訊號",
+                            f"強力買入「{SIGNAL_LABEL.get(sig_k,sig_k)}」— 多頭動能強"))
+                    elif sig_k in buy_sigs:
+                        sig_score = 1
+                        steps.append(("🟢 訊號",
+                            f"買入訊號「{SIGNAL_LABEL.get(sig_k,sig_k)}」— 技術面偏多"))
+                    else:
+                        sig_score = 0
+                        steps.append(("⚪ 訊號",
+                            f"中性「{SIGNAL_LABEL.get(sig_k,sig_k)}」— 等待方向"))
 
-                    # Priority 5: Strong buy signals → add position
-                    if sig_k in strong_buy and trend_s >= 2 and conf_s >= 5:
-                        return ("⭐ 可加碼",    "#ffd700",
-                                f"三重共振+多頭趨勢 + 共振{conf_s}/7 → 技術面支持加碼")
+                    # ── DIMENSION 2: 趨勢 ─────────────────────────────
+                    trend_lbl = {3:"強多頭↑↑",2:"多頭↑",1:"弱多頭",0:"中性",
+                                 -1:"弱空頭",-2:"強空頭↓↓"}
+                    if trend_s >= 2:
+                        steps.append(("📈 趨勢", f"{trend_lbl[trend_s]}：EMA20>EMA60，方向有利"))
+                    elif trend_s == 1:
+                        steps.append(("📊 趨勢", f"{trend_lbl[trend_s]}：趨勢尚未明確確立"))
+                    elif trend_s == 0:
+                        steps.append(("📊 趨勢", "中性盤整：無明顯多空偏向"))
+                    else:
+                        steps.append(("📉 趨勢", f"{trend_lbl.get(trend_s,'─')}：EMA20<EMA60，空頭環境"))
 
-                    # Priority 6: Normal buy + uptrend → hold
+                    # ── DIMENSION 3: 共振強度 ─────────────────────────
+                    if conf_s >= 6:
+                        steps.append(("⭐ 共振", f"{conf_s}/7 指標共振 — 高度確認，訊號可信度高"))
+                    elif conf_s >= 4:
+                        steps.append(("🟡 共振", f"{conf_s}/7 指標共振 — 中度確認"))
+                    else:
+                        steps.append(("🔴 共振", f"{conf_s}/7 指標共振 — 確認度不足，訊號不確定"))
+
+                    # ── DIMENSION 4: 動能加速 ─────────────────────────
+                    if accel_s > 0.5:
+                        steps.append(("🚀 加速", f"CCI+RSI 斜率 {accel_s:+.2f} — 動能快速上升"))
+                    elif accel_s > 0.2:
+                        steps.append(("↗️ 加速", f"CCI+RSI 斜率 {accel_s:+.2f} — 動能緩步改善"))
+                    elif accel_s < -0.3:
+                        steps.append(("⬇️ 減速", f"CCI+RSI 斜率 {accel_s:+.2f} — 動能快速衰退"))
+                    else:
+                        steps.append(("➡️ 平穩", f"CCI+RSI 斜率 {accel_s:+.2f} — 動能持平"))
+
+                    # ── DIMENSION 5: 成本位置 + ATR 停損 ─────────────
+                    if atr_stop:
+                        margin = cur_px - atr_stop
+                        margin_pct = margin / cur_px * 100
+                        steps.append(("🛑 停損",
+                            f"ATR×1.5停損位：{atr_stop:.2f}　"
+                            f"現價距停損 {margin_pct:.1f}%（{'安全' if margin_pct>5 else '接近'}）"))
+                    if huge_profit:
+                        steps.append(("💰 成本",
+                            f"獲利 {unreal_pct:.1f}% — 已達豐厚獲利，保留利潤是優先考量"))
+                    elif big_profit:
+                        steps.append(("💰 成本",
+                            f"獲利 {unreal_pct:.1f}% — 良好獲利，可考慮分批保護"))
+                    elif mid_profit:
+                        steps.append(("💰 成本",
+                            f"獲利 {unreal_pct:.1f}% — 小幅獲利，趨勢持續才有擴大空間"))
+                    elif small_profit:
+                        steps.append(("💰 成本",
+                            f"獲利 {unreal_pct:.1f}% — 剛脫離成本區，不輕易停利"))
+                    elif big_loss:
+                        steps.append(("🚨 成本",
+                            f"虧損 {unreal_pct:.1f}% — 嚴重虧損，必須評估是否停損保本"))
+                    elif mid_loss:
+                        steps.append(("⚠️ 成本",
+                            f"虧損 {unreal_pct:.1f}% — 達停損警戒，觀察下個交易日收盤"))
+                    elif stop_triggered:
+                        steps.append(("🛑 成本",
+                            f"現價 {cur_px:.2f} 跌破 ATR停損位 {atr_stop:.2f} — 停損條件觸發"))
+                    else:
+                        steps.append(("✅ 成本",
+                            f"小幅虧損/微獲利 {unreal_pct:+.1f}%，持倉尚在正常波動範圍"))
+
+                    # ══════════════════════════════════════════════════
+                    # DECISION MATRIX → 精確賣出比例 & 執行計畫
+                    # ══════════════════════════════════════════════════
+                    lot = 1000   # Taiwan stock minimum trading lot
+
+                    def _to_shares(pct, total):
+                        """Round to nearest lot."""
+                        raw = total * pct / 100
+                        return max(lot, round(raw / lot) * lot) if raw >= lot else 0
+
+                    # --- 立即停損 ---
+                    if stop_triggered or (sig_k in strong_sell and big_loss):
+                        sell_pct = 100
+                        sh = shares_held
+                        return dict(
+                            action="🚨 立即停損",  color="#ff0033",
+                            sell_pct=100, sell_shares=sh, entry_add_pct=0, steps=steps,
+                            exec_plan=(
+                                f"📋 執行計畫：全部清倉 {sh:,} 股 @ 市價\n"
+                                f"   停損價位 {atr_stop:.2f if atr_stop else '─'} 已觸發\n"
+                                f"   預計虧損：{int(sh*(cur_px-avg_px)):+,} 元（{unreal_pct:.1f}%）\n"
+                                f"   ⏰ 緊急程度：開盤立即執行"
+                            ),
+                            urgency="立即"
+                        )
+
+                    # --- 強力賣出訊號 + 大幅獲利 → 全部出場 ---
+                    if sig_k in strong_sell and (big_profit or huge_profit):
+                        sh = shares_held
+                        return dict(
+                            action="🔴 全部清倉", color="#ff3355",
+                            sell_pct=100, sell_shares=sh, entry_add_pct=0, steps=steps,
+                            exec_plan=(
+                                f"📋 執行計畫：全部清倉 {sh:,} 股 @ 市價\n"
+                                f"   強力賣出訊號 + 獲利 {unreal_pct:.1f}% → 趨勢反轉跡象\n"
+                                f"   鎖定利潤：{int(unreal):+,} 元\n"
+                                f"   ⏰ 緊急程度：本週完成"
+                            ),
+                            urgency="本週"
+                        )
+
+                    # --- 強力賣出訊號 + 小幅獲利 → 賣出75% ---
+                    if sig_k in strong_sell and small_profit:
+                        sh = _to_shares(75, shares_held)
+                        left = shares_held - sh
+                        return dict(
+                            action="🔴 減碼75%", color="#ff3355",
+                            sell_pct=75, sell_shares=sh, entry_add_pct=0, steps=steps,
+                            exec_plan=(
+                                f"📋 執行計畫：賣出 {sh:,} 股（75%），保留 {left:,} 股\n"
+                                f"   強賣訊號但獲利有限，先保護大部分本金\n"
+                                f"   若破 {atr_stop:.2f if atr_stop else '均成本'} 再清倉剩餘\n"
+                                f"   ⏰ 緊急程度：本週完成"
+                            ),
+                            urgency="本週"
+                        )
+
+                    # --- 強力賣出訊號 + 虧損 → 賣出50% 觀察 ---
+                    if sig_k in strong_sell and (small_loss or mid_loss):
+                        sh = _to_shares(50, shares_held)
+                        left = shares_held - sh
+                        return dict(
+                            action="🔴 減碼50%", color="#ff3355",
+                            sell_pct=50, sell_shares=sh, entry_add_pct=0, steps=steps,
+                            exec_plan=(
+                                f"📋 執行計畫：先賣出 {sh:,} 股（50%），保留 {left:,} 股\n"
+                                f"   訊號偏空但未達強停損，先降低部位風險\n"
+                                f"   停損條件：若跌破 {atr_stop:.2f if atr_stop else '均成本'} → 清倉剩餘\n"
+                                f"   反彈條件：若 CCI 再次突破 -100 + 放量可考慮回補\n"
+                                f"   ⏰ 緊急程度：下次交易日"
+                            ),
+                            urgency="下次交易日"
+                        )
+
+                    # --- 一般賣出訊號 + 大幅/豐厚獲利 → 賣出50% ---
+                    if sig_k in warn_sell and (big_profit or huge_profit):
+                        sh = _to_shares(50, shares_held)
+                        left = shares_held - sh
+                        return dict(
+                            action="🟡 分批出場50%", color="#f0a500",
+                            sell_pct=50, sell_shares=sh, entry_add_pct=0, steps=steps,
+                            exec_plan=(
+                                f"📋 執行計畫：賣出 {sh:,} 股（50%），保留 {left:,} 股\n"
+                                f"   獲利 {unreal_pct:.1f}% 已達分批出場標準\n"
+                                f"   保留倉位待趨勢明朗後再決定（{SIGNAL_LABEL.get(sig_k,'─')} 訊號）\n"
+                                f"   停損調升至成本價 {avg_px:.2f} 保護已實現利潤\n"
+                                f"   ⏰ 緊急程度：本週完成"
+                            ),
+                            urgency="本週"
+                        )
+
+                    # --- 動能衰退 + 豐厚獲利 → 賣出25%鎖定 ---
+                    if accel_s < -0.3 and (big_profit or huge_profit) and sig_k not in buy_sigs:
+                        sh = _to_shares(25, shares_held)
+                        left = shares_held - sh
+                        return dict(
+                            action="🟡 保護25%獲利", color="#f0a500",
+                            sell_pct=25, sell_shares=sh, entry_add_pct=0, steps=steps,
+                            exec_plan=(
+                                f"📋 執行計畫：賣出 {sh:,} 股（25%）鎖定部分獲利\n"
+                                f"   動能加速度 {accel_s:.2f} 顯示趨勢動力衰退\n"
+                                f"   保留 {left:,} 股繼續持有\n"
+                                f"   若 CCI 跌破 0 軸再賣出第2批（25%）\n"
+                                f"   ⏰ 緊急程度：觀察"
+                            ),
+                            urgency="觀察"
+                        )
+
+                    # --- 嚴重虧損（無強賣訊號）→ 評估停損 ---
+                    if big_loss and trend_s <= 0:
+                        sh = _to_shares(50, shares_held)
+                        return dict(
+                            action="⚠️ 停損評估", color="#ff6600",
+                            sell_pct=50, sell_shares=sh, entry_add_pct=0, steps=steps,
+                            exec_plan=(
+                                f"📋 執行計畫：考慮先賣出 {sh:,} 股（50%）降低風險\n"
+                                f"   虧損 {unreal_pct:.1f}% 已超過嚴重虧損警戒（-15%）\n"
+                                f"   空頭趨勢環境下持續持倉風險高\n"
+                                f"   停損標準：若破 {atr_stop:.2f if atr_stop else '均成本×0.93'} → 清倉剩餘\n"
+                                f"   ⏰ 緊急程度：下次交易日決策"
+                            ),
+                            urgency="下次交易日"
+                        )
+
+                    # --- 三重共振加碼 ---
+                    if sig_k in prime_buy and trend_s >= 2 and conf_s >= 5:
+                        add_sh = _to_shares(25, shares_held)   # add 25% more
+                        new_avg = (avg_px * shares_held + cur_px * add_sh) / (shares_held + add_sh)
+                        return dict(
+                            action="⭐ 加碼25%", color="#ffd700",
+                            sell_pct=0, sell_shares=0, entry_add_pct=25, steps=steps,
+                            exec_plan=(
+                                f"📋 執行計畫：加碼買入 {add_sh:,} 股（現有倉位25%）\n"
+                                f"   三重共振訊號 + 多頭趨勢 + {conf_s}/7 共振\n"
+                                f"   加碼後均成本：{new_avg:.2f}（現 {avg_px:.2f}）\n"
+                                f"   加碼停損位：{atr_stop:.2f if atr_stop else '─'}\n"
+                                f"   ⏰ 緊急程度：下次交易日執行"
+                            ),
+                            urgency="下次交易日"
+                        )
+
+                    # --- 續抱（訊號偏多，不操作）---
                     if sig_k in buy_sigs and trend_s >= 1:
-                        return ("🟢 續抱",      "#00ff88",
-                                f"多頭趨勢 + {SIGNAL_LABEL.get(sig_k,sig_k)}訊號 → 趨勢未變，繼續持有")
+                        return dict(
+                            action="🟢 續抱", color="#00ff88",
+                            sell_pct=0, sell_shares=0, entry_add_pct=0, steps=steps,
+                            exec_plan=(
+                                f"📋 執行計畫：維持現有 {shares_held:,} 股，不操作\n"
+                                f"   技術面偏多，趨勢支撐持倉\n"
+                                f"   停損守護：ATR停損 {atr_stop:.2f if atr_stop else '─'}\n"
+                                f"   出場條件：若出現強賣訊號或跌破停損位 → 再評估\n"
+                                f"   ⏰ 緊急程度：觀察"
+                            ),
+                            urgency="觀察"
+                        )
 
-                    # Priority 7: Stop loss triggered
-                    if loss_warn:
-                        return ("🔴 考慮停損",  "#ff3355",
-                                f"虧損已達 {unreal_pct:.1f}% 超過警戒線 → 建議執行停損")
+                    # --- 持有觀察（中性）---
+                    return dict(
+                        action="⚪ 持有觀察", color="#5a8fb0",
+                        sell_pct=0, sell_shares=0, entry_add_pct=0, steps=steps,
+                        exec_plan=(
+                            f"📋 執行計畫：維持現有 {shares_held:,} 股，等待訊號明確\n"
+                            f"   目前無明顯多空訊號，保持紀律等待\n"
+                            f"   停損守護：{atr_stop:.2f if atr_stop else '均成本-7%'}\n"
+                            f"   ⏰ 緊急程度：觀察"
+                        ),
+                        urgency="觀察"
+                    )
 
-                    # Priority 8: Neutral zone
-                    if trend_s >= 1 and conf_s >= 4:
-                        return ("🟢 持有觀望",  "#00ff88",
-                                f"趨勢偏多 + 共振{conf_s}/7 → 靜待更強訊號")
+                # Fetch ATR for stop calculation
+                atr_now = np.nan
+                if df_raw is not None and len(df_raw) >= 20:
+                    try:
+                        atr_now = float(generate_signals(df_raw, params).iloc[-1].get("ATR", np.nan))
+                    except Exception:
+                        pass
 
-                    return ("⚪ 觀望",         "#5a8fb0",
-                            f"趨勢中性 + 訊號{SIGNAL_LABEL.get(sig_k,sig_k)} → 等待明確方向再操作")
-
-                action, act_color, reason = _strategy(
-                    sig_key, trend, conf, accel, unreal_p, cur_price, avg_px)
+                rec = _pro_strategy(
+                    sig_key, trend, conf, accel,
+                    unreal_p, cur_price, avg_px,
+                    shares, atr_now)
 
                 pos_rows.append({
-                    "代號":      code,
-                    "名稱":      p_info.get("name",""),
-                    "股數":      shares,
-                    "均成本":    round(avg_px, 2),
-                    "現價":      round(cur_price, 2),
-                    "漲跌%":     round(chg_pct, 2),
-                    "市值":      int(mkt_val),
-                    "未實現損益": int(unreal),
-                    "報酬%":     round(unreal_p, 2),
-                    "訊號":      SIGNAL_LABEL.get(sig_key, sig_key),
-                    "趨勢":      trend,
-                    "共振":      conf,
-                    "策略建議":  action,
+                    "代號":       code,
+                    "名稱":       p_info.get("name",""),
+                    "股數":       shares,
+                    "均成本":     round(avg_px, 2),
+                    "現價":       round(cur_price, 2),
+                    "漲跌%":      round(chg_pct, 2),
+                    "市值":       int(mkt_val),
+                    "未實現損益":  int(unreal),
+                    "報酬%":      round(unreal_p, 2),
+                    "訊號":       SIGNAL_LABEL.get(sig_key, sig_key),
+                    "趨勢":       trend,
+                    "共振":       conf,
+                    "建議":       rec["action"],
+                    "賣出股數":   rec["sell_shares"] if rec["sell_shares"] > 0 else "-",
+                    "緊急程度":   rec["urgency"],
                 })
                 advice_cards.append({
                     "code": code, "name": p_info.get("name",""),
-                    "action": action, "color": act_color,
-                    "reason": reason, "sig_key": sig_key,
-                    "unreal_p": unreal_p, "unreal": unreal,
+                    "rec": rec, "sig_key": sig_key,
+                    "unreal_p": unreal_p, "unreal": int(unreal),
                     "trend": trend, "conf": conf, "accel": accel,
                     "cci": cci_v, "rsi": rsi_v, "k": k_v,
                     "cur_price": cur_price, "avg_px": avg_px,
-                    "sig_detail": sig_detail,
+                    "shares": shares, "mkt_val": int(mkt_val),
                 })
 
             # Portfolio summary metrics
@@ -3497,64 +3742,114 @@ def main():
                     "趨勢":       st.column_config.NumberColumn(format="%+d"),
                     "共振":       st.column_config.ProgressColumn(
                                   min_value=0, max_value=7, format="%d/7"),
+                    "建議":       st.column_config.TextColumn(help="詳細操作建議見下方卡片"),
+                    "緊急程度":   st.column_config.TextColumn(help="立即/本週/下次交易日/觀察"),
                 },
                 hide_index=True,
             )
 
             # ── Strategy advice cards ──────────────────────────────
-            st.markdown("#### 🎯 個股策略建議")
-            st.caption("根據即時技術面 × 趨勢位置 × 共振強度 × 持倉成本 四維度分析")
-
+            st.markdown("#### 🎯 個股操作建議")
+            urgency_order = {"立即": 0, "本週": 1, "下次交易日": 2, "觀察": 3}
             for card in sorted(advice_cards,
-                               key=lambda c: (0 if "出場" in c["action"] or "停損" in c["action"]
-                                              else 1 if "加碼" in c["action"]
-                                              else 2)):
-                cci_txt  = f"{card['cci']:.1f}" if not np.isnan(card['cci']) else "-"
-                rsi_txt  = f"{card['rsi']:.1f}" if not np.isnan(card['rsi']) else "-"
-                k_txt    = f"{card['k']:.1f}"   if not np.isnan(card['k'])   else "-"
-                pnl_col  = "#00ff88" if card["unreal_p"] >= 0 else "#ff3355"
-                trend_lbl= {3:"強多頭↑↑",2:"多頭↑",1:"弱多頭",0:"中性",
-                            -1:"弱空頭",-2:"強空頭↓↓"}.get(card["trend"],"─")
-                accel_txt= f"{card['accel']:+.2f}" if abs(card["accel"]) > 0.05 else "─"
-                sig_det  = card["sig_detail"][:42] + "…" if len(card["sig_detail"]) > 42 else card["sig_detail"]
+                               key=lambda c: urgency_order.get(c["rec"]["urgency"], 4)):
+                rec       = card["rec"]
+                color     = rec["color"]
+                cci_txt   = f"{card['cci']:.1f}"   if not np.isnan(card['cci']) else "-"
+                rsi_txt   = f"{card['rsi']:.1f}"   if not np.isnan(card['rsi']) else "-"
+                k_txt     = f"{card['k']:.1f}"     if not np.isnan(card['k'])   else "-"
+                pnl_col   = "#00ff88" if card["unreal_p"] >= 0 else "#ff3355"
+                urgency   = rec["urgency"]
+                urg_colors= {"立即":"#ff0033","本週":"#ff6600",
+                             "下次交易日":"#f0a500","觀察":"#5a8fb0"}
+                urg_col   = urg_colors.get(urgency, "#5a8fb0")
+
+                # Build step pills HTML
+                step_html = ""
+                for step_lbl, step_txt in rec["steps"]:
+                    step_html += (
+                        f'<div style="background:#0d1a2d;border-radius:6px;'
+                        f'padding:4px 10px;margin:3px 0;font-size:0.75rem">'
+                        f'<span style="color:#8a9bb5;font-weight:600">{step_lbl}</span>'
+                        f'<span style="color:#5a7a90;margin-left:6px">{step_txt}</span>'
+                        f'</div>'
+                    )
+
+                # Sell quantity badge
+                sell_badge = ""
+                if rec["sell_shares"] > 0:
+                    sell_badge = (
+                        f'<span style="background:#ff1a44;color:#fff;padding:2px 10px;'
+                        f'border-radius:4px;font-size:0.78rem;font-weight:700;margin-left:8px">'
+                        f'賣 {rec["sell_shares"]:,} 股 ({rec["sell_pct"]}%)</span>'
+                    )
+                elif rec["entry_add_pct"] > 0:
+                    sell_badge = (
+                        f'<span style="background:#00aa55;color:#fff;padding:2px 10px;'
+                        f'border-radius:4px;font-size:0.78rem;font-weight:700;margin-left:8px">'
+                        f'加 {rec["entry_add_pct"]}% 部位</span>'
+                    )
+
+                exec_lines = rec["exec_plan"].replace("\n", "<br>").replace("   ", "&nbsp;&nbsp;&nbsp;")
 
                 st.markdown(f"""
-                <div style="background:#0a1220;border:2px solid {card['color']};
-                    border-radius:12px;padding:14px 16px;margin-bottom:12px">
+                <div style="background:#0a1220;border:2px solid {color};
+                    border-radius:14px;padding:16px;margin-bottom:14px">
+
+                  {{/* Header */}}
                   <div style="display:flex;justify-content:space-between;
-                      align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px">
-                    <div>
-                      <span style="font-size:1.1rem;font-weight:700;
+                      align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+                    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px">
+                      <span style="font-size:1.15rem;font-weight:700;
                           color:#e8f4fd;font-family:Space Mono,monospace">{card['code']}</span>
-                      <span style="color:#8a9bb5;font-size:0.85rem;margin-left:8px">{card['name']}</span>
+                      <span style="color:#8a9bb5;font-size:0.85rem">{card['name']}</span>
+                      {sell_badge}
                     </div>
-                    <span style="font-size:1.0rem;font-weight:700;
-                        color:{card['color']};padding:2px 12px;
-                        background:rgba(0,0,0,0.3);border-radius:6px">{card['action']}</span>
+                    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                      <span style="color:{urg_col};font-size:0.72rem;font-weight:700;
+                          padding:1px 8px;border:1px solid {urg_col};border-radius:4px">
+                        ⏰ {urgency}</span>
+                      <span style="font-size:1.0rem;font-weight:700;
+                          color:{color};padding:3px 14px;
+                          background:rgba(0,0,0,0.35);border-radius:8px">{rec['action']}</span>
+                    </div>
                   </div>
-                  <div style="color:#8a9bb5;font-size:0.8rem;margin-bottom:8px;
-                      border-left:3px solid {card['color']};padding-left:8px">
-                    {card['reason']}
+
+                  {{/* P&L summary */}}
+                  <div style="display:flex;gap:16px;font-size:0.78rem;flex-wrap:wrap;
+                      margin-bottom:10px;padding:6px 10px;background:#05080f;border-radius:8px">
+                    <span>現價 <b style="color:#e8f4fd">{card['cur_price']:.2f}</b></span>
+                    <span>均成本 <b style="color:#8a9bb5">{card['avg_px']:.2f}</b></span>
+                    <span>持股 <b style="color:#e8f4fd">{card['shares']:,}</b> 股</span>
+                    <span>損益 <b style="color:{pnl_col}">{card['unreal_p']:+.1f}%</b>
+                      <b style="color:{pnl_col};font-size:0.72rem">（{card['unreal']:+,}元）</b></span>
+                    <span>市值 <b style="color:#e8f4fd">{card['mkt_val']:,}元</b></span>
                   </div>
-                  <div style="display:flex;gap:14px;font-size:0.75rem;flex-wrap:wrap">
-                    <span style="color:#5a8fb0">持倉損益
-                      <b style="color:{pnl_col}">{card['unreal_p']:+.1f}%</b>
-                      （{int(card['unreal']):+,}元）</span>
-                    <span style="color:#5a8fb0">現價/均成本
-                      <b style="color:#e8f4fd">{card['cur_price']:.2f} / {card['avg_px']:.2f}</b></span>
-                    <span style="color:#5a8fb0">趨勢
-                      <b style="color:#e8f4fd">{trend_lbl}</b></span>
-                    <span style="color:#5a8fb0">共振
-                      <b style="color:#e8f4fd">{card['conf']}/7</b></span>
-                    <span style="color:#5a8fb0">訊號
-                      <b style="color:#e8f4fd">{SIGNAL_LABEL.get(card['sig_key'],'─')}</b></span>
+
+                  {{/* 5-dimension analysis */}}
+                  <div style="margin-bottom:10px">
+                    <div style="font-size:0.72rem;color:#37474f;margin-bottom:4px">
+                      ▸ 五維度分析
+                    </div>
+                    {step_html}
                   </div>
-                  <div style="display:flex;gap:14px;font-size:0.72rem;flex-wrap:wrap;margin-top:6px">
-                    <span style="color:#37474f">CCI {cci_txt}</span>
-                    <span style="color:#37474f">RSI {rsi_txt}</span>
-                    <span style="color:#37474f">K值 {k_txt}</span>
-                    <span style="color:#37474f">加速 {accel_txt}</span>
-                    <span style="color:#37474f;font-style:italic">{sig_det}</span>
+
+                  {{/* Execution plan */}}
+                  <div style="background:#0b1520;border-left:3px solid {color};
+                      padding:8px 12px;border-radius:0 8px 8px 0;font-size:0.78rem;
+                      color:#8a9bb5;line-height:1.7">
+                    {exec_lines}
+                  </div>
+
+                  {{/* Technical reference row */}}
+                  <div style="display:flex;gap:12px;font-size:0.7rem;
+                      color:#37474f;margin-top:8px;flex-wrap:wrap">
+                    <span>CCI {cci_txt}</span>
+                    <span>RSI {rsi_txt}</span>
+                    <span>K值 {k_txt}</span>
+                    <span>共振 {card['conf']}/7</span>
+                    <span>加速 {card['accel']:+.2f}</span>
+                    <span>訊號 {SIGNAL_LABEL.get(card['sig_key'],'─')}</span>
                   </div>
                 </div>
                 """, unsafe_allow_html=True)
