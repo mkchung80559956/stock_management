@@ -3410,6 +3410,9 @@ def main():
                     # ATR-based stop (if available)
                     atr_stop = round(avg_px - atr * 1.5, 2) if pd.notna(atr) and atr > 0 else None
                     stop_triggered = cur_px < atr_stop if atr_stop else False
+                    # Pre-compute display strings (cannot use :.2f inside conditional)
+                    atr_stop_txt  = f"{atr_stop:.2f}" if atr_stop else "─"
+                    cost_stop_txt = f"{atr_stop:.2f}" if atr_stop else "均成本"
 
                     # Profit tiers
                     small_profit  = 3 < unreal_pct <= 8
@@ -3525,7 +3528,7 @@ def main():
                             sell_pct=100, sell_shares=sh, entry_add_pct=0, steps=steps,
                             exec_plan=(
                                 f"📋 執行計畫：全部清倉 {sh:,} 股 @ 市價\n"
-                                f"   停損價位 {atr_stop:.2f if atr_stop else '─'} 已觸發\n"
+                                f"   停損價位 {atr_stop_txt} 已觸發\n"
                                 f"   預計虧損：{int(sh*(cur_px-avg_px)):+,} 元（{unreal_pct:.1f}%）\n"
                                 f"   ⏰ 緊急程度：開盤立即執行"
                             ),
@@ -3557,7 +3560,7 @@ def main():
                             exec_plan=(
                                 f"📋 執行計畫：賣出 {sh:,} 股（75%），保留 {left:,} 股\n"
                                 f"   強賣訊號但獲利有限，先保護大部分本金\n"
-                                f"   若破 {atr_stop:.2f if atr_stop else '均成本'} 再清倉剩餘\n"
+                                f"   若破 {cost_stop_txt} 再清倉剩餘\n"
                                 f"   ⏰ 緊急程度：本週完成"
                             ),
                             urgency="本週"
@@ -3573,7 +3576,7 @@ def main():
                             exec_plan=(
                                 f"📋 執行計畫：先賣出 {sh:,} 股（50%），保留 {left:,} 股\n"
                                 f"   訊號偏空但未達強停損，先降低部位風險\n"
-                                f"   停損條件：若跌破 {atr_stop:.2f if atr_stop else '均成本'} → 清倉剩餘\n"
+                                f"   停損條件：若跌破 {cost_stop_txt} → 清倉剩餘\n"
                                 f"   反彈條件：若 CCI 再次突破 -100 + 放量可考慮回補\n"
                                 f"   ⏰ 緊急程度：下次交易日"
                             ),
@@ -3624,7 +3627,7 @@ def main():
                                 f"📋 執行計畫：考慮先賣出 {sh:,} 股（50%）降低風險\n"
                                 f"   虧損 {unreal_pct:.1f}% 已超過嚴重虧損警戒（-15%）\n"
                                 f"   空頭趨勢環境下持續持倉風險高\n"
-                                f"   停損標準：若破 {atr_stop:.2f if atr_stop else '均成本×0.93'} → 清倉剩餘\n"
+                                f"   停損標準：若破 {cost_stop_txt} → 清倉剩餘\n"
                                 f"   ⏰ 緊急程度：下次交易日決策"
                             ),
                             urgency="下次交易日"
@@ -3641,7 +3644,7 @@ def main():
                                 f"📋 執行計畫：加碼買入 {add_sh:,} 股（現有倉位25%）\n"
                                 f"   三重共振訊號 + 多頭趨勢 + {conf_s}/7 共振\n"
                                 f"   加碼後均成本：{new_avg:.2f}（現 {avg_px:.2f}）\n"
-                                f"   加碼停損位：{atr_stop:.2f if atr_stop else '─'}\n"
+                                f"   加碼停損位：{atr_stop_txt}\n"
                                 f"   ⏰ 緊急程度：下次交易日執行"
                             ),
                             urgency="下次交易日"
@@ -3655,7 +3658,7 @@ def main():
                             exec_plan=(
                                 f"📋 執行計畫：維持現有 {shares_held:,} 股，不操作\n"
                                 f"   技術面偏多，趨勢支撐持倉\n"
-                                f"   停損守護：ATR停損 {atr_stop:.2f if atr_stop else '─'}\n"
+                                f"   停損守護：ATR停損 {atr_stop_txt}\n"
                                 f"   出場條件：若出現強賣訊號或跌破停損位 → 再評估\n"
                                 f"   ⏰ 緊急程度：觀察"
                             ),
@@ -3669,7 +3672,7 @@ def main():
                         exec_plan=(
                             f"📋 執行計畫：維持現有 {shares_held:,} 股，等待訊號明確\n"
                             f"   目前無明顯多空訊號，保持紀律等待\n"
-                            f"   停損守護：{atr_stop:.2f if atr_stop else '均成本-7%'}\n"
+                            f"   停損守護：{cost_stop_txt}\n"
                             f"   ⏰ 緊急程度：觀察"
                         ),
                         urgency="觀察"
