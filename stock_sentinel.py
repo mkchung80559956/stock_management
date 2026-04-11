@@ -1322,215 +1322,438 @@ MARKER_SHAPE = {
 }
 
 
-def build_chart(df: pd.DataFrame, symbol: str, p: dict) -> go.Figure:
-    df = df.tail(130).copy()
+def calc_support_resistance(df: pd.DataFrame, window: int = 20, n_levels: int = 3) -> dict:
+    """
+    Find significant support and resistance levels from recent price action.
+    Uses rolling max/min to identify swing highs/lows.
+    Returns {'resistance': [...], 'support': [...]}
+    """
+    close = df["Close"]
+    high  = df["High"]
+    low   = df["Low"]
+    n     = len(df)
 
-    # 5-panel: Candle+BB+EMA | Volume+OBV | CCI | KD | MACD
+    resistance_levels = []
+    support_levels    = []
+
+    # Swing highs: local max within window
+    for i in range(window, n - window):
+        if high.iloc[i] == high.iloc[i-window:i+window+1].max():
+            resistance_levels.append(round(float(high.iloc[i]), 2))
+
+    # Swing lows: local min within window
+    for i in range(window, n - window):
+        if low.iloc[i] == low.iloc[i-window:i+window+1].min():
+            support_levels.append(round(float(low.iloc[i]), 2))
+
+    # Deduplicate levels within 1% of each other
+    def dedup(levels: list, tol: float = 0.01) -> list:
+        if not levels:
+            return []
+        levels = sorted(set(levels), reverse=True)
+        result = [levels[0]]
+        for lvl in levels[1:]:
+            if abs(lvl - result[-1]) / (result[-1] + 1e-8) > tol:
+                result.append(lvl)
+        return result
+
+    # Return closest levels to current price
+    current = float(close.iloc[-1])
+    res = sorted([l for l in dedup(resistance_levels) if l > current])[:n_levels]
+    sup = sorted([l for l in dedup(support_levels)    if l < current], reverse=True)[:n_levels]
+
+    # Also add 52-week high/low as key levels
+    yr = df.tail(252)
+    w52_high = round(float(yr["High"].max()), 2)
+    w52_low  = round(float(yr["Low"].min()),  2)
+    if w52_high > current and w52_high not in res:
+        res = sorted(res + [w52_high])[:n_levels + 1]
+    if w52_low < current and w52_low not in sup:
+        sup = sorted(sup + [w52_low], reverse=True)[:n_levels + 1]
+
+    return {"resistance": res, "support": sup,
+            "52w_high": w52_high, "52w_low": w52_low}
+
+
+def calc_rr_targets(price: float, stop: float, rr_ratios: list = [1.5, 2.0, 3.0]) -> list:
+    """
+    Calculate take-profit targets based on Risk:Reward ratios.
+    risk = price - stop
+    target_n = price + risk * rr_n
+    Returns list of (rr, target_price) tuples.
+    """
+    risk = price - stop
+    if risk <= 0:
+        return []
+    return [(rr, round(price + risk * rr, 2)) for rr in rr_ratios]
+
+
+@st.cache_data(ttl=3600)
+def fetch_fundamentals(code: str) -> dict:
+    """
+    Fetch basic fundamental data for the stock info panel.
+    Returns dict with pe, pb, dividend_yield, market_cap, week52_high, week52_low, beta.
+    All fields default to None if unavailable.
+    """
+    bare = code.upper().replace(".TWO", "").replace(".TW", "")
+    if code.upper().endswith(".TWO"):
+        sym = code
+    elif code.upper().endswith(".TW"):
+        sym = code
+    else:
+        sym = bare + ".TW"
+
+    result = {k: None for k in
+              ["pe", "pb", "div_yield", "market_cap", "eps", "beta",
+               "week52_high", "week52_low", "avg_vol_10d"]}
+    try:
+        info = yf.Ticker(sym).info
+        if not info or len(info) < 3:
+            return result
+        result["pe"]          = info.get("trailingPE") or info.get("forwardPE")
+        result["pb"]          = info.get("priceToBook")
+        result["div_yield"]   = info.get("dividendYield")
+        result["market_cap"]  = info.get("marketCap")
+        result["eps"]         = info.get("trailingEps")
+        result["beta"]        = info.get("beta")
+        result["week52_high"] = info.get("fiftyTwoWeekHigh")
+        result["week52_low"]  = info.get("fiftyTwoWeekLow")
+        result["avg_vol_10d"] = info.get("averageVolume10days") or info.get("averageVolume")
+    except Exception:
+        pass
+    return result
+
+
+def build_chart(df: pd.DataFrame, symbol: str, p: dict,
+                sr: dict | None = None,
+                stop_price: float | None = None,
+                rr_targets: list | None = None) -> go.Figure:
+    """
+    Professional 5-panel chart with:
+    - Full legends for every indicator
+    - Support/Resistance levels + 52W high/low
+    - Stop loss + R:R target lines
+    - OBV on independent secondary axis
+    - Unified hover across all panels
+    - KD cross text labels (金叉/死叉)
+    """
+    df = df.tail(130).copy()
+    ema1_p = p.get("ema1", 10)
+    ema2_p = p.get("ema2", 20)
+    kd_p   = p.get("kd_period", 9)
+    cci_p  = p.get("cci_period", 39)
+    bb_p   = p.get("bb_period", 20)
+
     fig = make_subplots(
         rows=5, cols=1, shared_xaxes=True,
-        row_heights=[0.38, 0.12, 0.17, 0.17, 0.16],
-        vertical_spacing=0.02,
+        row_heights=[0.40, 0.13, 0.17, 0.15, 0.15],
+        vertical_spacing=0.018,
+        specs=[[{"secondary_y": False}],
+               [{"secondary_y": True}],
+               [{"secondary_y": False}],
+               [{"secondary_y": False}],
+               [{"secondary_y": False}]],
     )
 
-    # ── Panel 1: K線 + EMA + BB ──
+    # ── P1: K線 ──
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"],
-        low=df["Low"], close=df["Close"], name="Price",
+        low=df["Low"], close=df["Close"], name="K線",
         increasing_fillcolor="#e8414e", increasing_line_color="#e8414e",
         decreasing_fillcolor="#22cc66", decreasing_line_color="#22cc66",
+        hoverinfo="x+text",
+        text=[f"O:{o:.2f} H:{h:.2f} L:{l:.2f} C:{c:.2f}"
+              for o, h, l, c in zip(df["Open"], df["High"], df["Low"], df["Close"])],
     ), row=1, col=1)
 
-    for col_name, color, lw, dash in [
-        ("EMA1",     "#f0a500", 1.3, "solid"),
-        ("EMA2",     "#2196f3", 1.3, "solid"),
-        ("EMA60",    "#e040fb", 1.0, "dash"),    # ① trend anchor
-        ("BB_Upper", "#607d8b", 0.8, "dot"),
-        ("BB_Lower", "#607d8b", 0.8, "dot"),
-        ("BB_Mid",   "#546e7a", 0.7, "dash"),
+    for col_key, label, color, lw, dash in [
+        ("EMA1",  f"EMA{ema1_p}",  "#f0a500", 1.4, "solid"),
+        ("EMA2",  f"EMA{ema2_p}",  "#2196f3", 1.4, "solid"),
+        ("EMA60", "EMA60",          "#e040fb", 1.0, "dash"),
     ]:
-        if col_name in df.columns:
+        if col_key in df.columns:
             fig.add_trace(go.Scatter(
-                x=df.index, y=df[col_name], name=col_name,
+                x=df.index, y=df[col_key], name=label,
                 line=dict(color=color, width=lw, dash=dash),
-                showlegend=False,
+                showlegend=True, legendgroup="ema",
+                hovertemplate=f"{label}: %{{y:.2f}}<extra></extra>",
             ), row=1, col=1)
 
-    if "BB_Upper" in df.columns and "BB_Lower" in df.columns:
+    if "BB_Upper" in df.columns:
         fig.add_trace(go.Scatter(
-            x=pd.concat([pd.Series(df.index), pd.Series(df.index[::-1])]),
-            y=pd.concat([df["BB_Upper"], df["BB_Lower"][::-1]]),
-            fill="toself", fillcolor="rgba(100,140,180,0.05)",
-            line=dict(width=0), showlegend=False, hoverinfo="skip",
+            x=df.index, y=df["BB_Upper"], name=f"BB上({bb_p},2σ)",
+            line=dict(color="#546e7a", width=0.9, dash="dot"),
+            showlegend=True, legendgroup="bb",
+            hovertemplate="BB上: %{y:.2f}<extra></extra>",
         ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["BB_Lower"], name="BB下",
+            line=dict(color="#546e7a", width=0.9, dash="dot"),
+            fill="tonexty", fillcolor="rgba(84,110,122,0.06)",
+            showlegend=False,
+            hovertemplate="BB下: %{y:.2f}<extra></extra>",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["BB_Mid"], name="BB中",
+            line=dict(color="#37474f", width=0.7, dash="dash"),
+            showlegend=False,
+            hovertemplate="BB中: %{y:.2f}<extra></extra>",
+        ), row=1, col=1)
+
+    # Support / Resistance levels
+    if sr:
+        for lvl in sr.get("resistance", []):
+            fig.add_hline(y=lvl, line_dash="dot",
+                          line_color="rgba(232,65,78,0.65)", line_width=1.2,
+                          row=1, col=1,
+                          annotation_text=f"壓 {lvl:.2f}",
+                          annotation_font_size=9,
+                          annotation_font_color="rgba(232,65,78,0.9)")
+        for lvl in sr.get("support", []):
+            fig.add_hline(y=lvl, line_dash="dot",
+                          line_color="rgba(34,204,102,0.65)", line_width=1.2,
+                          row=1, col=1,
+                          annotation_text=f"撐 {lvl:.2f}",
+                          annotation_font_size=9,
+                          annotation_font_color="rgba(34,204,102,0.9)")
+        if sr.get("52w_high"):
+            fig.add_hline(y=sr["52w_high"], line_dash="longdash",
+                          line_color="rgba(255,153,0,0.55)", line_width=1,
+                          row=1, col=1,
+                          annotation_text=f"52W高 {sr['52w_high']:.2f}",
+                          annotation_font_size=9,
+                          annotation_font_color="rgba(255,153,0,0.8)")
+        if sr.get("52w_low"):
+            fig.add_hline(y=sr["52w_low"], line_dash="longdash",
+                          line_color="rgba(100,181,246,0.55)", line_width=1,
+                          row=1, col=1,
+                          annotation_text=f"52W低 {sr['52w_low']:.2f}",
+                          annotation_font_size=9,
+                          annotation_font_color="rgba(100,181,246,0.8)")
+
+    # Stop loss line
+    if stop_price:
+        fig.add_hline(y=stop_price, line_dash="solid",
+                      line_color="rgba(255,51,85,0.9)", line_width=2.0,
+                      row=1, col=1,
+                      annotation_text=f"🛑 停損 {stop_price:.2f}",
+                      annotation_font_size=10,
+                      annotation_font_color="#ff3355")
+
+    # R:R target lines
+    if rr_targets:
+        rr_colors = ["rgba(0,255,136,0.75)", "rgba(0,212,255,0.65)", "rgba(255,153,0,0.65)"]
+        for (rr, target), rr_col in zip(rr_targets[:3], rr_colors):
+            fig.add_hline(y=target, line_dash="dash",
+                          line_color=rr_col, line_width=1.3,
+                          row=1, col=1,
+                          annotation_text=f"🎯 R{rr}x {target:.2f}",
+                          annotation_font_size=9,
+                          annotation_font_color=rr_col)
 
     # Signal markers
     for sig, (shape, color, size, pos) in MARKER_SHAPE.items():
         mask = df["Signal"] == sig
         if not mask.any():
             continue
-        y_vals = (df.loc[mask, "Low"] * 0.975 if pos == "below"
-                  else df.loc[mask, "High"] * 1.025)
+        y_vals = df.loc[mask, "Low"] * 0.972 if pos == "below" \
+                 else df.loc[mask, "High"] * 1.028
+        hover = [f"{SIGNAL_LABEL.get(sig,sig)}<br>{d}"
+                 for d in df.loc[mask, "Signal_Detail"]]
         fig.add_trace(go.Scatter(
-            x=df.index[mask], y=y_vals,
-            mode="markers",
-            marker=dict(symbol=shape, color=color, size=size,
-                        line=dict(width=1, color="#000")),
+            x=df.index[mask], y=y_vals, mode="markers",
+            marker=dict(symbol=shape, color=color, size=size + 2,
+                        line=dict(width=1.2, color="#000")),
             name=SIGNAL_LABEL.get(sig, sig),
-            hovertext=df.loc[mask, "Signal_Detail"].tolist(),
-            hoverinfo="text",
+            hovertext=hover, hoverinfo="text",
+            showlegend=True, legendgroup="signals",
         ), row=1, col=1)
 
-    # ── Panel 2: Volume bars + OBV line ──
+    # ── P2: Volume + OBV (dual axis) ──
     vol_colors = ["#e8414e" if c >= o else "#22cc66"
                   for c, o in zip(df["Close"], df["Open"])]
     fig.add_trace(go.Bar(
         x=df.index, y=df["Volume"], marker_color=vol_colors,
-        name="Volume", showlegend=False, opacity=0.7,
+        name="成交量", opacity=0.65, showlegend=False,
+        hovertemplate="量: %{y:,.0f}<extra></extra>",
     ), row=2, col=1)
+    if "Vol_MA" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["Vol_MA"],
+            name=f"均量{p.get('vol_ma_period',20)}日",
+            line=dict(color="#f0a500", width=1.2),
+            showlegend=True, legendgroup="vol",
+            hovertemplate="均量: %{y:,.0f}<extra></extra>",
+        ), row=2, col=1)
     if "OBV" in df.columns:
-        # Normalise OBV to volume scale for overlay readability
-        obv_range = df["OBV"].max() - df["OBV"].min() + 1e-8
-        vol_range  = df["Volume"].max() + 1e-8
-        obv_scaled = (df["OBV"] - df["OBV"].min()) / obv_range * vol_range * 0.8
         fig.add_trace(go.Scatter(
-            x=df.index, y=obv_scaled, name="OBV(scaled)",
-            line=dict(color="#00d4ff", width=1.2, dash="dot"),
-            showlegend=False,
-        ), row=2, col=1)
-        # Vol_MA line
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["Vol_MA"], name="Vol MA",
-            line=dict(color="#f0a500", width=1.0),
-            showlegend=False,
-        ), row=2, col=1)
+            x=df.index, y=df["OBV"], name="OBV",
+            line=dict(color="#00d4ff", width=1.3),
+            showlegend=True, legendgroup="vol",
+            hovertemplate="OBV: %{y:,.0f}<extra></extra>",
+        ), row=2, col=1, secondary_y=True)
+        if "OBV_MA" in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df["OBV_MA"], name="OBV均線",
+                line=dict(color="#004d66", width=1.0, dash="dot"),
+                showlegend=False,
+                hovertemplate="OBV均: %{y:,.0f}<extra></extra>",
+            ), row=2, col=1, secondary_y=True)
 
-    # ── Panel 3: CCI with trend-zone background shading ──
-    # Shade green when TrendScore >= 2, red when <= -2
+    # ── P3: CCI ──
     cci_colors = ["#e8414e" if v > 100 else "#22cc66" if v < -100 else "#455a64"
                   for v in df["CCI"].fillna(0)]
     fig.add_trace(go.Bar(
-        x=df.index, y=df["CCI"], marker_color=cci_colors, name="CCI", showlegend=False,
+        x=df.index, y=df["CCI"], marker_color=cci_colors,
+        name=f"CCI({cci_p})", showlegend=False,
+        hovertemplate=f"CCI: %{{y:.1f}}<extra></extra>",
     ), row=3, col=1)
-    # Trend zone overlays on CCI panel — use add_shape with correct xref
     if "TrendScore" in df.columns:
-        uptrend_mask  = df["TrendScore"] >= 2
-        dwntrend_mask = df["TrendScore"] <= -2
-        for mask, fill_col in [(uptrend_mask, "rgba(34,204,102,0.07)"),
-                               (dwntrend_mask, "rgba(232,65,78,0.07)")]:
+        for mask_fn, fill_col in [
+            (lambda: df["TrendScore"] >= 2,  "rgba(34,204,102,0.07)"),
+            (lambda: df["TrendScore"] <= -2, "rgba(232,65,78,0.07)"),
+        ]:
+            mask = mask_fn()
             if not mask.any():
                 continue
-            runs_start = None
-            prev_val   = False
+            rs = None
+            pv = False
             for idx, val in enumerate(mask):
-                if val and not prev_val:
-                    runs_start = idx
-                elif not val and prev_val and runs_start is not None:
+                if val and not pv:
+                    rs = idx
+                elif not val and pv and rs is not None:
                     try:
-                        fig.add_shape(
-                            type="rect",
-                            xref="x", yref="y3 domain",   # shared x-axis = "x"
-                            x0=df.index[runs_start], x1=df.index[idx - 1],
-                            y0=0, y1=1,
-                            fillcolor=fill_col, line_width=0, layer="below",
-                        )
+                        fig.add_shape(type="rect", xref="x", yref="y3 domain",
+                            x0=df.index[rs], x1=df.index[idx - 1],
+                            y0=0, y1=1, fillcolor=fill_col, line_width=0, layer="below")
                     except Exception:
                         pass
-                    runs_start = None
-                prev_val = bool(val)
-            if runs_start is not None:
+                    rs = None
+                pv = bool(val)
+            if rs is not None:
                 try:
-                    fig.add_shape(
-                        type="rect",
-                        xref="x", yref="y3 domain",
-                        x0=df.index[runs_start], x1=df.index[-1],
-                        y0=0, y1=1,
-                        fillcolor=fill_col, line_width=0, layer="below",
-                    )
+                    fig.add_shape(type="rect", xref="x", yref="y3 domain",
+                        x0=df.index[rs], x1=df.index[-1],
+                        y0=0, y1=1, fillcolor=fill_col, line_width=0, layer="below")
                 except Exception:
                     pass
-    for level, col in [(100, "rgba(232,65,78,0.35)"), (-100, "rgba(34,204,102,0.35)"), (0, "#37474f")]:
-        fig.add_hline(y=level, line_dash="dot", line_color=col, line_width=1, row=3, col=1)
+    for lvl, col, lbl in [(100, "rgba(232,65,78,0.4)", "超買"),
+                           (-100, "rgba(34,204,102,0.4)", "超賣"),
+                           (0, "#37474f", "")]:
+        fig.add_hline(y=lvl, line_dash="dot", line_color=col, line_width=1,
+                      row=3, col=1,
+                      annotation_text=lbl, annotation_font_size=8,
+                      annotation_font_color=col)
 
-    # ── Panel 4: KD ──
+    # ── P4: KD ──
     if "K" in df.columns and "D" in df.columns:
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["K"], name="K",
-            line=dict(color="#f0a500", width=1.5), showlegend=False,
+            x=df.index, y=df["K"], name=f"K({kd_p})",
+            line=dict(color="#f0a500", width=1.8),
+            showlegend=True, legendgroup="kd",
+            hovertemplate="K: %{y:.1f}<extra></extra>",
         ), row=4, col=1)
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["D"], name="D",
-            line=dict(color="#2196f3", width=1.5), showlegend=False,
+            x=df.index, y=df["D"], name="D(3)",
+            line=dict(color="#2196f3", width=1.8),
+            showlegend=True, legendgroup="kd",
+            hovertemplate="D: %{y:.1f}<extra></extra>",
         ), row=4, col=1)
-        # KD golden/dead cross markers
-        gc = df["KD_Golden"] if "KD_Golden" in df.columns else pd.Series(False, index=df.index)
-        dc = df["KD_Dead"]   if "KD_Dead"   in df.columns else pd.Series(False, index=df.index)
-        if gc.any():
+        gc = df.get("KD_Golden", pd.Series(False, index=df.index))
+        dc = df.get("KD_Dead",   pd.Series(False, index=df.index))
+        if hasattr(gc, "any") and gc.any():
             fig.add_trace(go.Scatter(
-                x=df.index[gc], y=df.loc[gc, "K"],
-                mode="markers", marker=dict(symbol="triangle-up", color="#00ff88", size=9),
-                name="KD金叉", showlegend=False,
+                x=df.index[gc], y=df.loc[gc, "K"] - 4,
+                mode="markers+text",
+                marker=dict(symbol="triangle-up", color="#00ff88", size=12,
+                            line=dict(width=1.5, color="#000")),
+                text=["金叉"] * int(gc.sum()), textposition="bottom center",
+                textfont=dict(size=8, color="#00ff88"),
+                name="KD金叉", showlegend=True, legendgroup="kd",
+                hovertemplate="KD金叉 K=%{y:.1f}<extra></extra>",
             ), row=4, col=1)
-        if dc.any():
+        if hasattr(dc, "any") and dc.any():
             fig.add_trace(go.Scatter(
-                x=df.index[dc], y=df.loc[dc, "K"],
-                mode="markers", marker=dict(symbol="triangle-down", color="#ff3355", size=9),
-                name="KD死叉", showlegend=False,
+                x=df.index[dc], y=df.loc[dc, "K"] + 4,
+                mode="markers+text",
+                marker=dict(symbol="triangle-down", color="#ff3355", size=12,
+                            line=dict(width=1.5, color="#000")),
+                text=["死叉"] * int(dc.sum()), textposition="top center",
+                textfont=dict(size=8, color="#ff3355"),
+                name="KD死叉", showlegend=True, legendgroup="kd",
+                hovertemplate="KD死叉 K=%{y:.1f}<extra></extra>",
             ), row=4, col=1)
-        for level, col in [(80, "rgba(232,65,78,0.35)"), (20, "rgba(34,204,102,0.35)"), (50, "#37474f")]:
-            fig.add_hline(y=level, line_dash="dot", line_color=col, line_width=1, row=4, col=1)
+        for lvl, col, lbl in [(80, "rgba(232,65,78,0.35)", "超買80"),
+                               (50, "#37474f", ""),
+                               (20, "rgba(34,204,102,0.35)", "超賣20")]:
+            fig.add_hline(y=lvl, line_dash="dot", line_color=col, line_width=1,
+                          row=4, col=1, annotation_text=lbl,
+                          annotation_font_size=8, annotation_font_color=col)
 
-    # ── Panel 5: MACD ──
-    hist_colors = ["#e8414e" if v >= 0 else "#22cc66" for v in df["MACD_Hist"].fillna(0)]
+    # ── P5: MACD ──
+    hist_colors = ["#e8414e" if v >= 0 else "#22cc66"
+                   for v in df["MACD_Hist"].fillna(0)]
     fig.add_trace(go.Bar(
-        x=df.index, y=df["MACD_Hist"], marker_color=hist_colors, name="Hist", showlegend=False,
+        x=df.index, y=df["MACD_Hist"], marker_color=hist_colors,
+        name="MACD柱(紅多綠空)", opacity=0.8,
+        showlegend=True, legendgroup="macd",
+        hovertemplate="Hist: %{y:.3f}<extra></extra>",
     ), row=5, col=1)
     fig.add_trace(go.Scatter(
-        x=df.index, y=df["MACD"], name="MACD",
-        line=dict(color="#2196f3", width=1.3), showlegend=False,
+        x=df.index, y=df["MACD"], name="MACD(藍)",
+        line=dict(color="#2196f3", width=1.5),
+        showlegend=True, legendgroup="macd",
+        hovertemplate="MACD: %{y:.3f}<extra></extra>",
     ), row=5, col=1)
     fig.add_trace(go.Scatter(
-        x=df.index, y=df["MACD_Sig"], name="Signal",
-        line=dict(color="#f0a500", width=1.3), showlegend=False,
+        x=df.index, y=df["MACD_Sig"], name="訊號(橙)",
+        line=dict(color="#f0a500", width=1.5),
+        showlegend=True, legendgroup="macd",
+        hovertemplate="Signal: %{y:.3f}<extra></extra>",
     ), row=5, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="#37474f",
+                  line_width=1, row=5, col=1)
 
+    # ── Layout ──
     fig.update_layout(
-        template="plotly_dark",
-        height=820,
-        paper_bgcolor="#0a0e1a",
-        plot_bgcolor="#0d1226",
+        template="plotly_dark", height=920,
+        paper_bgcolor="#0a0e1a", plot_bgcolor="#0d1226",
         xaxis_rangeslider_visible=False,
-        margin=dict(l=55, r=20, t=20, b=10),
-        font=dict(family="Space Mono, monospace", size=11, color="#8a9bb5"),
+        margin=dict(l=60, r=90, t=30, b=10),
+        font=dict(family="Space Mono, monospace", size=10, color="#8a9bb5"),
+        hovermode="x unified",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+            font=dict(size=9), bgcolor="rgba(10,14,26,0.85)",
+            bordercolor="#1e3a5f", borderwidth=1,
+        ),
     )
     for i in range(1, 6):
         fig.update_yaxes(gridcolor="#1a2a3a", zeroline=False,
-                         tickfont=dict(size=10), row=i, col=1)
+                         tickfont=dict(size=9), row=i, col=1)
+    fig.update_yaxes(showgrid=False, tickfont=dict(size=8, color="#00d4ff"),
+                     row=2, col=1, secondary_y=True)
     fig.update_xaxes(showgrid=False, rangeslider_visible=False)
 
     annotations = [
-        dict(x=0.01, y=1.00, xref="paper", yref="paper",
-             text=f"<b>{symbol}</b> · K線 / EMA{p['ema1']}/{p['ema2']} / EMA60 / BB",
-             showarrow=False, font=dict(color="#8a9bb5", size=11)),
-        dict(x=0.01, y=0.59, xref="paper", yref="paper",
-             text="Volume / OBV",
-             showarrow=False, font=dict(color="#8a9bb5", size=11)),
-        dict(x=0.01, y=0.46, xref="paper", yref="paper",
-             text=f"CCI({p['cci_period']}) · 綠底=多頭趨勢 · 紅底=空頭趨勢",
-             showarrow=False, font=dict(color="#8a9bb5", size=11)),
-        dict(x=0.01, y=0.30, xref="paper", yref="paper",
-             text=f"KD({p.get('kd_period',9)}) · ▲金叉 ▼死叉",
-             showarrow=False, font=dict(color="#8a9bb5", size=11)),
-        dict(x=0.01, y=0.14, xref="paper", yref="paper",
-             text="MACD",
-             showarrow=False, font=dict(color="#8a9bb5", size=11)),
+        dict(x=0.01, y=1.00, xref="paper", yref="paper", showarrow=False,
+             text=f"<b>{symbol}</b>  EMA{ema1_p}(橙) / EMA{ema2_p}(藍) / EMA60(紫) / BB({bb_p},2σ)  撐/壓=水平虛線",
+             font=dict(color="#8a9bb5", size=10)),
+        dict(x=0.01, y=0.578, xref="paper", yref="paper", showarrow=False,
+             text=f"成交量(棒紅升綠降) / 均量{p.get('vol_ma_period',20)}日(橙) | OBV累積量能(藍,右軸) — OBV向上=量能支撐",
+             font=dict(color="#8a9bb5", size=10)),
+        dict(x=0.01, y=0.445, xref="paper", yref="paper", showarrow=False,
+             text=f"CCI({cci_p})  紅柱&gt;+100超買 / 綠柱&lt;-100超賣 / 綠底=趨勢多頭 / 紅底=趨勢空頭",
+             font=dict(color="#8a9bb5", size=10)),
+        dict(x=0.01, y=0.285, xref="paper", yref="paper", showarrow=False,
+             text=f"KD({kd_p})  橙=K線 藍=D線 / 金叉▲(低檔多) 死叉▼(高檔空) / 超買80 超賣20",
+             font=dict(color="#8a9bb5", size=10)),
+        dict(x=0.01, y=0.132, xref="paper", yref="paper", showarrow=False,
+             text="MACD  藍=MACD 橙=訊號線 / 柱紅=MACD>0多頭 柱綠=MACD<0空頭 / 黃金交叉=買進",
+             font=dict(color="#8a9bb5", size=10)),
     ]
     fig.update_layout(annotations=annotations)
     return fig
-
-
-# ══════════════════════════════════════════════
-# EXCEL  IMPORT / EXPORT
-# ══════════════════════════════════════════════
 
 def to_excel(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
@@ -2357,17 +2580,24 @@ def main():
         c1, c2, c3 = st.columns([3, 2, 1])
         sel_from_wl = c1.selectbox(
             "從自選股選擇", st.session_state.watchlist,
-            format_func=lambda x: x if x.upper().endswith((".TW", ".TWO"))
-                                     else f"{x}.TW",
+            format_func=lambda x: x if x.upper().endswith((".TW", ".TWO")) else f"{x}.TW",
         )
         custom_code = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 3661.TWO")
         load_btn    = c3.button("📊 載入", type="primary", width='stretch')
+
+        # Timeframe selector
+        tf_opts  = {"1個月": "1mo", "3個月": "3mo", "6個月": "6mo",
+                    "1年": "1y", "2年": "2y"}
+        tf_label = st.radio("分析區間", list(tf_opts.keys()),
+                            horizontal=True, index=2,
+                            label_visibility="collapsed")
+        drill_period = tf_opts[tf_label]
 
         target = custom_code.strip() or sel_from_wl
 
         if load_btn:
             with st.spinner(f"載入 {target} …"):
-                df_raw, err = fetch_data(target, data_period)
+                df_raw, err = fetch_data(target, drill_period)
             if df_raw is None:
                 st.error(f"無法取得資料：{err}")
             else:
@@ -2377,7 +2607,7 @@ def main():
                 quote   = fetch_quote(target)
                 cn_name, mkt_label = fetch_name(target)
 
-                price   = quote.get("price")    or round(latest["Close"], 2)
+                price   = quote.get("price")    or round(float(latest["Close"]), 2)
                 chg     = quote.get("change")   or float(latest["Close"] - prev["Close"])
                 chg_pct = quote.get("change_pct") or float(chg / (prev["Close"] + 1e-8) * 100)
 
@@ -2386,7 +2616,7 @@ def main():
                 mkt_color = "#22cc66" if mkt_label == "上櫃" else "#00aaff"
                 chg_color = "#e8414e" if chg >= 0 else "#22cc66"
                 st.markdown(
-                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">'
+                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">'
                     f'<span style="font-size:1.3rem;font-weight:700;color:#e8f4fd;font-family:Space Mono,monospace">{bare_t}</span>'
                     f'<span style="background:{mkt_color};color:#000;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700">{mkt_label}</span>'
                     f'<span style="color:#8a9bb5;font-size:0.9rem">{cn_name}</span>'
@@ -2396,10 +2626,36 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-                # ── Scan signal for this stock ──
-                scan_sig, scan_detail = get_scan_signal(df_sig, lookback=5)
+                # ── Fundamentals row ──
+                with st.spinner("載入基本面資料…"):
+                    fund = fetch_fundamentals(target)
 
-                # ── Metrics — 2 rows of 4 ──
+                def _fmt_cap(v):
+                    if v is None: return "-"
+                    if v >= 1e12: return f"{v/1e12:.1f}兆"
+                    if v >= 1e8:  return f"{v/1e8:.1f}億"
+                    return f"{v:,.0f}"
+
+                def _fmt_pct(v):
+                    return f"{v*100:.2f}%" if v is not None else "-"
+
+                def _fmt_f(v, dec=1):
+                    return f"{v:.{dec}f}" if v is not None else "-"
+
+                w52h = fund.get("week52_high") or float(df_sig["High"].max())
+                w52l = fund.get("week52_low")  or float(df_sig["Low"].min())
+                pct_from_high = (price - w52h) / w52h * 100 if w52h else 0
+
+                f1, f2, f3, f4, f5, f6 = st.columns(6)
+                f1.metric("本益比 PE",    _fmt_f(fund.get("pe")))
+                f2.metric("股價淨值 PB",  _fmt_f(fund.get("pb")))
+                f3.metric("殖利率",       _fmt_pct(fund.get("div_yield")))
+                f4.metric("市值",         _fmt_cap(fund.get("market_cap")))
+                f5.metric("52W高",        f"{w52h:.2f}", f"{pct_from_high:+.1f}%")
+                f6.metric("Beta",         _fmt_f(fund.get("beta")))
+
+                # ── Signal metrics ──
+                scan_sig, scan_detail = get_scan_signal(df_sig, lookback=5)
                 r1c1, r1c2, r1c3, r1c4 = st.columns(4)
                 r2c1, r2c2, r2c3, r2c4 = st.columns(4)
 
@@ -2414,57 +2670,96 @@ def main():
                 trnd_now = int(float(latest.get("TrendScore",      0) or 0))
                 accl_now = float(latest.get("MomAccel",        0) or 0)
                 atr_stop = round(price - atr_val * 1.5, 2) if pd.notna(atr_val) else None
-                trend_lbl = {3:"強多頭↑↑", 2:"多頭↑", 1:"弱多頭", 0:"中性", -1:"弱空頭", -2:"強空頭↓↓"}
+                trend_lbl = {3:"強多頭↑↑",2:"多頭↑",1:"弱多頭",0:"中性",-1:"弱空頭",-2:"強空頭↓↓"}
 
-                r1c1.metric("訊號",    SIGNAL_LABEL.get(scan_sig, "─"))
-                r1c2.metric("② 共振", f"{conf_now}/7",
+                r1c1.metric("訊號",   SIGNAL_LABEL.get(scan_sig, "─"))
+                r1c2.metric("共振②", f"{conf_now}/7",
                             "✅ 強" if conf_now >= 5 else "⚠️ 弱" if conf_now <= 3 else None)
-                r1c3.metric("① 趨勢", trend_lbl.get(trnd_now, str(trnd_now)))
-                r1c4.metric("③ 加速", f"{accl_now:+.2f}",
-                            "🚀 加速中" if accl_now > 0.3 else "⬇️ 減速" if accl_now < -0.3 else None)
+                r1c3.metric("趨勢①", trend_lbl.get(trnd_now, str(trnd_now)))
+                r1c4.metric("加速③", f"{accl_now:+.2f}",
+                            "🚀" if accl_now > 0.3 else "⬇️" if accl_now < -0.3 else None)
 
-                r2c1.metric("動能",    f"{mom_now:.0f}/100")
-                r2c2.metric(f"CCI",   f"{cci_val:.1f}" if pd.notna(cci_val) else "-")
-                r2c3.metric(f"RSI",   f"{rsi_val:.1f}" if pd.notna(rsi_val) else "-")
+                r2c1.metric("動能",   f"{mom_now:.0f}/100")
+                r2c2.metric("CCI",    f"{cci_val:.1f}" if pd.notna(cci_val) else "-")
+                r2c3.metric("RSI",    f"{rsi_val:.1f}" if pd.notna(rsi_val) else "-")
                 r2c4.metric("ATR停損", f"{atr_stop:.2f}" if atr_stop else "-")
 
-                # ── Combined signal quality bar ──
-                mom_color = "#00ff88" if mom_now >= 60 else "#f0a500" if mom_now >= 40 else "#ff3355"
+                # ── R:R calculation ──
+                rr_targets_list = calc_rr_targets(price, atr_stop) if atr_stop else []
+                if rr_targets_list:
+                    risk = price - atr_stop
+                    rr1, t1 = rr_targets_list[0]
+                    rr2, t2 = rr_targets_list[1]
+                    rr3, t3 = rr_targets_list[2]
+                    st.markdown(
+                        f'<div style="background:#0d1a2d;border:1px solid #1a3050;border-radius:8px;'
+                        f'padding:8px 14px;margin:6px 0;font-size:0.78rem;display:flex;gap:16px;flex-wrap:wrap">'
+                        f'<span style="color:#5a8fb0">風險 <b style="color:#ff3355">{risk:.2f}</b></span>'
+                        f'<span style="color:#5a8fb0">目標1({rr1}x) <b style="color:#00ff88">{t1:.2f}</b></span>'
+                        f'<span style="color:#5a8fb0">目標2({rr2}x) <b style="color:#00d4ff">{t2:.2f}</b></span>'
+                        f'<span style="color:#5a8fb0">目標3({rr3}x) <b style="color:#f0a500">{t3:.2f}</b></span>'
+                        f'<span style="color:#37474f;font-size:0.7rem">風險報酬比 — 建議 R:R ≥ 2x 才進場</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # ── Combined quality bar ──
+                mom_color  = "#00ff88" if mom_now >= 60 else "#f0a500" if mom_now >= 40 else "#ff3355"
                 conf_color = "#00ff88" if conf_now >= 5 else "#f0a500" if conf_now >= 4 else "#ff3355"
                 st.markdown(
-                    f'<div style="margin:4px 0 10px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
-                    f'<span style="color:#5a8fb0;font-size:0.72rem">動能</span>'
-                    f'<div style="flex:1;min-width:60px;background:#1a2a3a;border-radius:3px;height:5px">'
+                    f'<div style="margin:2px 0 10px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+                    f'<span style="color:#5a8fb0;font-size:0.72rem;white-space:nowrap">動能</span>'
+                    f'<div style="flex:1;min-width:50px;background:#1a2a3a;border-radius:3px;height:5px">'
                     f'<div style="background:{mom_color};width:{min(mom_now,100):.0f}%;height:5px;border-radius:3px"></div></div>'
-                    f'<span style="color:#5a8fb0;font-size:0.72rem">共振</span>'
-                    f'<div style="flex:1;min-width:60px;background:#1a2a3a;border-radius:3px;height:5px">'
+                    f'<span style="color:#5a8fb0;font-size:0.72rem;white-space:nowrap">共振</span>'
+                    f'<div style="flex:1;min-width:50px;background:#1a2a3a;border-radius:3px;height:5px">'
                     f'<div style="background:{conf_color};width:{conf_now/7*100:.0f}%;height:5px;border-radius:3px"></div></div>'
                     f'<span style="color:#5a8fb0;font-size:0.68rem;white-space:nowrap">'
-                    f'{_html_safe(scan_detail[:35] + "…" if len(scan_detail) > 35 else scan_detail)}</span>'
+                    f'{_html_safe(scan_detail[:40] + "…" if len(scan_detail) > 40 else scan_detail)}</span>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
 
-                # ── Chart ──
-                fig = build_chart(df_sig, target, params)
+                # ── Chart (with S/R + stop + R:R) ──
+                sr = calc_support_resistance(df_sig)
+                fig = build_chart(df_sig, bare_t, params,
+                                  sr=sr,
+                                  stop_price=atr_stop,
+                                  rr_targets=rr_targets_list)
                 st.plotly_chart(fig, width='stretch')
 
-                # ── Recent signal log (only crossover events) ──
-                sig_cols  = ["Close", "Volume", "CCI", "RSI", "K", "D",
-                             "Vol_Ratio", "MomScore", "Signal", "Signal_Detail"]
-                available = [c for c in sig_cols if c in df_sig.columns]
-                sig_hist  = df_sig[
-                    df_sig["Signal"].isin(
-                        list(BUY_SIGNALS) + list(SELL_SIGNALS) + ["WATCH", "FAKE_BREAKOUT"]
-                    )
-                ][available].tail(20)
+                # ── Professional signal history table (clean 6 columns) ──
+                EVENT_SIGS = set(BUY_SIGNALS) | set(SELL_SIGNALS) | {"WATCH", "FAKE_BREAKOUT"}
+                sig_hist = df_sig[df_sig["Signal"].isin(EVENT_SIGS)].copy()
                 if not sig_hist.empty:
-                    st.markdown("##### 📋 近期訊號記錄（最新 20 筆）")
-                    sig_hist = sig_hist.copy()
-                    sig_hist["Signal"] = sig_hist["Signal"].map(
-                        lambda x: SIGNAL_LABEL.get(x, x))
-                    sig_hist.index = sig_hist.index.date
-                    st.dataframe(sig_hist, width='stretch')
+                    sig_hist = sig_hist.tail(15)
+                    vol_ma_ser = sig_hist["Vol_MA"] if "Vol_MA" in sig_hist.columns else 1
+                    display = pd.DataFrame({
+                        "日期":   sig_hist.index.date,
+                        "收盤":   sig_hist["Close"].round(2),
+                        "訊號":   sig_hist["Signal"].map(lambda x: SIGNAL_LABEL.get(x, x)),
+                        "CCI":    sig_hist["CCI"].round(1) if "CCI" in sig_hist.columns else "-",
+                        "RSI":    sig_hist["RSI"].round(1) if "RSI" in sig_hist.columns else "-",
+                        "量/均量": (sig_hist["Vol_Ratio"].round(2)
+                                    if "Vol_Ratio" in sig_hist.columns else "-"),
+                        "說明":   sig_hist["Signal_Detail"].str[:30],
+                    })
+                    display = display.reset_index(drop=True)
+                    st.markdown("##### 📋 近期訊號記錄（最新15筆）")
+                    st.dataframe(
+                        display,
+                        width='stretch',
+                        column_config={
+                            "收盤": st.column_config.NumberColumn(format="%.2f"),
+                            "CCI":  st.column_config.NumberColumn(format="%.1f",
+                                    help="CCI(39) 超買>+100 / 超賣<-100"),
+                            "RSI":  st.column_config.NumberColumn(format="%.1f",
+                                    help="RSI(6) 超買>70 / 超賣<30"),
+                            "量/均量": st.column_config.NumberColumn(format="%.2fx",
+                                    help="今日成交量 ÷ 均量，>1.5為放量"),
+                        },
+                        hide_index=True,
+                    )
 
     # ─────────────────────────────────────────
     # TAB 3  回測 & 優化
