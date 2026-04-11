@@ -2055,7 +2055,12 @@ def main():
     if "auto_refresh" not in st.session_state:
         st.session_state.auto_refresh = False
     if "prev_sig_keys" not in st.session_state:
-        st.session_state.prev_sig_keys = {}   # {代號: sig_key} from last scan
+        st.session_state.prev_sig_keys = {}
+    # Portfolio / trade journal state
+    if "portfolio_trades" not in st.session_state:
+        st.session_state.portfolio_trades = []   # list of trade dicts
+    if "portfolio_next_id" not in st.session_state:
+        st.session_state.portfolio_next_id = 1
 
     # ══════════════════════════════════════════
     # SIDEBAR
@@ -2185,8 +2190,8 @@ def main():
     # ══════════════════════════════════════════
     # TABS
     # ══════════════════════════════════════════
-    tab_scan, tab_drill, tab_bt = st.tabs([
-        "📡  訊號掃描", "🔬  個股分析", "📊  回測 & 優化",
+    tab_scan, tab_drill, tab_bt, tab_port = st.tabs([
+        "📡  訊號掃描", "🔬  個股分析", "📊  回測 & 優化", "📒  買賣記錄",
     ])
 
     # ─────────────────────────────────────────
@@ -3068,6 +3073,458 @@ def main():
                         file_name=f"optimize_{bare_bt}_{datetime.now().strftime('%Y%m%d')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
+
+
+    # ─────────────────────────────────────────
+    # TAB 4  買賣記錄 & 策略建議
+    # ─────────────────────────────────────────
+    with tab_port:
+        st.markdown("#### 📒 買賣記錄 & 智能策略建議")
+        st.caption("記錄每筆交易 · 即時計算損益 · 根據當前技術訊號給出持倉策略建議")
+
+        # ══════════════════════════════════════════════════════
+        # Helper: derive open positions from trade list
+        # ══════════════════════════════════════════════════════
+        def get_open_positions(trades: list) -> dict:
+            """
+            Returns {code: {shares, avg_cost, buy_dates, fees, trade_ids}}.
+            Sells reduce shares FIFO.
+            """
+            pos = {}
+            for t in sorted(trades, key=lambda x: x["date"]):
+                c = t["code"]
+                if t["type"] == "買入":
+                    if c not in pos:
+                        pos[c] = {"shares": 0, "cost": 0.0, "fees": 0.0,
+                                  "name": t.get("name",""), "ids": []}
+                    pos[c]["shares"] += t["shares"]
+                    pos[c]["cost"]   += t["shares"] * t["price"] + t.get("fee", 0)
+                    pos[c]["fees"]   += t.get("fee", 0)
+                    pos[c]["ids"].append(t["id"])
+                elif t["type"] == "賣出" and c in pos:
+                    sell_val = t["shares"] * t["price"] - t.get("fee", 0)
+                    cost_pp  = pos[c]["cost"] / max(pos[c]["shares"], 1)
+                    pos[c]["shares"] -= t["shares"]
+                    pos[c]["cost"]    = max(pos[c]["cost"] - cost_pp * t["shares"], 0)
+                    if pos[c]["shares"] <= 0:
+                        del pos[c]
+            return pos
+
+        def get_closed_trades(trades: list) -> list:
+            """Match buy→sell pairs to compute realised P&L."""
+            buys  = {}   # code → deque of (shares, price, date, fee)
+            closed = []
+            from collections import deque
+            for t in sorted(trades, key=lambda x: x["date"]):
+                c = t["code"]
+                if t["type"] == "買入":
+                    if c not in buys: buys[c] = deque()
+                    buys[c].append({"sh": t["shares"], "px": t["price"],
+                                    "dt": t["date"], "fee": t.get("fee",0)})
+                elif t["type"] == "賣出" and c in buys and buys[c]:
+                    rem = t["shares"]
+                    total_cost = 0.0
+                    while rem > 0 and buys[c]:
+                        b = buys[c][0]
+                        take = min(rem, b["sh"])
+                        total_cost += take * b["px"] + b["fee"] * (take/b["sh"])
+                        b["sh"] -= take
+                        rem -= take
+                        if b["sh"] <= 0:
+                            buys[c].popleft()
+                    sell_proc = t["shares"] * t["price"] - t.get("fee", 0)
+                    pnl = sell_proc - total_cost
+                    pnl_pct = pnl / (total_cost + 1e-8) * 100
+                    closed.append({
+                        "代號":   c, "名稱": t.get("name",""),
+                        "買入均價": round(total_cost / t["shares"], 2),
+                        "賣出價":  t["price"],
+                        "股數":    t["shares"],
+                        "實現損益": round(pnl, 0),
+                        "報酬%":   round(pnl_pct, 2),
+                        "結果":    "獲利" if pnl > 0 else "虧損",
+                        "賣出日":  t["date"],
+                    })
+            return closed
+
+        trades_all = st.session_state.portfolio_trades
+
+        # ══════════════════════════════════════════════════════
+        # SECTION A — 新增交易記錄
+        # ══════════════════════════════════════════════════════
+        with st.expander("➕ 新增交易", expanded=not trades_all):
+            fa1, fa2, fa3 = st.columns([2, 2, 2])
+            wl_opts = [c.replace(".TW","").replace(".TWO","")
+                       for c in st.session_state.watchlist]
+            t_code  = fa1.selectbox("股票代號", wl_opts,
+                                    key="pt_code",
+                                    help="從自選股選擇")
+            t_cust  = fa2.text_input("或手動輸入代號",
+                                      placeholder="2330 / 3661",
+                                      key="pt_cust")
+            t_type  = fa3.selectbox("交易類型", ["買入", "賣出"], key="pt_type")
+
+            fb1, fb2, fb3, fb4, fb5 = st.columns([2, 1.5, 1.5, 1.5, 1.5])
+            t_date  = fb1.date_input("交易日期",
+                                      value=tw_now().date(), key="pt_date")
+            t_price = fb2.number_input("成交價", min_value=0.01,
+                                        value=100.0, step=0.01, key="pt_price")
+            t_shares = fb3.number_input("股數", min_value=1,
+                                         value=1000, step=100, key="pt_shares")
+            t_fee   = fb4.number_input("手續費 $", min_value=0.0,
+                                        value=round(t_price * t_shares * 0.001425 * 0.6, 0),
+                                        step=1.0, key="pt_fee",
+                                        help="預設 0.1425%×60折")
+            add_btn = fb5.button("✅ 確認新增", type="primary",
+                                  width='stretch', key="pt_add")
+
+            if add_btn:
+                code_final = (t_cust.strip() or t_code).upper().replace(".TW","").replace(".TWO","")
+                cn, _ = fetch_name(code_final)
+                new_trade = {
+                    "id":     st.session_state.portfolio_next_id,
+                    "type":   t_type,
+                    "code":   code_final,
+                    "name":   cn or code_final,
+                    "date":   str(t_date),
+                    "price":  float(t_price),
+                    "shares": int(t_shares),
+                    "fee":    float(t_fee),
+                }
+                # Validate sell doesn't exceed position
+                if t_type == "賣出":
+                    pos_now = get_open_positions(trades_all)
+                    held    = pos_now.get(code_final, {}).get("shares", 0)
+                    if t_shares > held:
+                        st.error(f"⚠️ 持倉只有 {held} 股，無法賣出 {t_shares} 股")
+                    else:
+                        st.session_state.portfolio_trades.append(new_trade)
+                        st.session_state.portfolio_next_id += 1
+                        st.success(f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}")
+                        st.rerun()
+                else:
+                    st.session_state.portfolio_trades.append(new_trade)
+                    st.session_state.portfolio_next_id += 1
+                    st.success(f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}")
+                    st.rerun()
+
+        # Import / Export
+        col_imp, col_exp = st.columns(2)
+        with col_exp:
+            if trades_all:
+                df_export = pd.DataFrame(trades_all)
+                st.download_button(
+                    "📤 匯出交易記錄 Excel",
+                    data=to_excel(df_export),
+                    file_name=f"trades_{tw_now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width='stretch',
+                )
+        with col_imp:
+            up_trades = st.file_uploader(
+                "📥 匯入交易記錄 Excel",
+                type=["xlsx"],
+                key="port_import",
+            )
+            if up_trades:
+                try:
+                    df_imp = pd.read_excel(up_trades)
+                    req = {"type","code","date","price","shares"}
+                    if req.issubset(df_imp.columns):
+                        imported = df_imp.to_dict("records")
+                        for r in imported:
+                            if "id" not in r or pd.isna(r.get("id")):
+                                r["id"] = st.session_state.portfolio_next_id
+                                st.session_state.portfolio_next_id += 1
+                            r["fee"] = float(r.get("fee", 0) or 0)
+                            r["name"] = str(r.get("name",""))
+                        st.session_state.portfolio_trades = imported
+                        st.success(f"✅ 已匯入 {len(imported)} 筆交易")
+                        st.rerun()
+                    else:
+                        st.error(f"欄位不足，需包含：{req}")
+                except Exception as e:
+                    st.error(f"匯入失敗：{e}")
+
+        if not trades_all:
+            st.info("🔍 尚無交易記錄 — 點上方「➕ 新增交易」開始記錄")
+            st.stop()
+
+        # ══════════════════════════════════════════════════════
+        # SECTION B — 持倉總覽 + 即時損益 + 策略建議
+        # ══════════════════════════════════════════════════════
+        open_pos = get_open_positions(trades_all)
+
+        if open_pos:
+            st.markdown("---")
+            st.markdown("#### 📊 持倉概況 & 策略建議")
+            st.caption("策略建議根據：① 即時技術訊號 ② 中期趨勢 ③ 共振強度 ④ 持倉成本位置")
+
+            # Fetch live prices + signals for all held stocks
+            pos_rows = []
+            advice_cards = []
+            for code, p_info in open_pos.items():
+                shares  = p_info["shares"]
+                cost    = p_info["cost"]
+                avg_px  = cost / max(shares, 1)
+
+                # Live price
+                q = fetch_quote(code)
+                cur_price = q.get("price") or avg_px
+                chg_pct   = q.get("change_pct") or 0.0
+
+                # Unrealised P&L
+                mkt_val  = cur_price * shares
+                unreal   = mkt_val - cost
+                unreal_p = unreal / (cost + 1e-8) * 100
+
+                # Technical signal
+                df_raw, _ = fetch_data(code, "6mo")
+                sig_key, sig_detail = "NEUTRAL", ""
+                trend, conf, accel  = 0, 0, 0.0
+                cci_v, rsi_v, k_v   = np.nan, np.nan, np.nan
+                if df_raw is not None and len(df_raw) >= 60:
+                    try:
+                        df_s   = generate_signals(df_raw, params)
+                        sig_key, sig_detail = get_scan_signal(df_s, lookback=5)
+                        lat    = df_s.iloc[-1]
+                        trend  = int(float(lat.get("TrendScore",      0) or 0))
+                        conf   = int(float(lat.get("ConfluenceScore",  0) or 0))
+                        accel  = float(lat.get("MomAccel", 0) or 0)
+                        cci_v  = float(lat.get("CCI", np.nan))
+                        rsi_v  = float(lat.get("RSI", np.nan))
+                        k_v    = float(lat.get("K",   np.nan))
+                    except Exception:
+                        pass
+
+                # ── Strategy recommendation engine ──────────────────
+                def _strategy(sig_k, trend_s, conf_s, accel_s, unreal_pct, cur_px, avg_px):
+                    """
+                    Returns (action, color, reason) based on 4 dimensions:
+                    訊號強度 + 趨勢 + 共振 + 持倉成本位置
+                    """
+                    sell_sigs = {"STRONG_SELL","DIV_SELL","SELL","FAKE_BREAKOUT","KD_HIGH"}
+                    buy_sigs  = {"HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY","BUY","DIV_BUY"}
+                    strong_buy= {"HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY"}
+                    in_profit = unreal_pct > 0
+                    big_profit= unreal_pct > 15
+                    loss_warn = unreal_pct < -7
+
+                    # Priority 1: Sell signals + in profit → lock profits
+                    if sig_k in sell_sigs and in_profit:
+                        return ("🔴 建議出場",  "#ff3355",
+                                f"出現{SIGNAL_LABEL.get(sig_k,sig_k)}訊號 + 已獲利 {unreal_pct:.1f}% → 考慮鎖定獲利")
+
+                    # Priority 2: Sell signal + in loss → stop loss
+                    if sig_k in sell_sigs and not in_profit:
+                        return ("🔴 考慮停損",  "#ff3355",
+                                f"出現{SIGNAL_LABEL.get(sig_k,sig_k)}訊號 + 虧損 {unreal_pct:.1f}% → 考慮停損保護")
+
+                    # Priority 3: Strong downtrend
+                    if trend_s <= -2 and not in_profit:
+                        return ("🟡 減碼警示",  "#f0a500",
+                                f"強空頭趨勢 + 虧損 {unreal_pct:.1f}% → 考慮減碼或停損")
+
+                    # Priority 4: Big profit + weakening
+                    if big_profit and (conf_s < 4 or accel_s < -0.2):
+                        return ("🟡 部分獲利",  "#f0a500",
+                                f"獲利 {unreal_pct:.1f}% 但動能減弱 → 考慮分批出場鎖定")
+
+                    # Priority 5: Strong buy signals → add position
+                    if sig_k in strong_buy and trend_s >= 2 and conf_s >= 5:
+                        return ("⭐ 可加碼",    "#ffd700",
+                                f"三重共振+多頭趨勢 + 共振{conf_s}/7 → 技術面支持加碼")
+
+                    # Priority 6: Normal buy + uptrend → hold
+                    if sig_k in buy_sigs and trend_s >= 1:
+                        return ("🟢 續抱",      "#00ff88",
+                                f"多頭趨勢 + {SIGNAL_LABEL.get(sig_k,sig_k)}訊號 → 趨勢未變，繼續持有")
+
+                    # Priority 7: Stop loss triggered
+                    if loss_warn:
+                        return ("🔴 考慮停損",  "#ff3355",
+                                f"虧損已達 {unreal_pct:.1f}% 超過警戒線 → 建議執行停損")
+
+                    # Priority 8: Neutral zone
+                    if trend_s >= 1 and conf_s >= 4:
+                        return ("🟢 持有觀望",  "#00ff88",
+                                f"趨勢偏多 + 共振{conf_s}/7 → 靜待更強訊號")
+
+                    return ("⚪ 觀望",         "#5a8fb0",
+                            f"趨勢中性 + 訊號{SIGNAL_LABEL.get(sig_k,sig_k)} → 等待明確方向再操作")
+
+                action, act_color, reason = _strategy(
+                    sig_key, trend, conf, accel, unreal_p, cur_price, avg_px)
+
+                pos_rows.append({
+                    "代號":      code,
+                    "名稱":      p_info.get("name",""),
+                    "股數":      shares,
+                    "均成本":    round(avg_px, 2),
+                    "現價":      round(cur_price, 2),
+                    "漲跌%":     round(chg_pct, 2),
+                    "市值":      int(mkt_val),
+                    "未實現損益": int(unreal),
+                    "報酬%":     round(unreal_p, 2),
+                    "訊號":      SIGNAL_LABEL.get(sig_key, sig_key),
+                    "趨勢":      trend,
+                    "共振":      conf,
+                    "策略建議":  action,
+                })
+                advice_cards.append({
+                    "code": code, "name": p_info.get("name",""),
+                    "action": action, "color": act_color,
+                    "reason": reason, "sig_key": sig_key,
+                    "unreal_p": unreal_p, "unreal": unreal,
+                    "trend": trend, "conf": conf, "accel": accel,
+                    "cci": cci_v, "rsi": rsi_v, "k": k_v,
+                    "cur_price": cur_price, "avg_px": avg_px,
+                    "sig_detail": sig_detail,
+                })
+
+            # Portfolio summary metrics
+            total_cost = sum(p["cost"] for p in open_pos.values())
+            total_mkt  = sum(r["市值"]  for r in pos_rows)
+            total_unrl = total_mkt - total_cost
+            total_p    = total_unrl / (total_cost + 1e-8) * 100
+
+            pm1, pm2, pm3, pm4 = st.columns(4)
+            pnl_delta = "normal" if total_unrl >= 0 else "inverse"
+            pm1.metric("持倉數量",   f"{len(open_pos)} 支")
+            pm2.metric("總成本",     f"{total_cost/1e4:.1f} 萬")
+            pm3.metric("市值",       f"{total_mkt/1e4:.1f} 萬")
+            pm4.metric("未實現損益", f"{total_unrl/1e4:+.1f} 萬",
+                       f"{total_p:+.1f}%")
+
+            # Position table
+            df_pos = pd.DataFrame(pos_rows)
+            st.dataframe(
+                df_pos,
+                width='stretch',
+                column_config={
+                    "漲跌%":      st.column_config.NumberColumn(format="%+.2f%%"),
+                    "報酬%":      st.column_config.NumberColumn(format="%+.2f%%"),
+                    "未實現損益": st.column_config.NumberColumn(format="$%+,.0f"),
+                    "市值":       st.column_config.NumberColumn(format="$%,.0f"),
+                    "趨勢":       st.column_config.NumberColumn(format="%+d"),
+                    "共振":       st.column_config.ProgressColumn(
+                                  min_value=0, max_value=7, format="%d/7"),
+                },
+                hide_index=True,
+            )
+
+            # ── Strategy advice cards ──────────────────────────────
+            st.markdown("#### 🎯 個股策略建議")
+            st.caption("根據即時技術面 × 趨勢位置 × 共振強度 × 持倉成本 四維度分析")
+
+            for card in sorted(advice_cards,
+                               key=lambda c: (0 if "出場" in c["action"] or "停損" in c["action"]
+                                              else 1 if "加碼" in c["action"]
+                                              else 2)):
+                cci_txt  = f"{card['cci']:.1f}" if not np.isnan(card['cci']) else "-"
+                rsi_txt  = f"{card['rsi']:.1f}" if not np.isnan(card['rsi']) else "-"
+                k_txt    = f"{card['k']:.1f}"   if not np.isnan(card['k'])   else "-"
+                pnl_col  = "#00ff88" if card["unreal_p"] >= 0 else "#ff3355"
+                trend_lbl= {3:"強多頭↑↑",2:"多頭↑",1:"弱多頭",0:"中性",
+                            -1:"弱空頭",-2:"強空頭↓↓"}.get(card["trend"],"─")
+                accel_txt= f"{card['accel']:+.2f}" if abs(card["accel"]) > 0.05 else "─"
+                sig_det  = card["sig_detail"][:42] + "…" if len(card["sig_detail"]) > 42 else card["sig_detail"]
+
+                st.markdown(f"""
+                <div style="background:#0a1220;border:2px solid {card['color']};
+                    border-radius:12px;padding:14px 16px;margin-bottom:12px">
+                  <div style="display:flex;justify-content:space-between;
+                      align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+                    <div>
+                      <span style="font-size:1.1rem;font-weight:700;
+                          color:#e8f4fd;font-family:Space Mono,monospace">{card['code']}</span>
+                      <span style="color:#8a9bb5;font-size:0.85rem;margin-left:8px">{card['name']}</span>
+                    </div>
+                    <span style="font-size:1.0rem;font-weight:700;
+                        color:{card['color']};padding:2px 12px;
+                        background:rgba(0,0,0,0.3);border-radius:6px">{card['action']}</span>
+                  </div>
+                  <div style="color:#8a9bb5;font-size:0.8rem;margin-bottom:8px;
+                      border-left:3px solid {card['color']};padding-left:8px">
+                    {card['reason']}
+                  </div>
+                  <div style="display:flex;gap:14px;font-size:0.75rem;flex-wrap:wrap">
+                    <span style="color:#5a8fb0">持倉損益
+                      <b style="color:{pnl_col}">{card['unreal_p']:+.1f}%</b>
+                      （{int(card['unreal']):+,}元）</span>
+                    <span style="color:#5a8fb0">現價/均成本
+                      <b style="color:#e8f4fd">{card['cur_price']:.2f} / {card['avg_px']:.2f}</b></span>
+                    <span style="color:#5a8fb0">趨勢
+                      <b style="color:#e8f4fd">{trend_lbl}</b></span>
+                    <span style="color:#5a8fb0">共振
+                      <b style="color:#e8f4fd">{card['conf']}/7</b></span>
+                    <span style="color:#5a8fb0">訊號
+                      <b style="color:#e8f4fd">{SIGNAL_LABEL.get(card['sig_key'],'─')}</b></span>
+                  </div>
+                  <div style="display:flex;gap:14px;font-size:0.72rem;flex-wrap:wrap;margin-top:6px">
+                    <span style="color:#37474f">CCI {cci_txt}</span>
+                    <span style="color:#37474f">RSI {rsi_txt}</span>
+                    <span style="color:#37474f">K值 {k_txt}</span>
+                    <span style="color:#37474f">加速 {accel_txt}</span>
+                    <span style="color:#37474f;font-style:italic">{sig_det}</span>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # ══════════════════════════════════════════════════════
+        # SECTION C — 歷史交易績效
+        # ══════════════════════════════════════════════════════
+        closed = get_closed_trades(trades_all)
+        if closed:
+            st.markdown("---")
+            st.markdown("#### 📋 歷史已結算交易")
+            df_closed = pd.DataFrame(closed)
+            wins_c  = len(df_closed[df_closed["結果"] == "獲利"])
+            total_c = len(df_closed)
+            wr_c    = wins_c / total_c * 100 if total_c else 0
+            total_pnl = df_closed["實現損益"].sum()
+            avg_ret_c = df_closed["報酬%"].mean()
+
+            hm1, hm2, hm3, hm4 = st.columns(4)
+            hm1.metric("已結算交易",  total_c)
+            hm2.metric("實現勝率",    f"{wr_c:.1f}%",
+                       "✅" if wr_c >= 55 else "⚠️")
+            hm3.metric("總實現損益",  f"{int(total_pnl):+,} 元")
+            hm4.metric("平均報酬",    f"{avg_ret_c:+.2f}%")
+
+            st.dataframe(
+                df_closed,
+                width='stretch',
+                column_config={
+                    "報酬%":      st.column_config.NumberColumn(format="%+.2f%%"),
+                    "實現損益":   st.column_config.NumberColumn(format="$%+,.0f"),
+                },
+                hide_index=True,
+            )
+
+        # ══════════════════════════════════════════════════════
+        # SECTION D — 完整交易明細 & 刪除
+        # ══════════════════════════════════════════════════════
+        with st.expander("📑 所有交易記錄（可刪除）"):
+            if trades_all:
+                df_all = pd.DataFrame(trades_all)
+                st.dataframe(df_all[["id","type","code","name","date",
+                                      "price","shares","fee"]],
+                             width='stretch', hide_index=True)
+                del_id = st.number_input("刪除指定 ID", min_value=1,
+                                         step=1, key="del_id")
+                if st.button("🗑 刪除此筆記錄", key="del_btn"):
+                    before = len(trades_all)
+                    st.session_state.portfolio_trades = [
+                        t for t in trades_all if t["id"] != int(del_id)]
+                    after = len(st.session_state.portfolio_trades)
+                    if before != after:
+                        st.success(f"已刪除 ID={del_id}")
+                        st.rerun()
+                    else:
+                        st.warning(f"找不到 ID={del_id}")
+            else:
+                st.info("暫無交易記錄")
 
 
 if __name__ == "__main__":
