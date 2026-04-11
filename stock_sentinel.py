@@ -3257,6 +3257,17 @@ def main():
         run_bt  = c3.button("🔬 執行", type="primary", width='stretch')
         bt_target = bt_cust.strip() or bt_sym
 
+        # Period selector ABOVE the button — must be outside if run_bt: so Streamlit
+        # preserves the selection across reruns triggered by the button press
+        bt_period_opts = {"1年": "1y", "2年": "2y", "3年": "3y", "5年": "5y"}
+        bt_period_lbl  = st.radio(
+            "回測資料區間",
+            list(bt_period_opts.keys()),
+            index=1, horizontal=True,
+            key="bt_period_radio",
+        )
+        bt_period = bt_period_opts[bt_period_lbl]
+
         # ── 各訊號量化說明 ────────────────────────────────────────
         with st.expander("❓ 各訊號量化必要嗎？（點此展開說明）", expanded=False):
             st.markdown("""
@@ -3277,11 +3288,6 @@ def main():
             """)
 
         if run_bt:
-            bt_period_opts = {"1年": "1y", "2年": "2y", "3年": "3y", "5年": "5y"}
-            bt_period_lbl  = st.radio("回測資料區間", list(bt_period_opts.keys()),
-                                      index=1, horizontal=True,
-                                      label_visibility="collapsed")
-            bt_period = bt_period_opts[bt_period_lbl]
             with st.spinner(f"載入 {bt_target} 資料（{bt_period_lbl}）…"):
                 df_raw, err = fetch_data(bt_target, bt_period)
 
