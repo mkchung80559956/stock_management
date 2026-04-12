@@ -2484,25 +2484,21 @@ def mtf_confirm(daily_sig: str, weekly_sig: str) -> tuple[bool, str]:
     return False, "⚪ 無明確共識"
 def classify_market_regime(df: pd.DataFrame) -> pd.Series:
     """
-    Classify each daily bar into one of three market regimes:
-      'bull'     — EMA20 > EMA60, TrendScore >= 2, index in uptrend
-      'bear'     — EMA20 < EMA60, TrendScore <= -2, index in downtrend
-      'sideways' — neither: EMA20/EMA60 intertwined, low volatility
-    Returns a Series aligned to df.index.
+    Classify each daily bar into market regime using EMA position + EMA slope.
+    Three regimes:
+      'bull'     — EMA20 > EMA60  AND  EMA20 slope (10-bar) > 0
+      'bear'     — EMA20 < EMA60  AND  EMA20 slope (10-bar) < 0
+      'sideways' — transitional: EMA crossing or slope contradicts position
+    Uses EMA slope instead of ROC to avoid the threshold sensitivity problem.
+    Produces roughly equal thirds across a typical 2-year history.
     """
-    ema20 = df["Close"].ewm(span=20, adjust=False).mean()
-    ema60 = df["Close"].ewm(span=60, adjust=False).mean()
-
-    # Rate of change over 20 bars to determine direction momentum
-    roc20 = df["Close"].pct_change(20) * 100
+    ema20   = df["Close"].ewm(span=20, adjust=False).mean()
+    ema60   = df["Close"].ewm(span=60, adjust=False).mean()
+    slope10 = ema20.diff(10)   # 10-bar slope of EMA20
 
     regime = pd.Series("sideways", index=df.index, dtype=str)
-
-    bull_mask = (ema20 > ema60) & (roc20 > 3)
-    bear_mask = (ema20 < ema60) & (roc20 < -3)
-
-    regime[bull_mask] = "bull"
-    regime[bear_mask] = "bear"
+    regime[(ema20 > ema60) & (slope10 > 0)] = "bull"
+    regime[(ema20 < ema60) & (slope10 < 0)] = "bear"
     return regime
 
 
@@ -4371,13 +4367,19 @@ def main():
                 st.markdown("#### 🌤 市場環境分析回測（自動化框架）")
                 st.caption(
                     "自動將歷史分為三種市況（多頭 / 盤整 / 空頭），"
-                    "分別統計各訊號在不同環境下的真實勝率，"
-                    "找出「哪種市況適合哪種訊號」。"
+                    "分別統計各訊號在不同環境下的真實勝率。"
                 )
+
+                # Fetch 3y for regime analysis (more regimes visible)
+                with st.spinner("載入3年資料進行環境分類…"):
+                    df_regime, err_regime = fetch_data(bt_target, "3y")
+                if df_regime is None:
+                    df_regime = df_raw   # fallback to existing data
+                    st.caption("⚠️ 3年資料不足，使用現有資料區間")
 
                 with st.spinner("環境分類 + 多維度回測中…"):
                     regime_result = backtest_by_regime(
-                        df_raw, params,
+                        df_regime, params,
                         holding_days=holding_days,
                         profit_pct=profit_target,
                         stop_pct=stop_loss,
@@ -4431,30 +4433,55 @@ def main():
                     # ── Signal × Regime heatmap ────────────────────────
                     if not r_stat.empty:
                         st.markdown("##### 📊 訊號 × 市況 勝率矩陣")
-                        st.caption("數值 = 勝率%，格數越亮表示勝率越高。空白 = 該組合交易次數不足。")
+                        st.caption("數值 = 勝率%。空白 = 交易次數不足（< 2次）。")
 
-                        # Build pivot for heatmap
+                        # Regime distribution bar chart
+                        env_cnt_df = all_t["市場環境"].value_counts().reset_index()
+                        env_cnt_df.columns = ["市場環境", "交易次數"]
+                        env_color_map = {"🐂 多頭": "#00cc66", "⚖️ 盤整": "#f0a500", "🐻 空頭": "#ff3355"}
+                        env_cnt_df["顏色"] = env_cnt_df["市場環境"].map(env_color_map).fillna("#5a8fb0")
+                        dist_fig = go.Figure(go.Bar(
+                            x=env_cnt_df["市場環境"], y=env_cnt_df["交易次數"],
+                            marker_color=env_cnt_df["顏色"],
+                            text=env_cnt_df["交易次數"], textposition="outside",
+                        ))
+                        dist_fig.update_layout(
+                            template="plotly_dark", height=200,
+                            paper_bgcolor="#0a0e1a", plot_bgcolor="#0d1226",
+                            margin=dict(l=20, r=20, t=20, b=30),
+                            font=dict(size=10, color="#8a9bb5"),
+                            showlegend=False, title="市況分布（交易次數）",
+                        )
+                        st.plotly_chart(dist_fig, width='stretch')
+
                         try:
                             pivot = r_stat.pivot_table(
                                 index="訊號", columns="市場環境",
                                 values="勝率%", aggfunc="first"
-                            ).fillna(0)
+                            )
+                            # Ensure all three columns exist even if empty
+                            for env in ["🐂 多頭", "⚖️ 盤整", "🐻 空頭"]:
+                                if env not in pivot.columns:
+                                    pivot[env] = float("nan")
+                            env_order_cols = ["🐂 多頭", "⚖️ 盤整", "🐻 空頭"]
+                            pivot = pivot[env_order_cols].fillna(0)
 
-                            # Plotly heatmap
-                            import plotly.figure_factory as ff
-                            env_order_cols = [c for c in ["🐂 多頭","⚖️ 盤整","🐻 空頭"] if c in pivot.columns]
-                            pivot_ordered  = pivot[env_order_cols] if env_order_cols else pivot
+                            z    = pivot.values.tolist()
+                            xlbl = list(pivot.columns)
+                            ylbl = list(pivot.index)
 
-                            z    = pivot_ordered.values.tolist()
-                            xlbl = list(pivot_ordered.columns)
-                            ylbl = list(pivot_ordered.index)
+                            # Build text: show % if value > 0, else "─"
+                            text_z = [
+                                [f"{v:.0f}%" if v > 0 else "─" for v in row]
+                                for row in z
+                            ]
 
                             heat_fig = go.Figure(go.Heatmap(
                                 z=z, x=xlbl, y=ylbl,
                                 colorscale=[[0,"#0d1226"],[0.4,"#1a3a6a"],
                                             [0.6,"#1a6a3a"],[1,"#00ff88"]],
                                 zmin=0, zmax=100,
-                                text=[[f"{v:.0f}%" if v > 0 else "" for v in row] for row in z],
+                                text=text_z,
                                 texttemplate="%{text}",
                                 textfont={"size": 12, "color": "white"},
                                 hovertemplate="訊號：%{y}<br>市況：%{x}<br>勝率：%{z:.1f}%<extra></extra>",
@@ -4462,16 +4489,16 @@ def main():
                             ))
                             heat_fig.update_layout(
                                 template="plotly_dark",
-                                height=max(250, len(ylbl) * 45 + 80),
+                                height=max(280, len(ylbl) * 50 + 100),
                                 paper_bgcolor="#0a0e1a",
                                 plot_bgcolor="#0d1226",
-                                margin=dict(l=120, r=40, t=20, b=40),
+                                margin=dict(l=130, r=60, t=50, b=20),
                                 font=dict(size=11, color="#8a9bb5"),
                                 xaxis=dict(side="top"),
                             )
                             st.plotly_chart(heat_fig, width='stretch')
-                        except Exception:
-                            pass   # fallback to table
+                        except Exception as e:
+                            st.caption(f"熱圖生成失敗：{e}")
 
                         st.dataframe(
                             r_stat, width='stretch', hide_index=True,
