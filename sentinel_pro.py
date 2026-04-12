@@ -2267,6 +2267,155 @@ def gs_overwrite_trades(sheet_id: str, api_key: str, trades: list) -> tuple[bool
         return False, err
 
 
+
+# ══════════════════════════════════════════════
+# SIGNAL  HISTORY  TRACKER
+# Stores real signals as they fire, tracks actual
+# 5/10/20-day returns to build a live win-rate DB.
+# ══════════════════════════════════════════════
+_SIG_HIST_FILE = "/tmp/sentinel_sig_history.json"
+
+@st.cache_resource
+def _get_sig_hist_store() -> dict:
+    """
+    Singleton: {
+      "records": [
+        {id, code, name, sig_key, sig_label, confluence,
+         trend, date_fired, price_fired, atr_stop,
+         price_5d, price_10d, price_20d,
+         ret_5d, ret_10d, ret_20d, status}
+      ]
+    }
+    status: "pending" → "partial" → "complete"
+    """
+    store = {"records": []}
+    try:
+        if os.path.exists(_SIG_HIST_FILE):
+            with open(_SIG_HIST_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded.get("records"), list):
+                store["records"] = loaded["records"]
+    except Exception:
+        pass
+    return store
+
+
+def _save_sig_hist(store: dict) -> None:
+    try:
+        tmp = _SIG_HIST_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False)
+        os.replace(tmp, _SIG_HIST_FILE)
+    except Exception:
+        pass
+
+
+def sig_hist_add(record: dict) -> None:
+    """Add a new signal record if not already recorded today for this code+sig."""
+    store = _get_sig_hist_store()
+    # Dedup: same code + sig_key within same calendar day
+    existing_keys = {(r["code"], r["sig_key"], r["date_fired"])
+                     for r in store["records"]}
+    key = (record["code"], record["sig_key"], record["date_fired"])
+    if key not in existing_keys:
+        store["records"].append(record)
+        _save_sig_hist(store)
+
+
+def sig_hist_update_outcomes(fetch_data_fn) -> int:
+    """
+    For every pending/partial record, check if 5/10/20 trading days
+    have elapsed and fetch the actual closing price to fill in returns.
+    Returns count of records updated.
+    """
+    store   = _get_sig_hist_store()
+    records = store["records"]
+    updated = 0
+
+    for r in records:
+        if r.get("status") == "complete":
+            continue
+        try:
+            fire_date = datetime.strptime(r["date_fired"], "%Y-%m-%d").date()
+            today     = tw_now().date()
+            cal_days  = (today - fire_date).days   # calendar days elapsed
+
+            # Approximate: 5 trading days ≈ 7 calendar days, etc.
+            thresholds = {5: 7, 10: 14, 20: 28}
+
+            # Fetch historical data for this stock (use 3mo to cover all windows)
+            df, _ = fetch_data_fn(r["code"], "3mo")
+            if df is None or len(df) < 5:
+                continue
+
+            # Filter to dates >= fire_date
+            df_after = df[df.index.date >= fire_date]
+            n_bars   = len(df_after)   # trading days since signal
+
+            changed = False
+            for td, cd in [(5,"ret_5d"), (10,"ret_10d"), (20,"ret_20d")]:
+                price_key = f"price_{td}d"
+                if r.get(price_key) is not None:
+                    continue   # already filled
+                if n_bars >= td:
+                    # Use the closing price at the td-th trading day
+                    close_at_td = float(df_after.iloc[td - 1]["Close"])
+                    ret_pct     = (close_at_td - r["price_fired"]) / r["price_fired"] * 100
+                    r[price_key]     = round(close_at_td, 2)
+                    r[cd]            = round(ret_pct, 2)
+                    changed = True
+
+            if changed:
+                # Set status
+                filled = sum(1 for td in [5,10,20] if r.get(f"price_{td}d") is not None)
+                r["status"] = "complete" if filled == 3 else "partial"
+                updated += 1
+
+        except Exception:
+            continue
+
+    if updated:
+        store["records"] = records
+        _save_sig_hist(store)
+
+    return updated
+
+
+def sig_hist_get_all() -> list:
+    return _get_sig_hist_store()["records"]
+
+
+def sig_hist_clear() -> None:
+    store = _get_sig_hist_store()
+    store["records"] = []
+    _save_sig_hist(store)
+
+
+def sig_hist_to_df(records: list) -> "pd.DataFrame":
+    """Convert records to a clean display DataFrame."""
+    if not records:
+        return pd.DataFrame()
+    rows = []
+    for r in records:
+        sig_label = SIGNAL_LABEL.get(r.get("sig_key",""), r.get("sig_label","─"))
+        rows.append({
+            "日期":      r.get("date_fired",""),
+            "代號":      r.get("code",""),
+            "名稱":      r.get("name",""),
+            "訊號":      sig_label,
+            "共振":      r.get("confluence", "-"),
+            "趨勢":      r.get("trend", "-"),
+            "進場價":    r.get("price_fired",""),
+            "5日%":      r.get("ret_5d"),
+            "10日%":     r.get("ret_10d"),
+            "20日%":     r.get("ret_20d"),
+            "狀態":      {"pending":"⏳等待","partial":"🔄部分","complete":"✅完成"}.get(
+                          r.get("status","pending"), "⏳等待"),
+        })
+    df = pd.DataFrame(rows)
+    df = df.sort_values("日期", ascending=False).reset_index(drop=True)
+    return df
+    # 上市 (TSE .TW) ─────────────────────────────
 DEFAULT_WATCHLIST = [
     # 上市 (TSE .TW) ─────────────────────────────
     "2330",   # 台積電
@@ -2954,8 +3103,9 @@ def main():
     # ══════════════════════════════════════════
     # TABS
     # ══════════════════════════════════════════
-    tab_scan, tab_drill, tab_bt, tab_port = st.tabs([
-        "📡  訊號掃描", "🔬  個股分析", "📊  回測 & 優化", "📒  買賣記錄",
+    tab_scan, tab_drill, tab_bt, tab_port, tab_sig_hist = st.tabs([
+        "📡  訊號掃描", "🔬  個股分析", "📊  回測 & 優化",
+        "📒  買賣記錄", "📈  訊號歷史勝率",
     ])
 
     # ─────────────────────────────────────────
@@ -3177,6 +3327,31 @@ def main():
             st.session_state.scan_rows      = rows
             st.session_state.scan_failed    = failed
             st.session_state.scan_timestamp = tw_now().strftime("%Y-%m-%d %H:%M")
+
+            # ── Record NEW buy signals into history DB ────────────────
+            _TRACK_SIGS = BUY_SIGNALS  # track all buy signals
+            today_str = tw_now().strftime("%Y-%m-%d")
+            for r in rows:
+                if r["_sig_key"] in _TRACK_SIGS:
+                    sig_hist_add({
+                        "code":        r["代號"],
+                        "name":        r.get("_cn_name", r.get("名稱","")),
+                        "sig_key":     r["_sig_key"],
+                        "sig_label":   SIGNAL_LABEL.get(r["_sig_key"], r["_sig_key"]),
+                        "confluence":  r.get("_conf", 0),
+                        "trend":       r.get("趨勢", 0),
+                        "date_fired":  today_str,
+                        "price_fired": r.get("_price", r.get("最新價", 0)),
+                        "atr_stop":    r.get("_atr_stop", "-"),
+                        "price_5d":    None, "price_10d": None, "price_20d": None,
+                        "ret_5d":      None, "ret_10d":   None, "ret_20d":   None,
+                        "status":      "pending",
+                    })
+
+            # ── Update outcomes for previously recorded signals ───────
+            n_updated = sig_hist_update_outcomes(fetch_data)
+            if n_updated:
+                st.toast(f"📈 已更新 {n_updated} 筆歷史訊號實際報酬", icon="📊")
 
             # ── Telegram push for NEW actionable signals ──────────────
             tg_token_v   = st.session_state.get("tg_token", "")
@@ -4301,6 +4476,192 @@ def main():
                     type="primary",
                     width='stretch',
                 )
+
+
+    # ─────────────────────────────────────────
+    # TAB 5  訊號歷史勝率
+    # ─────────────────────────────────────────
+    with tab_sig_hist:
+        st.markdown("#### 📈 真實訊號歷史勝率追蹤")
+        st.caption(
+            "每次掃描發現買入訊號時自動記錄。之後每次掃描自動回填 5/10/20 交易日的實際報酬，"
+            "幫助你驗證訊號的真實效果，而非假設性回測。"
+        )
+
+        records = sig_hist_get_all()
+        df_hist  = sig_hist_to_df(records)
+
+        # ── 手動觸發更新 ──
+        col_upd, col_exp, col_clr = st.columns([2, 2, 1])
+        if col_upd.button("🔄 立即更新報酬", key="sh_update", width='stretch'):
+            with st.spinner("更新中，下載各股歷史價格…"):
+                n = sig_hist_update_outcomes(fetch_data)
+            st.success(f"✅ 更新了 {n} 筆記錄")
+            st.rerun()
+
+        records = sig_hist_get_all()
+        df_hist = sig_hist_to_df(records)
+
+        if not df_hist.empty:
+            with col_exp:
+                with st.expander("📤 匯出記錄", expanded=False):
+                    st.download_button(
+                        "下載 Excel",
+                        data=to_excel(df_hist),
+                        file_name=f"sig_history_{tw_now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width='stretch',
+                    )
+            if col_clr.button("🗑", key="sh_clear", help="清除所有歷史記錄"):
+                sig_hist_clear()
+                st.rerun()
+
+        if df_hist.empty:
+            st.info(
+                "📭 尚無歷史記錄。\n\n"
+                "執行一次掃描後，所有出現的買入訊號會自動記錄。"
+                "之後每次掃描會自動填入 5/10/20 日後的實際報酬。"
+            )
+        else:
+            total    = len(records)
+            complete = sum(1 for r in records if r.get("status") == "complete")
+            pending  = sum(1 for r in records if r.get("status") == "pending")
+
+            ma, mb, mc, md = st.columns(4)
+            ma.metric("總記錄訊號", total)
+            mb.metric("已完成追蹤", complete)
+            mc.metric("等待中",     pending)
+            md.metric("追蹤中",     total - complete - pending)
+
+            # ── Per-signal win rate summary ──────────────────────────
+            completed_recs = [r for r in records if r.get("status") == "complete"]
+            if completed_recs:
+                st.markdown("---")
+                st.markdown("##### 📊 各訊號類型真實勝率統計")
+
+                summary_rows = []
+                for period_key, period_label in [("ret_5d","5日"), ("ret_10d","10日"), ("ret_20d","20日")]:
+                    by_sig = {}
+                    for r in completed_recs:
+                        sk = r.get("sig_key","")
+                        if sk not in by_sig:
+                            by_sig[sk] = []
+                        v = r.get(period_key)
+                        if v is not None:
+                            by_sig[sk].append(v)
+
+                    for sk, rets in by_sig.items():
+                        if not rets:
+                            continue
+                        wins    = sum(1 for v in rets if v > 0)
+                        wr      = wins / len(rets) * 100
+                        avg_ret = sum(rets) / len(rets)
+                        max_ret = max(rets)
+                        min_ret = min(rets)
+                        summary_rows.append({
+                            "訊號":      SIGNAL_LABEL.get(sk, sk),
+                            "持有期":    period_label,
+                            "次數":      len(rets),
+                            "真實勝率%": round(wr, 1),
+                            "平均報酬%": round(avg_ret, 2),
+                            "最大獲利%": round(max_ret, 2),
+                            "最大虧損%": round(min_ret, 2),
+                        })
+
+                if summary_rows:
+                    df_sum = (pd.DataFrame(summary_rows)
+                              .sort_values(["持有期","真實勝率%"],
+                                           ascending=[True, False])
+                              .reset_index(drop=True))
+                    st.dataframe(
+                        df_sum, width='stretch', hide_index=True,
+                        column_config={
+                            "真實勝率%": st.column_config.ProgressColumn(
+                                min_value=0, max_value=100, format="%.1f%%"),
+                            "平均報酬%": st.column_config.NumberColumn(format="%+.2f%%"),
+                            "最大獲利%": st.column_config.NumberColumn(format="%+.2f%%"),
+                            "最大虧損%": st.column_config.NumberColumn(format="%+.2f%%"),
+                        },
+                    )
+
+                    # ── Confluence filter analysis ────────────────────
+                    st.markdown("##### 🔍 共振分數 vs 勝率（20日持有）")
+                    st.caption("驗證共振門檻設定是否真正有效")
+                    conf_rows = []
+                    for min_conf in range(3, 8):
+                        subset = [r for r in completed_recs
+                                  if r.get("confluence", 0) >= min_conf
+                                  and r.get("ret_20d") is not None]
+                        if len(subset) < 3:
+                            continue
+                        wr20 = sum(1 for r in subset if r["ret_20d"] > 0) / len(subset) * 100
+                        avg20 = sum(r["ret_20d"] for r in subset) / len(subset)
+                        conf_rows.append({
+                            "共振門檻 ≥": min_conf,
+                            "符合訊號數": len(subset),
+                            "20日勝率%":  round(wr20, 1),
+                            "20日平均報酬%": round(avg20, 2),
+                        })
+
+                    if conf_rows:
+                        df_conf = pd.DataFrame(conf_rows)
+                        st.dataframe(
+                            df_conf, width='stretch', hide_index=True,
+                            column_config={
+                                "20日勝率%": st.column_config.ProgressColumn(
+                                    min_value=0, max_value=100, format="%.1f%%"),
+                                "20日平均報酬%": st.column_config.NumberColumn(format="%+.2f%%"),
+                            },
+                        )
+                        # Highlight optimal confluence threshold
+                        best_conf = df_conf.loc[df_conf["20日勝率%"].idxmax()]
+                        st.info(
+                            f"💡 根據歷史數據，共振門檻設為 "
+                            f"**{int(best_conf['共振門檻 ≥'])}** 時勝率最高："
+                            f"**{best_conf['20日勝率%']:.1f}%**"
+                            f"（{int(best_conf['符合訊號數'])} 次交易）"
+                        )
+
+            # ── Full record table ─────────────────────────────────────
+            st.markdown("---")
+            st.markdown("##### 📋 完整訊號記錄")
+
+            # Filter controls
+            fc1, fc2 = st.columns(2)
+            filter_sig  = fc1.multiselect(
+                "篩選訊號類型",
+                options=df_hist["訊號"].unique().tolist(),
+                default=[],
+                key="sh_filter_sig",
+                placeholder="全部訊號",
+            )
+            filter_stat = fc2.multiselect(
+                "篩選狀態",
+                options=["⏳等待","🔄部分","✅完成"],
+                default=[],
+                key="sh_filter_stat",
+                placeholder="全部狀態",
+            )
+
+            df_show = df_hist.copy()
+            if filter_sig:
+                df_show = df_show[df_show["訊號"].isin(filter_sig)]
+            if filter_stat:
+                df_show = df_show[df_show["狀態"].isin(filter_stat)]
+
+            st.dataframe(
+                df_show, width='stretch', hide_index=True,
+                height=min(400, 35 + len(df_show) * 35),
+                column_config={
+                    "5日%":   st.column_config.NumberColumn(format="%+.2f%%"),
+                    "10日%":  st.column_config.NumberColumn(format="%+.2f%%"),
+                    "20日%":  st.column_config.NumberColumn(format="%+.2f%%"),
+                    "進場價": st.column_config.NumberColumn(format="%.2f"),
+                    "共振":   st.column_config.ProgressColumn(
+                               min_value=0, max_value=7, format="%d/7"),
+                },
+            )
+            st.caption(f"共 {len(df_show)} 筆 | 等待中的記錄在下次掃描時自動更新")
 
 
 if __name__ == "__main__":
