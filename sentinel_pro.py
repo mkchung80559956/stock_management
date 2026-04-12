@@ -2482,6 +2482,175 @@ def mtf_confirm(daily_sig: str, weekly_sig: str) -> tuple[bool, str]:
     if d_sell and w_buy:
         return False, "❌ 日賣/週買（逆勢）"
     return False, "⚪ 無明確共識"
+def classify_market_regime(df: pd.DataFrame) -> pd.Series:
+    """
+    Classify each daily bar into one of three market regimes:
+      'bull'     — EMA20 > EMA60, TrendScore >= 2, index in uptrend
+      'bear'     — EMA20 < EMA60, TrendScore <= -2, index in downtrend
+      'sideways' — neither: EMA20/EMA60 intertwined, low volatility
+    Returns a Series aligned to df.index.
+    """
+    ema20 = df["Close"].ewm(span=20, adjust=False).mean()
+    ema60 = df["Close"].ewm(span=60, adjust=False).mean()
+
+    # Rate of change over 20 bars to determine direction momentum
+    roc20 = df["Close"].pct_change(20) * 100
+
+    regime = pd.Series("sideways", index=df.index, dtype=str)
+
+    bull_mask = (ema20 > ema60) & (roc20 > 3)
+    bear_mask = (ema20 < ema60) & (roc20 < -3)
+
+    regime[bull_mask] = "bull"
+    regime[bear_mask] = "bear"
+    return regime
+
+
+def backtest_by_regime(
+    df: pd.DataFrame,
+    params: dict,
+    holding_days: int = 10,
+    profit_pct: float = 3.0,
+    stop_pct: float = 5.0,
+) -> dict:
+    """
+    Run backtest and annotate each trade with its market regime at entry.
+    Returns dict with:
+      all_trades   — full trade DataFrame with 'market_regime' column
+      regime_stats — DataFrame: regime × signal → win_rate, avg_ret, count
+      signal_stats — DataFrame: signal × metric (across all regimes)
+      best_by_regime — {regime: [(signal, win_rate, count)]}
+    """
+    df_sig = generate_signals(df, params)
+    regime = classify_market_regime(df)
+    df_sig["market_regime"] = regime
+
+    buy_idx = df_sig.index[df_sig["Signal"].isin(BUY_SIGNALS)]
+    if len(buy_idx) == 0:
+        empty = pd.DataFrame()
+        return {"all_trades": empty, "regime_stats": empty,
+                "signal_stats": empty, "best_by_regime": {}}
+
+    prices = df_sig["Close"].values
+    opens  = df_sig["Open"].values
+    dates  = df_sig.index
+    rows   = []
+
+    for entry_date in buy_idx:
+        pos = df_sig.index.get_loc(entry_date)
+        entry_pos = pos + 1
+        if entry_pos >= len(prices):
+            continue
+        ep      = opens[entry_pos]
+        outcome = "HOLD"
+        xp, xd, held = ep, dates[entry_pos], 0
+
+        for d in range(1, min(holding_days + 1, len(prices) - entry_pos)):
+            fp  = prices[entry_pos + d]
+            ret = (fp - ep) / ep * 100
+            if ret >= profit_pct:
+                outcome, xp, xd, held = "WIN",  fp, dates[entry_pos + d], d; break
+            elif ret <= -stop_pct:
+                outcome, xp, xd, held = "LOSS", fp, dates[entry_pos + d], d; break
+
+        if outcome == "HOLD" and entry_pos + holding_days < len(prices):
+            xp   = prices[entry_pos + holding_days]
+            held = holding_days
+            xd   = dates[min(entry_pos + holding_days, len(dates) - 1)]
+            outcome = "WIN" if xp > ep else "LOSS"
+
+        ret_pct = (xp - ep) / ep * 100
+        rows.append({
+            "進場日":       entry_date.date(),
+            "訊號代號":     df_sig.loc[entry_date, "Signal"],
+            "訊號名稱":     SIGNAL_LABEL.get(df_sig.loc[entry_date, "Signal"], "─"),
+            "市場環境":     {"bull": "🐂 多頭", "bear": "🐻 空頭",
+                            "sideways": "⚖️ 盤整"}.get(
+                                str(df_sig.loc[entry_date, "market_regime"]), "─"),
+            "共振":         int(float(df_sig.loc[entry_date].get("ConfluenceScore", 0) or 0)),
+            "趨勢分數":     int(float(df_sig.loc[entry_date].get("TrendScore", 0) or 0)),
+            "進場價":       round(ep, 2),
+            "出場價":       round(xp, 2),
+            "持有天":       held,
+            "報酬%":        round(ret_pct, 2),
+            "結果":         outcome,
+        })
+
+    if not rows:
+        empty = pd.DataFrame()
+        return {"all_trades": empty, "regime_stats": empty,
+                "signal_stats": empty, "best_by_regime": {}}
+
+    all_trades = pd.DataFrame(rows)
+    comp       = all_trades[all_trades["結果"] != "HOLD"]
+
+    # ── Regime × Signal cross-stats ─────────────────────────────────
+    env_order  = ["🐂 多頭", "⚖️ 盤整", "🐻 空頭"]
+    stat_rows  = []
+    best_by_regime: dict[str, list] = {}
+
+    for env in env_order:
+        env_df = comp[comp["市場環境"] == env]
+        if len(env_df) == 0:
+            continue
+        best_sig = []
+        for sig_code in BUY_SIGNALS:
+            sig_label = SIGNAL_LABEL.get(sig_code, sig_code)
+            s = env_df[env_df["訊號代號"] == sig_code]
+            if len(s) < 2:
+                continue
+            wr  = len(s[s["結果"] == "WIN"]) / len(s) * 100
+            avg = s["報酬%"].mean()
+            stat_rows.append({
+                "市場環境":  env,
+                "訊號":      sig_label,
+                "次數":      len(s),
+                "勝率%":     round(wr, 1),
+                "平均報酬%": round(avg, 2),
+                "最大獲利%": round(s["報酬%"].max(), 2),
+                "最大虧損%": round(s["報酬%"].min(), 2),
+            })
+            best_sig.append((sig_label, wr, len(s), avg))
+        best_sig.sort(key=lambda x: (-x[1], -x[2]))
+        best_by_regime[env] = best_sig
+
+    regime_stats = (pd.DataFrame(stat_rows)
+                    .sort_values(["市場環境", "勝率%"], ascending=[True, False])
+                    .reset_index(drop=True)) if stat_rows else pd.DataFrame()
+
+    # ── Signal-level summary (across all environments) ───────────────
+    sig_rows = []
+    for sig_code in BUY_SIGNALS:
+        sig_label = SIGNAL_LABEL.get(sig_code, sig_code)
+        s = comp[comp["訊號代號"] == sig_code]
+        if len(s) < 2:
+            continue
+        wr = len(s[s["結果"] == "WIN"]) / len(s) * 100
+        sig_rows.append({
+            "訊號":      sig_label,
+            "總次數":    len(s),
+            "勝率%":     round(wr, 1),
+            "平均報酬%": round(s["報酬%"].mean(), 2),
+            "多頭勝率%": round(len(s[(s["市場環境"] == "🐂 多頭") & (s["結果"] == "WIN")]) /
+                              max(len(s[s["市場環境"] == "🐂 多頭"]), 1) * 100, 1),
+            "盤整勝率%": round(len(s[(s["市場環境"] == "⚖️ 盤整") & (s["結果"] == "WIN")]) /
+                              max(len(s[s["市場環境"] == "⚖️ 盤整"]), 1) * 100, 1),
+            "空頭勝率%": round(len(s[(s["市場環境"] == "🐻 空頭") & (s["結果"] == "WIN")]) /
+                              max(len(s[s["市場環境"] == "🐻 空頭"]), 1) * 100, 1),
+        })
+    signal_stats = (pd.DataFrame(sig_rows)
+                    .sort_values("勝率%", ascending=False)
+                    .reset_index(drop=True)) if sig_rows else pd.DataFrame()
+
+    return {
+        "all_trades":    all_trades,
+        "regime_stats":  regime_stats,
+        "signal_stats":  signal_stats,
+        "best_by_regime": best_by_regime,
+        "total_trades":  len(comp),
+    }
+
+
 DEFAULT_WATCHLIST = [
     # 上市 (TSE .TW) ─────────────────────────────
     # 上市 (TSE .TW) ─────────────────────────────
@@ -4196,6 +4365,169 @@ def main():
                         file_name=f"optimize_{bare_bt}_{datetime.now().strftime('%Y%m%d')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
+
+                # ── ⑦ 市場環境分析回測 ──────────────────────────────
+                st.divider()
+                st.markdown("#### 🌤 市場環境分析回測（自動化框架）")
+                st.caption(
+                    "自動將歷史分為三種市況（多頭 / 盤整 / 空頭），"
+                    "分別統計各訊號在不同環境下的真實勝率，"
+                    "找出「哪種市況適合哪種訊號」。"
+                )
+
+                with st.spinner("環境分類 + 多維度回測中…"):
+                    regime_result = backtest_by_regime(
+                        df_raw, params,
+                        holding_days=holding_days,
+                        profit_pct=profit_target,
+                        stop_pct=stop_loss,
+                    )
+
+                if regime_result["all_trades"].empty:
+                    st.warning("訊號次數不足，無法進行環境分析（建議使用 2 年以上資料）")
+                else:
+                    all_t  = regime_result["all_trades"]
+                    r_stat = regime_result["regime_stats"]
+                    s_stat = regime_result["signal_stats"]
+                    best_r = regime_result["best_by_regime"]
+
+                    # ── 市況分布 ──────────────────────────────────────
+                    env_counts = all_t["市場環境"].value_counts()
+                    ec1, ec2, ec3 = st.columns(3)
+                    ec1.metric("🐂 多頭交易", int(env_counts.get("🐂 多頭", 0)))
+                    ec2.metric("⚖️ 盤整交易", int(env_counts.get("⚖️ 盤整", 0)))
+                    ec3.metric("🐻 空頭交易", int(env_counts.get("🐻 空頭", 0)))
+
+                    # ── Best signal per regime cards ───────────────────
+                    st.markdown("##### 🏆 各市況最佳訊號")
+                    card_cols = st.columns(3)
+                    env_colors = {"🐂 多頭": "#00cc66", "⚖️ 盤整": "#f0a500", "🐻 空頭": "#ff3355"}
+                    for col, (env, sigs) in zip(card_cols, best_r.items()):
+                        with col:
+                            clr = env_colors.get(env, "#5a8fb0")
+                            st.markdown(
+                                f'<div style="border:2px solid {clr};border-radius:10px;'
+                                f'padding:12px;background:#08101a">'
+                                f'<div style="font-size:1rem;font-weight:700;color:{clr};'
+                                f'margin-bottom:8px">{env}</div>',
+                                unsafe_allow_html=True,
+                            )
+                            if sigs:
+                                for rank, (sig_lbl, wr, cnt, avg) in enumerate(sigs[:3], 1):
+                                    medal = ["🥇","🥈","🥉"][rank-1]
+                                    wr_c  = "#00ff88" if wr >= 60 else "#f0a500" if wr >= 50 else "#ff6666"
+                                    st.markdown(
+                                        f'<div style="font-size:0.8rem;margin:4px 0">'
+                                        f'{medal} <b style="color:#e8f4fd">{sig_lbl}</b><br>'
+                                        f'&nbsp;&nbsp;勝率 <b style="color:{wr_c}">{wr:.0f}%</b>'
+                                        f'　平均 <b style="color:#8a9bb5">{avg:+.1f}%</b>'
+                                        f'　{cnt}次</div>',
+                                        unsafe_allow_html=True,
+                                    )
+                            else:
+                                st.caption("資料不足")
+                            st.markdown('</div>', unsafe_allow_html=True)
+
+                    # ── Signal × Regime heatmap ────────────────────────
+                    if not r_stat.empty:
+                        st.markdown("##### 📊 訊號 × 市況 勝率矩陣")
+                        st.caption("數值 = 勝率%，格數越亮表示勝率越高。空白 = 該組合交易次數不足。")
+
+                        # Build pivot for heatmap
+                        try:
+                            pivot = r_stat.pivot_table(
+                                index="訊號", columns="市場環境",
+                                values="勝率%", aggfunc="first"
+                            ).fillna(0)
+
+                            # Plotly heatmap
+                            import plotly.figure_factory as ff
+                            env_order_cols = [c for c in ["🐂 多頭","⚖️ 盤整","🐻 空頭"] if c in pivot.columns]
+                            pivot_ordered  = pivot[env_order_cols] if env_order_cols else pivot
+
+                            z    = pivot_ordered.values.tolist()
+                            xlbl = list(pivot_ordered.columns)
+                            ylbl = list(pivot_ordered.index)
+
+                            heat_fig = go.Figure(go.Heatmap(
+                                z=z, x=xlbl, y=ylbl,
+                                colorscale=[[0,"#0d1226"],[0.4,"#1a3a6a"],
+                                            [0.6,"#1a6a3a"],[1,"#00ff88"]],
+                                zmin=0, zmax=100,
+                                text=[[f"{v:.0f}%" if v > 0 else "" for v in row] for row in z],
+                                texttemplate="%{text}",
+                                textfont={"size": 12, "color": "white"},
+                                hovertemplate="訊號：%{y}<br>市況：%{x}<br>勝率：%{z:.1f}%<extra></extra>",
+                                colorbar=dict(title="勝率%", tickformat=".0f"),
+                            ))
+                            heat_fig.update_layout(
+                                template="plotly_dark",
+                                height=max(250, len(ylbl) * 45 + 80),
+                                paper_bgcolor="#0a0e1a",
+                                plot_bgcolor="#0d1226",
+                                margin=dict(l=120, r=40, t=20, b=40),
+                                font=dict(size=11, color="#8a9bb5"),
+                                xaxis=dict(side="top"),
+                            )
+                            st.plotly_chart(heat_fig, width='stretch')
+                        except Exception:
+                            pass   # fallback to table
+
+                        st.dataframe(
+                            r_stat, width='stretch', hide_index=True,
+                            column_config={
+                                "勝率%":     st.column_config.ProgressColumn(
+                                    min_value=0, max_value=100, format="%.1f%%"),
+                                "平均報酬%": st.column_config.NumberColumn(format="%+.2f%%"),
+                                "最大獲利%": st.column_config.NumberColumn(format="%+.2f%%"),
+                                "最大虧損%": st.column_config.NumberColumn(format="%+.2f%%"),
+                            },
+                        )
+
+                    # ── Signal-level cross-env summary ────────────────
+                    if not s_stat.empty:
+                        st.markdown("##### 📋 各訊號跨市況勝率對比")
+                        st.dataframe(
+                            s_stat, width='stretch', hide_index=True,
+                            column_config={
+                                "勝率%":     st.column_config.ProgressColumn(
+                                    min_value=0, max_value=100, format="%.1f%%"),
+                                "平均報酬%": st.column_config.NumberColumn(format="%+.2f%%"),
+                                "多頭勝率%": st.column_config.NumberColumn(format="%.1f%%"),
+                                "盤整勝率%": st.column_config.NumberColumn(format="%.1f%%"),
+                                "空頭勝率%": st.column_config.NumberColumn(format="%.1f%%"),
+                            },
+                        )
+
+                    # ── Strategy recommendation ────────────────────────
+                    st.markdown("##### 💡 策略建議")
+                    for env, sigs in best_r.items():
+                        if not sigs or sigs[0][1] < 40:
+                            continue
+                        top = sigs[0]
+                        avoid = [s for s in sigs if s[1] < 45]
+                        clr = env_colors.get(env, "#5a8fb0")
+                        msg_parts = [
+                            f"**{env}**：首選 **{top[0]}**（勝率 {top[1]:.0f}%，"
+                            f"共 {top[2]} 次，平均 {top[3]:+.1f}%）"
+                        ]
+                        if len(sigs) >= 2 and sigs[1][1] >= 50:
+                            msg_parts.append(f"，次選 **{sigs[1][0]}**（{sigs[1][1]:.0f}%）")
+                        if avoid:
+                            msg_parts.append(
+                                f"。❌ 避免：{', '.join(s[0] for s in avoid[:2])}"
+                                f"（勝率低於 45%）"
+                            )
+                        st.info("".join(msg_parts))
+
+                    # ── Export ────────────────────────────────────────
+                    with st.expander("📤 匯出環境分析詳細結果"):
+                        st.download_button(
+                            "下載完整交易明細（含市況分類）Excel",
+                            data=to_excel(regime_result["all_trades"]),
+                            file_name=f"regime_backtest_{bare_bt}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
 
 
     # ─────────────────────────────────────────
