@@ -14,6 +14,9 @@ import io
 import itertools
 import json
 import os
+import re as _re
+import urllib.request as _urllib_req
+import urllib.parse  as _urllib_parse
 import warnings
 import logging
 import pytz
@@ -2045,6 +2048,189 @@ def get_closed_trades(trades: list) -> list:
     return closed
 
 
+
+# ══════════════════════════════════════════════
+# TELEGRAM  PUSH  NOTIFICATIONS
+# ══════════════════════════════════════════════
+
+def _tg_send(token: str, chat_id: str, text: str) -> bool:
+    """
+    Send a Telegram message via Bot API.
+    Uses only stdlib urllib — no extra dependencies.
+    Returns True on success.
+    """
+    if not token or not chat_id:
+        return False
+    try:
+        url  = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = _urllib_parse.urlencode({
+            "chat_id":    chat_id,
+            "text":       text,
+            "parse_mode": "HTML",
+        }).encode()
+        req = _urllib_req.Request(url, data=data, method="POST")
+        with _urllib_req.urlopen(req, timeout=8) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def send_signal_alert(token: str, chat_id: str,
+                      new_buy_rows: list, new_sell_rows: list) -> int:
+    """
+    Send Telegram alerts for newly-detected actionable signals.
+    Returns count of messages sent.
+    """
+    if not token or not chat_id:
+        return 0
+    msgs_sent = 0
+
+    for r in new_buy_rows[:8]:
+        sig_lbl = SIGNAL_LABEL.get(r["_sig_key"], r["_sig_key"])
+        wr      = r.get("_win_rate", r.get("勝率%", 0))
+        conf    = r.get("_conf", r.get("共振", 0))
+        detail  = r.get("_detail", r.get("說明", ""))[:60]
+        star    = "⭐" if r["_sig_key"] == "HIGH_CONF_BUY" else "🟢"
+        msg = (
+            f"{star} <b>Sentinel Pro 買入訊號</b>\n"
+            f"🏷 <b>{r['代號']} {r.get('名稱','')}</b>　{r.get('市場','')}\n"
+            f"📡 訊號：{sig_lbl}\n"
+            f"💰 現價：<b>{r.get('最新價','─')}</b>　"
+            f"漲跌：{r.get('漲跌%',0):+.2f}%\n"
+            f"📊 共振：{conf}/7　勝率：{wr:.0f}%\n"
+            f"🛑 止損：{r.get('止損參考','─')}\n"
+            f"📝 {detail}\n"
+            f"🕐 {r.get('_ts', tw_now().strftime('%H:%M'))}"
+        )
+        if _tg_send(token, chat_id, msg):
+            msgs_sent += 1
+
+    for r in new_sell_rows[:4]:
+        sig_lbl = SIGNAL_LABEL.get(r["_sig_key"], r["_sig_key"])
+        msg = (
+            f"🔴 <b>Sentinel Pro 賣出訊號</b>\n"
+            f"🏷 <b>{r['代號']} {r.get('名稱','')}</b>\n"
+            f"📡 訊號：{sig_lbl}\n"
+            f"💰 現價：{r.get('最新價','─')}　"
+            f"漲跌：{r.get('漲跌%',0):+.2f}%\n"
+            f"🕐 {tw_now().strftime('%H:%M')}"
+        )
+        if _tg_send(token, chat_id, msg):
+            msgs_sent += 1
+
+    return msgs_sent
+
+
+# ══════════════════════════════════════════════
+# GOOGLE  SHEETS  PERSISTENT  STORAGE
+# ══════════════════════════════════════════════
+_GS_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
+
+
+def _gs_headers(api_key: str) -> dict:
+    return {"Content-Type": "application/json"}
+
+
+def gs_read_trades(sheet_id: str, api_key: str) -> list:
+    """
+    Read trades from Google Sheets (public sheet with API key read).
+    Sheet must have columns: id,type,code,name,date,price,shares,fee
+    Returns list of dicts, empty on error.
+    """
+    if not sheet_id or not api_key:
+        return []
+    try:
+        range_  = "Sheet1!A:H"
+        url     = f"{_GS_BASE}/{sheet_id}/values/{_urllib_parse.quote(range_)}?key={api_key}"
+        req     = _urllib_req.Request(url)
+        with _urllib_req.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        rows = data.get("values", [])
+        if len(rows) < 2:
+            return []
+        headers = rows[0]
+        trades  = []
+        for row in rows[1:]:
+            # Pad short rows
+            while len(row) < len(headers):
+                row.append("")
+            t = dict(zip(headers, row))
+            try:
+                t["id"]     = int(float(t.get("id", 0)))
+                t["price"]  = float(t.get("price", 0))
+                t["shares"] = int(float(t.get("shares", 0)))
+                t["fee"]    = float(t.get("fee", 0))
+            except Exception:
+                continue
+            if t.get("code") and t.get("type"):
+                trades.append(t)
+        return trades
+    except Exception:
+        return []
+
+
+def gs_append_trade(sheet_id: str, api_key: str, trade: dict) -> bool:
+    """
+    Append one trade row to Google Sheets via REST API.
+    Requires the sheet to be writable — use a service account token
+    or OAuth token passed as api_key (Bearer token).
+    Returns True on success.
+    """
+    if not sheet_id or not api_key:
+        return False
+    try:
+        range_  = "Sheet1!A:H"
+        url     = (f"{_GS_BASE}/{sheet_id}/values/"
+                   f"{_urllib_parse.quote(range_)}:append"
+                   f"?valueInputOption=USER_ENTERED")
+        values  = [[
+            trade.get("id",""), trade.get("type",""),
+            trade.get("code",""), trade.get("name",""),
+            trade.get("date",""), trade.get("price",""),
+            trade.get("shares",""), trade.get("fee",""),
+        ]]
+        body    = json.dumps({"values": values}).encode()
+        req     = _urllib_req.Request(url, data=body, method="POST")
+        req.add_header("Authorization", f"Bearer {api_key}")
+        req.add_header("Content-Type", "application/json")
+        with _urllib_req.urlopen(req, timeout=10) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def gs_overwrite_trades(sheet_id: str, api_key: str, trades: list) -> bool:
+    """Overwrite entire Sheet1 with header + all trades."""
+    if not sheet_id or not api_key:
+        return False
+    try:
+        headers = [["id","type","code","name","date","price","shares","fee"]]
+        rows    = headers + [[
+            t.get("id",""), t.get("type",""), t.get("code",""),
+            t.get("name",""), t.get("date",""), t.get("price",""),
+            t.get("shares",""), t.get("fee",""),
+        ] for t in trades]
+
+        # Clear first
+        clear_url = f"{_GS_BASE}/{sheet_id}/values/Sheet1!A:H:clear"
+        req = _urllib_req.Request(clear_url, data=b"", method="POST")
+        req.add_header("Authorization", f"Bearer {api_key}")
+        with _urllib_req.urlopen(req, timeout=10):
+            pass
+
+        # Write
+        url  = (f"{_GS_BASE}/{sheet_id}/values/"
+                f"Sheet1!A1?valueInputOption=USER_ENTERED")
+        body = json.dumps({"values": rows}).encode()
+        req  = _urllib_req.Request(url, data=body, method="PUT")
+        req.add_header("Authorization", f"Bearer {api_key}")
+        req.add_header("Content-Type", "application/json")
+        with _urllib_req.urlopen(req, timeout=10) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
 DEFAULT_WATCHLIST = [
     # 上市 (TSE .TW) ─────────────────────────────
     "2330",   # 台積電
@@ -2619,6 +2805,72 @@ def main():
             width='stretch',
         )
 
+        # ── Telegram 推播設定 ──────────────────────────────
+        with st.expander("📲 Telegram 推播設定", expanded=False):
+            st.caption("掃描到買入訊號時自動推送到你的 Telegram")
+            tg_token   = st.text_input("Bot Token",
+                placeholder="1234567890:AAF...",
+                type="password",
+                key="tg_token",
+                help="從 @BotFather 建立 Bot 後取得")
+            tg_chat_id = st.text_input("Chat ID",
+                placeholder="123456789",
+                key="tg_chat_id",
+                help="用 @userinfobot 查詢你的 Chat ID")
+            tg_min_conf = st.slider("最低共振門檻（推播條件）",
+                min_value=3, max_value=7, value=5, key="tg_min_conf",
+                help="只推播共振分數達此門檻以上的訊號")
+            tg_sigs = st.multiselect("推播訊號類型",
+                options=["HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY",
+                         "BUY","DIV_BUY","STRONG_SELL","DIV_SELL"],
+                default=["HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY"],
+                key="tg_sigs",
+                format_func=lambda x: SIGNAL_LABEL.get(x, x))
+            if st.button("🧪 測試推播", key="tg_test", width='stretch'):
+                ok = _tg_send(tg_token, tg_chat_id,
+                    f"✅ <b>Sentinel Pro 推播測試</b>\n"
+                    f"連線成功！當掃描到符合條件的訊號時將自動通知你。\n"
+                    f"設定：共振 ≥ {tg_min_conf}/7")
+                if ok:
+                    st.success("✅ 測試訊息已成功發送！")
+                else:
+                    st.error("❌ 發送失敗，請確認 Token 和 Chat ID")
+
+        # ── Google Sheets 儲存設定 ─────────────────────────
+        with st.expander("📊 Google Sheets 交易記錄雲端同步", expanded=False):
+            st.caption("將買賣記錄永久儲存到 Google Sheets，重啟後自動還原")
+            st.markdown("""
+            **設定步驟：**
+            1. 建立 Google Sheet，記下 URL 中的 Sheet ID
+            2. 在 Google Cloud Console 啟用 Sheets API
+            3. 建立 OAuth 2.0 或 Service Account，取得 Access Token
+            """)
+            gs_sheet_id = st.text_input("Sheet ID",
+                placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
+                key="gs_sheet_id",
+                help="Google Sheets URL 中 /d/ 和 /edit 之間的字串")
+            gs_api_token = st.text_input("Access Token / API Key",
+                placeholder="ya29.xxx 或 AIza...",
+                type="password", key="gs_api_token",
+                help="可讀可寫: OAuth Bearer Token；唯讀: API Key")
+            col_pull, col_push = st.columns(2)
+            if col_pull.button("⬇️ 從 Sheets 同步", key="gs_pull", width='stretch'):
+                with st.spinner("讀取中…"):
+                    gs_trades = gs_read_trades(gs_sheet_id, gs_api_token)
+                if gs_trades:
+                    port_replace_trades(gs_trades, reset_id=True)
+                    st.success(f"✅ 已同步 {len(gs_trades)} 筆記錄")
+                    st.rerun()
+                else:
+                    st.error("❌ 讀取失敗或無資料")
+            if col_push.button("⬆️ 上傳到 Sheets", key="gs_push", width='stretch'):
+                with st.spinner("上傳中…"):
+                    ok = gs_overwrite_trades(gs_sheet_id, gs_api_token, port_get_trades())
+                if ok:
+                    st.success("✅ 已上傳")
+                else:
+                    st.error("❌ 上傳失敗，請確認 Access Token 有寫入權限")
+
     # ── Pack params ─────────────────────────────
     params = dict(
         min_confluence=min_confluence,
@@ -2862,7 +3114,27 @@ def main():
             st.session_state.scan_rows      = rows
             st.session_state.scan_failed    = failed
             st.session_state.scan_timestamp = tw_now().strftime("%Y-%m-%d %H:%M")
-            # NOTE: do NOT call st.rerun() here — the scan just completed;
+
+            # ── Telegram push for NEW actionable signals ──────────────
+            tg_token_v   = st.session_state.get("tg_token", "")
+            tg_chat_v    = st.session_state.get("tg_chat_id", "")
+            tg_sigs_v    = set(st.session_state.get("tg_sigs",
+                                ["HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY"]))
+            tg_min_conf_v= int(st.session_state.get("tg_min_conf", 5))
+            if tg_token_v and tg_chat_v:
+                scan_ts = tw_now().strftime("%H:%M")
+                new_buy  = [r for r in rows
+                            if r.get("_is_new") and r["_sig_key"] in tg_sigs_v
+                            and r.get("_conf", 0) >= tg_min_conf_v
+                            and r["_sig_key"] not in ("STRONG_SELL","DIV_SELL")]
+                new_sell = [r for r in rows
+                            if r.get("_is_new") and r["_sig_key"] in tg_sigs_v
+                            and r["_sig_key"] in ("STRONG_SELL","DIV_SELL")]
+                for r in new_buy + new_sell:
+                    r["_ts"] = scan_ts
+                sent = send_signal_alert(tg_token_v, tg_chat_v, new_buy, new_sell)
+                if sent:
+                    st.toast(f"📲 已推播 {sent} 則訊號到 Telegram", icon="✅")
             # next auto-refresh is triggered when user returns to the page
             # and secs_left <= 0 fires the should_auto_scan flag above.
 
@@ -3605,6 +3877,11 @@ def main():
                 else:
                     port_add_trade(new_trade)
                     st.session_state["_port_msg"] = f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}　（已自動儲存）"
+                    # Auto-sync to Google Sheets if configured
+                    _gs_id  = st.session_state.get("gs_sheet_id", "")
+                    _gs_tok = st.session_state.get("gs_api_token", "")
+                    if _gs_id and _gs_tok:
+                        gs_append_trade(_gs_id, _gs_tok, new_trade)
                     st.rerun()
 
         # ── Persistent status message (shown after rerun) ──
