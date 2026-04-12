@@ -2055,18 +2055,17 @@ def get_closed_trades(trades: list) -> list:
 
 def _tg_send(token: str, chat_id: str, text: str) -> tuple[bool, str]:
     """
-    Send a Telegram message via Bot API (plain text, no parse_mode).
+    Send a Telegram message via Bot API.
     Returns (success, error_message).
     """
     if not token or not chat_id:
         return False, "Token 或 Chat ID 未設定"
-    # Strip all HTML tags — use plain text to avoid HTTP 400 from unescaped chars
-    clean_text = _re.sub(r'<[^>]+>', '', text)
     try:
-        url  = f"https://api.telegram.org/bot{token.strip()}/sendMessage"
+        url  = f"https://api.telegram.org/bot{token}/sendMessage"
         data = _urllib_parse.urlencode({
-            "chat_id": str(chat_id).strip(),
-            "text":    clean_text,
+            "chat_id":    str(chat_id).strip(),
+            "text":       text,
+            "parse_mode": "HTML",
         }).encode()
         req = _urllib_req.Request(url, data=data, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -2074,14 +2073,9 @@ def _tg_send(token: str, chat_id: str, text: str) -> tuple[bool, str]:
             resp_body = r.read().decode()
             if r.status == 200:
                 return True, ""
-            return False, f"HTTP Error {r.status}: {resp_body[:300]}"
+            return False, f"HTTP {r.status}: {resp_body[:200]}"
     except Exception as e:
-        err = str(e)
-        # urllib HTTPError contains the response body
-        if hasattr(e, 'read'):
-            try: err += " | " + e.read().decode()[:200]
-            except Exception: pass
-        return False, err
+        return False, str(e)
 
 
 def send_signal_alert(token: str, chat_id: str,
@@ -2214,57 +2208,36 @@ def gs_append_trade(sheet_id: str, api_key: str, trade: dict) -> bool:
         return False
 
 
-def gs_overwrite_trades(sheet_id: str, api_key: str, trades: list) -> tuple[bool, str]:
-    """
-    Overwrite entire Sheet1 with header + all trades.
-    Returns (success, error_message).
-    api_key can be:
-      - OAuth Bearer token (ya29.xxx) → full read/write
-      - API Key (AIza...) → read-only only, write will fail
-    """
+def gs_overwrite_trades(sheet_id: str, api_key: str, trades: list) -> bool:
+    """Overwrite entire Sheet1 with header + all trades."""
     if not sheet_id or not api_key:
-        return False, "Sheet ID 或 Token 未設定"
+        return False
     try:
         headers = [["id","type","code","name","date","price","shares","fee"]]
         rows    = headers + [[
-            str(t.get("id","")), str(t.get("type","")), str(t.get("code","")),
-            str(t.get("name","")), str(t.get("date","")), str(t.get("price","")),
-            str(t.get("shares","")), str(t.get("fee","")),
+            t.get("id",""), t.get("type",""), t.get("code",""),
+            t.get("name",""), t.get("date",""), t.get("price",""),
+            t.get("shares",""), t.get("fee",""),
         ] for t in trades]
 
-        # Step 1: Clear range (correct URL format for Sheets API v4)
-        clear_url = f"{_GS_BASE}/{sheet_id}/values/Sheet1!A1:H10000:clear"
-        req = _urllib_req.Request(clear_url, data=b"{}", method="POST")
-        req.add_header("Authorization", f"Bearer {api_key.strip()}")
-        req.add_header("Content-Type", "application/json")
-        try:
-            with _urllib_req.urlopen(req, timeout=10):
-                pass
-        except Exception as e:
-            err = str(e)
-            if hasattr(e, 'read'):
-                try: err += " | " + e.read().decode()[:300]
-                except Exception: pass
-            return False, f"Clear失敗: {err}"
+        # Clear first
+        clear_url = f"{_GS_BASE}/{sheet_id}/values/Sheet1!A:H:clear"
+        req = _urllib_req.Request(clear_url, data=b"", method="POST")
+        req.add_header("Authorization", f"Bearer {api_key}")
+        with _urllib_req.urlopen(req, timeout=10):
+            pass
 
-        # Step 2: Write values
-        write_url = (f"{_GS_BASE}/{sheet_id}/values/"
-                     f"Sheet1!A1?valueInputOption=USER_ENTERED")
+        # Write
+        url  = (f"{_GS_BASE}/{sheet_id}/values/"
+                f"Sheet1!A1?valueInputOption=USER_ENTERED")
         body = json.dumps({"values": rows}).encode()
-        req  = _urllib_req.Request(write_url, data=body, method="PUT")
-        req.add_header("Authorization", f"Bearer {api_key.strip()}")
+        req  = _urllib_req.Request(url, data=body, method="PUT")
+        req.add_header("Authorization", f"Bearer {api_key}")
         req.add_header("Content-Type", "application/json")
         with _urllib_req.urlopen(req, timeout=10) as r:
-            if r.status == 200:
-                return True, ""
-            resp = r.read().decode()[:300]
-            return False, f"Write HTTP {r.status}: {resp}"
-    except Exception as e:
-        err = str(e)
-        if hasattr(e, 'read'):
-            try: err += " | " + e.read().decode()[:300]
-            except Exception: pass
-        return False, err
+            return r.status == 200
+    except Exception:
+        return False
 
 
 DEFAULT_WATCHLIST = [
@@ -2922,17 +2895,11 @@ def main():
                     st.error("❌ 讀取失敗或無資料")
             if col_push.button("⬆️ 上傳到 Sheets", key="gs_push", width='stretch'):
                 with st.spinner("上傳中…"):
-                    ok, err = gs_overwrite_trades(gs_sheet_id, gs_api_token, port_get_trades())
+                    ok = gs_overwrite_trades(gs_sheet_id, gs_api_token, port_get_trades())
                 if ok:
                     st.success("✅ 已上傳")
                 else:
-                    st.error(f"❌ 上傳失敗：{err}")
-                    st.caption(
-                        "💡 常見原因：\n"
-                        "1. Access Token 需要 OAuth Bearer Token（以 ya29. 開頭），不是 API Key\n"
-                        "2. Service Account 需先被加入 Sheet 的編輯權限\n"
-                        "3. OAuth Token 可能已過期（有效期通常 1 小時）"
-                    )
+                    st.error("❌ 上傳失敗，請確認 Access Token 有寫入權限")
 
     # ── Pack params ─────────────────────────────
     params = dict(
