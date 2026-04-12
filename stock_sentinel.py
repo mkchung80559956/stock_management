@@ -2053,69 +2053,78 @@ def get_closed_trades(trades: list) -> list:
 # TELEGRAM  PUSH  NOTIFICATIONS
 # ══════════════════════════════════════════════
 
-def _tg_send(token: str, chat_id: str, text: str) -> bool:
+def _tg_send(token: str, chat_id: str, text: str) -> tuple[bool, str]:
     """
     Send a Telegram message via Bot API.
-    Uses only stdlib urllib — no extra dependencies.
-    Returns True on success.
+    Returns (success, error_message).
     """
     if not token or not chat_id:
-        return False
+        return False, "Token 或 Chat ID 未設定"
     try:
         url  = f"https://api.telegram.org/bot{token}/sendMessage"
         data = _urllib_parse.urlencode({
-            "chat_id":    chat_id,
+            "chat_id":    str(chat_id).strip(),
             "text":       text,
             "parse_mode": "HTML",
         }).encode()
         req = _urllib_req.Request(url, data=data, method="POST")
-        with _urllib_req.urlopen(req, timeout=8) as r:
-            return r.status == 200
-    except Exception:
-        return False
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with _urllib_req.urlopen(req, timeout=10) as r:
+            resp_body = r.read().decode()
+            if r.status == 200:
+                return True, ""
+            return False, f"HTTP {r.status}: {resp_body[:200]}"
+    except Exception as e:
+        return False, str(e)
 
 
 def send_signal_alert(token: str, chat_id: str,
                       new_buy_rows: list, new_sell_rows: list) -> int:
-    """
-    Send Telegram alerts for newly-detected actionable signals.
-    Returns count of messages sent.
-    """
+    """Send Telegram alerts for newly-detected actionable signals."""
     if not token or not chat_id:
         return 0
     msgs_sent = 0
 
+    def _safe_float(v, default=0.0):
+        try: return float(v)
+        except Exception: return default
+
     for r in new_buy_rows[:8]:
         sig_lbl = SIGNAL_LABEL.get(r["_sig_key"], r["_sig_key"])
-        wr      = r.get("_win_rate", r.get("勝率%", 0))
-        conf    = r.get("_conf", r.get("共振", 0))
-        detail  = r.get("_detail", r.get("說明", ""))[:60]
+        wr      = _safe_float(r.get("_win_rate", r.get("勝率%", 0)))
+        conf    = int(_safe_float(r.get("_conf", r.get("共振", 0))))
+        chg     = _safe_float(r.get("漲跌%", 0))
+        detail  = str(r.get("_detail", r.get("說明", "")))[:60]
         star    = "⭐" if r["_sig_key"] == "HIGH_CONF_BUY" else "🟢"
+        price   = r.get("最新價", "─")
+        stop    = r.get("止損參考", "─")
+        ts      = r.get("_ts", tw_now().strftime("%H:%M"))
         msg = (
             f"{star} <b>Sentinel Pro 買入訊號</b>\n"
             f"🏷 <b>{r['代號']} {r.get('名稱','')}</b>　{r.get('市場','')}\n"
             f"📡 訊號：{sig_lbl}\n"
-            f"💰 現價：<b>{r.get('最新價','─')}</b>　"
-            f"漲跌：{r.get('漲跌%',0):+.2f}%\n"
+            f"💰 現價：<b>{price}</b>　漲跌：{chg:+.2f}%\n"
             f"📊 共振：{conf}/7　勝率：{wr:.0f}%\n"
-            f"🛑 止損：{r.get('止損參考','─')}\n"
+            f"🛑 止損：{stop}\n"
             f"📝 {detail}\n"
-            f"🕐 {r.get('_ts', tw_now().strftime('%H:%M'))}"
+            f"🕐 {ts}"
         )
-        if _tg_send(token, chat_id, msg):
+        ok, _ = _tg_send(token, chat_id, msg)
+        if ok:
             msgs_sent += 1
 
     for r in new_sell_rows[:4]:
         sig_lbl = SIGNAL_LABEL.get(r["_sig_key"], r["_sig_key"])
+        chg     = _safe_float(r.get("漲跌%", 0))
         msg = (
             f"🔴 <b>Sentinel Pro 賣出訊號</b>\n"
             f"🏷 <b>{r['代號']} {r.get('名稱','')}</b>\n"
             f"📡 訊號：{sig_lbl}\n"
-            f"💰 現價：{r.get('最新價','─')}　"
-            f"漲跌：{r.get('漲跌%',0):+.2f}%\n"
+            f"💰 現價：{r.get('最新價','─')}　漲跌：{chg:+.2f}%\n"
             f"🕐 {tw_now().strftime('%H:%M')}"
         )
-        if _tg_send(token, chat_id, msg):
+        ok, _ = _tg_send(token, chat_id, msg)
+        if ok:
             msgs_sent += 1
 
     return msgs_sent
@@ -2808,15 +2817,26 @@ def main():
         # ── Telegram 推播設定 ──────────────────────────────
         with st.expander("📲 Telegram 推播設定", expanded=False):
             st.caption("掃描到買入訊號時自動推送到你的 Telegram")
+            # Read from st.secrets if configured in Streamlit Cloud
+            _tg_sec = {}
+            try: _tg_sec = st.secrets.get("telegram", {})
+            except Exception: pass
             tg_token   = st.text_input("Bot Token",
+                value=_tg_sec.get("token", ""),
                 placeholder="1234567890:AAF...",
-                type="password",
-                key="tg_token",
-                help="從 @BotFather 建立 Bot 後取得")
+                type="password", key="tg_token",
+                help="從 @BotFather 取得。可永久儲存：Streamlit Cloud → Settings → Secrets → [telegram]\\ntoken = '你的TOKEN'")
             tg_chat_id = st.text_input("Chat ID",
+                value=_tg_sec.get("chat_id", ""),
                 placeholder="123456789",
                 key="tg_chat_id",
-                help="用 @userinfobot 查詢你的 Chat ID")
+                help="先向 Bot 傳一條訊息，再點下方連結查詢")
+            if tg_token and len(tg_token) > 20:
+                st.markdown(
+                    f"[🔍 查詢我的 Chat ID]"
+                    f"(https://api.telegram.org/bot{tg_token}/getUpdates)"
+                    f" ← 先向 Bot 傳任意一條訊息再點此"
+                )
             tg_min_conf = st.slider("最低共振門檻（推播條件）",
                 min_value=3, max_value=7, value=5, key="tg_min_conf",
                 help="只推播共振分數達此門檻以上的訊號")
@@ -2827,14 +2847,24 @@ def main():
                 key="tg_sigs",
                 format_func=lambda x: SIGNAL_LABEL.get(x, x))
             if st.button("🧪 測試推播", key="tg_test", width='stretch'):
-                ok = _tg_send(tg_token, tg_chat_id,
-                    f"✅ <b>Sentinel Pro 推播測試</b>\n"
-                    f"連線成功！當掃描到符合條件的訊號時將自動通知你。\n"
-                    f"設定：共振 ≥ {tg_min_conf}/7")
-                if ok:
-                    st.success("✅ 測試訊息已成功發送！")
+                if not tg_token or not tg_chat_id:
+                    st.warning("⚠️ 請先填入 Bot Token 和 Chat ID")
                 else:
-                    st.error("❌ 發送失敗，請確認 Token 和 Chat ID")
+                    ok, err = _tg_send(tg_token, tg_chat_id,
+                        f"✅ <b>Sentinel Pro 推播測試</b>\n"
+                        f"連線成功！當掃描到符合條件的訊號時將自動通知你。\n"
+                        f"設定：共振 ≥ {tg_min_conf}/7")
+                    if ok:
+                        st.success("✅ 測試訊息已成功發送！")
+                    else:
+                        st.error(f"❌ 發送失敗：{err}")
+                        st.caption(
+                            "常見原因：\n"
+                            "1. Token 錯誤 — 確認從 @BotFather 取得的完整 Token\n"
+                            "2. Chat ID 錯誤 — 先傳一條訊息給 Bot，再用上方連結確認\n"
+                            "3. Bot 尚未啟用 — 在 Telegram 搜尋你的 Bot 並按 Start\n"
+                            "4. 網路限制 — Streamlit Cloud 免費版可能封鎖外部請求"
+                        )
 
         # ── Google Sheets 儲存設定 ─────────────────────────
         with st.expander("📊 Google Sheets 交易記錄雲端同步", expanded=False):
