@@ -2103,7 +2103,7 @@ def send_signal_alert(token: str, chat_id: str,
         detail  = str(r.get("_detail", r.get("說明", "")))[:60]
         star    = "⭐" if r["_sig_key"] == "HIGH_CONF_BUY" else "🟢"
         price   = r.get("最新價", "─")
-        stop    = r.get("止損參考", "─")
+        stop    = r.get("_sl_label", r.get("止損說明", r.get("止損參考", "─")))
         ts      = r.get("_ts", tw_now().strftime("%H:%M"))
         msg = (
             f"{star} <b>Sentinel Pro 買入訊號</b>\n"
@@ -2416,7 +2416,74 @@ def sig_hist_to_df(records: list) -> "pd.DataFrame":
     df = df.sort_values("日期", ascending=False).reset_index(drop=True)
     return df
     # 上市 (TSE .TW) ─────────────────────────────
+def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resample daily OHLCV to weekly (week ending Friday).
+    Requires DatetimeIndex.
+    """
+    agg = {
+        "Open":   "first",
+        "High":   "max",
+        "Low":    "min",
+        "Close":  "last",
+        "Volume": "sum",
+    }
+    # Use W-FRI to align with Taiwan market week
+    df_w = df.resample("W-FRI").agg(agg).dropna()
+    return df_w
+
+
+@st.cache_data(ttl=1800)
+def get_weekly_signal(symbol: str, p: dict,
+                      _p_ver: int = 1) -> tuple[str, str]:
+    """
+    Returns (weekly_sig_key, detail) for the symbol.
+    Cached 30 min — weekly bars don't change intraday.
+    _p_ver bumps cache when params change.
+    """
+    df_daily, _ = fetch_data(symbol, "2y")
+    if df_daily is None or len(df_daily) < 52:
+        return "NEUTRAL", "週線資料不足"
+    try:
+        df_w = resample_weekly(df_daily)
+        if len(df_w) < 20:
+            return "NEUTRAL", "週線K棒不足"
+        df_w_sig = generate_signals(df_w, p)
+        w_sig, w_det = get_scan_signal(df_w_sig, lookback=3)
+        return w_sig, w_det
+    except Exception as e:
+        return "NEUTRAL", str(e)[:40]
+
+
+def mtf_confirm(daily_sig: str, weekly_sig: str) -> tuple[bool, str]:
+    """
+    Multi-timeframe confirmation:
+    Both timeframes must agree on direction.
+    Returns (confirmed, label).
+    """
+    BUY  = {"HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY","BUY","DIV_BUY",
+            "KD_GOLDEN_ZONE","BULL_ZONE","RISING"}
+    SELL = {"STRONG_SELL","DIV_SELL","SELL","FAKE_BREAKOUT","KD_HIGH",
+            "BEAR_ZONE","FALLING"}
+
+    d_buy  = daily_sig  in BUY
+    d_sell = daily_sig  in SELL
+    w_buy  = weekly_sig in BUY
+    w_sell = weekly_sig in SELL
+
+    if d_buy and w_buy:
+        return True,  "✅ 日線買+週線買"
+    if d_sell and w_sell:
+        return True,  "✅ 日線賣+週線賣"
+    if d_buy and not w_buy and not w_sell:
+        return False, "⚠️ 日買/週中性"
+    if d_buy and w_sell:
+        return False, "❌ 日買/週賣（逆勢）"
+    if d_sell and w_buy:
+        return False, "❌ 日賣/週買（逆勢）"
+    return False, "⚪ 無明確共識"
 DEFAULT_WATCHLIST = [
+    # 上市 (TSE .TW) ─────────────────────────────
     # 上市 (TSE .TW) ─────────────────────────────
     "2330",   # 台積電
 "2317",   # 鴻海
@@ -2953,6 +3020,43 @@ def main():
             profit_target = st.slider("獲利目標 (%)", 1.0, 15.0, 3.0, 0.5)
             stop_loss     = st.slider("停損 (%)",     1.0, 10.0, 5.0, 0.5)
 
+        with st.expander("🕯 多時間框架確認 (MTF)", expanded=False):
+            use_mtf = st.checkbox(
+                "啟用日K + 週K 雙重確認",
+                value=False,
+                key="use_mtf",
+                help="只有日線與週線同時出現方向一致的訊號才視為有效。"
+                     "可大幅降低假突破，但訊號數量會減少約 40-60%。"
+            )
+            if use_mtf:
+                st.caption(
+                    "✅ 已啟用：掃描表格新增「週線訊號」和「MTF確認」欄，"
+                    "未通過雙重確認的買入訊號會自動降級。"
+                )
+
+        with st.expander("🛑 停損設定", expanded=False):
+            st.caption("設定實際操作時使用的停損策略")
+            sl_mode = st.radio(
+                "停損計算方式",
+                ["ATR倍數（動態）", "固定百分比"],
+                horizontal=True, key="sl_mode",
+            )
+            if sl_mode == "ATR倍數（動態）":
+                atr_mult = st.slider(
+                    "ATR 倍數", min_value=1.0, max_value=4.0,
+                    value=1.5, step=0.5, key="atr_mult",
+                    help="停損 = 進場價 - ATR(14) × 倍數。"
+                         "1.5x = 較緊；2.0x = 正常；3.0x = 寬鬆"
+                )
+                fixed_sl_pct = None
+            else:
+                fixed_sl_pct = st.slider(
+                    "固定停損 %", min_value=1.0, max_value=15.0,
+                    value=7.0, step=0.5, key="fixed_sl_pct",
+                    help="停損 = 進場價 × (1 - 此百分比/100)"
+                )
+                atr_mult = 1.5   # unused but keep default
+
         data_period = st.selectbox("資料區間", ["3mo", "6mo", "1y", "2y"], index=2)
 
         st.divider()
@@ -3098,6 +3202,8 @@ def main():
         ema1=ema1, ema2=ema2, bb_period=bb_period,
         use_divergence=use_divergence, div_lookback=div_lookback,
         holding_days=holding_days, profit_target=profit_target, stop_loss=stop_loss,
+        use_mtf=use_mtf, atr_mult=atr_mult,
+        sl_mode=sl_mode, fixed_sl_pct=fixed_sl_pct,
     )
 
     # ══════════════════════════════════════════
@@ -3265,7 +3371,39 @@ def main():
 
                 recent_sig, recent_detail = get_scan_signal(df_sig, lookback=5)
 
-                atr_stop = round(price - float(latest["ATR"]) * 1.5, 2) if pd.notna(latest.get("ATR")) else "-"
+                # ── Stop Loss calculation (user-configured) ───────────
+                atr_val  = float(latest["ATR"]) if pd.notna(latest.get("ATR")) else None
+                _atr_m   = params.get("atr_mult", 1.5)
+                _sl_mode = params.get("sl_mode", "ATR倍數（動態）")
+                _fix_pct = params.get("fixed_sl_pct", None)
+                if _sl_mode == "ATR倍數（動態）" and atr_val:
+                    atr_stop     = round(price - atr_val * _atr_m, 2)
+                    sl_pct_shown = round(atr_val * _atr_m / price * 100, 1)
+                    sl_label     = f"{atr_stop} (ATR×{_atr_m}={sl_pct_shown}%)"
+                elif _fix_pct and _fix_pct > 0:
+                    atr_stop     = round(price * (1 - _fix_pct / 100), 2)
+                    sl_label     = f"{atr_stop} (-{_fix_pct}%)"
+                else:
+                    atr_stop = round(price - float(latest["ATR"]) * 1.5, 2) if atr_val else "-"
+                    sl_label = str(atr_stop)
+
+                # ── Multi-timeframe confirmation ──────────────────────
+                use_mtf_flag = params.get("use_mtf", False)
+                if use_mtf_flag and recent_sig in BUY_SIGNALS:
+                    w_sig, w_det = get_weekly_signal(
+                        code, params,
+                        _p_ver=hash((params.get("cci_period",39), params.get("vol_multiplier",1.5)))
+                    )
+                    mtf_ok, mtf_label = mtf_confirm(recent_sig, w_sig)
+                    # Downgrade signal if MTF disagrees
+                    if not mtf_ok:
+                        recent_sig    = "WATCH"
+                        recent_detail = f"MTF未確認: {mtf_label} | 日線: {SIGNAL_LABEL.get(recent_sig, recent_sig)}"
+                else:
+                    w_sig    = "─"
+                    mtf_label = "─" if not use_mtf_flag else "不適用"
+                    mtf_ok    = True
+
                 mom  = round(float(latest.get("MomScore",       0) or 0), 1)
                 conf = int(  float(latest.get("ConfluenceScore", 0) or 0))
                 trnd = int(  float(latest.get("TrendScore",      0) or 0))
@@ -3278,7 +3416,6 @@ def main():
                 win_rate   = opt.get("win_rate",   bt["win_rate"])   if opt.get("optimised") else bt["win_rate"]
                 avg_return = opt.get("avg_return", bt["avg_return"]) if opt.get("optimised") else bt["avg_return"]
 
-                # Fix 3: always use fixed "CCI" column name
                 rows.append({
                     "代號":     bare,
                     "名稱":     cn_name,
@@ -3295,7 +3432,10 @@ def main():
                     "D值":      d_val,
                     "量/均量":  vol_r,
                     "說明":     recent_detail,
-                    "止損參考": atr_stop,
+                    "止損價":   atr_stop,
+                    "止損說明": sl_label,
+                    "週線訊號": SIGNAL_LABEL.get(w_sig, w_sig) if use_mtf_flag else "─",
+                    "MTF確認":  mtf_label if use_mtf_flag else "─",
                     "勝率%":    win_rate,
                     "平均報酬%": avg_return,
                     "最佳CCI":  best_cci,
@@ -3307,9 +3447,12 @@ def main():
                     "_chg_p":   round(chg_p, 2),
                     "_cn_name": cn_name,
                     "_atr_stop": atr_stop,
+                    "_sl_label": sl_label,
                     "_win_rate": win_rate,
                     "_detail":  recent_detail,
-                    "_is_new":  False,   # will be updated after loop
+                    "_mtf_ok":  mtf_ok,
+                    "_w_sig":   w_sig,
+                    "_is_new":  False,
                 })
 
             prog.empty()
@@ -3534,6 +3677,14 @@ def main():
                     "勝率%":    st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
                     "平均報酬%": st.column_config.NumberColumn(format="%.2f%%"),
                     "最佳CCI":  st.column_config.NumberColumn(format="%d"),
+                    "止損價":   st.column_config.NumberColumn(format="%.2f",
+                                  help="根據側欄「停損設定」計算的止損價"),
+                    "止損說明": st.column_config.TextColumn(
+                                  help="ATR倍數說明或固定%說明"),
+                    "週線訊號": st.column_config.TextColumn(
+                                  help="週K線訊號（啟用MTF確認後顯示）"),
+                    "MTF確認":  st.column_config.TextColumn(
+                                  help="日線+週線雙重確認結果"),
                 },
                 hide_index=True,
             )
