@@ -12,7 +12,8 @@ import pytz
 import urllib.request as _urllib_req
 import urllib.parse  as _urllib_parse
 import re as _re
-from datetime import datetime
+import io as _io
+from datetime import datetime, date
 
 # ── App config ───────────────────────────────────────────
 st.set_page_config(
@@ -90,8 +91,186 @@ def _mark_alert_sent(code: str, alert_type: str) -> None:
         pass
 
 
-def check_and_send_alerts(token: str, chat_id: str,
-                          codes: list, quotes: dict) -> list[str]:
+
+# ── Google Sheets helpers ─────────────────────────────────
+_GS_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
+
+def gs_write_portfolio(sheet_id: str, token: str, trades: list) -> tuple[bool, str]:
+    """Write portfolio trades to Sheet named 'Portfolio' in standard format."""
+    if not sheet_id or not token:
+        return False, "Sheet ID 或 Token 未設定"
+    headers = [["商品","交易日","交易別","股數","成交價","價金","手續費","交易稅","備註"]]
+    rows = headers + [[
+        t.get("商品",""), t.get("交易日",""), t.get("交易別","現買"),
+        t.get("股數",0), t.get("成交價",0), t.get("價金",0),
+        t.get("手續費",0), t.get("交易稅",0), t.get("備註",""),
+    ] for t in trades]
+    try:
+        # Clear
+        url = f"{_GS_BASE}/{sheet_id}/values/Portfolio!A1:I10000:clear"
+        req = _urllib_req.Request(url, data=b"{}", method="POST")
+        req.add_header("Authorization", f"Bearer {token.strip()}")
+        req.add_header("Content-Type", "application/json")
+        with _urllib_req.urlopen(req, timeout=10): pass
+        # Write
+        url2 = f"{_GS_BASE}/{sheet_id}/values/Portfolio!A1?valueInputOption=USER_ENTERED"
+        body = json.dumps({"values": rows}).encode()
+        req2 = _urllib_req.Request(url2, data=body, method="PUT")
+        req2.add_header("Authorization", f"Bearer {token.strip()}")
+        req2.add_header("Content-Type", "application/json")
+        with _urllib_req.urlopen(req2, timeout=10) as r:
+            return (True, "") if r.status == 200 else (False, f"HTTP {r.status}")
+    except Exception as e:
+        err = str(e)
+        if hasattr(e, 'read'):
+            try: err += " | " + e.read().decode()[:200]
+            except Exception: pass
+        return False, err
+
+
+# ── Portfolio persistence ─────────────────────────────────
+PORTFOLIO_FILE = "/tmp/watchlist_portfolio.json"
+
+@st.cache_resource
+def _get_portfolio_store():
+    store = {"trades": []}
+    try:
+        if os.path.exists(PORTFOLIO_FILE):
+            with open(PORTFOLIO_FILE) as f:
+                store = json.load(f)
+    except Exception:
+        pass
+    return store
+
+def _save_portfolio(store):
+    try:
+        tmp = PORTFOLIO_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(store, f, ensure_ascii=False)
+        os.replace(tmp, PORTFOLIO_FILE)
+    except Exception:
+        pass
+
+def port_get():
+    return _get_portfolio_store().get("trades", [])
+
+def port_save(trades: list):
+    store = _get_portfolio_store()
+    store["trades"] = trades
+    _save_portfolio(store)
+
+
+# ── Strategy evaluation engine ────────────────────────────
+def evaluate_position(code: str, trades: list, cur_price: float) -> dict:
+    """
+    FIFO cost analysis + 5-path strategy decision.
+    Returns full evaluation dict.
+    """
+    buys = [t for t in trades if t.get("交易別") in ("現買","買進","買") and t.get("商品","").startswith(code)]
+    sells= [t for t in trades if t.get("交易別") in ("現賣","賣出","賣") and t.get("商品","").startswith(code)]
+
+    total_shares = sum(t.get("股數",0) for t in buys) - sum(t.get("股數",0) for t in sells)
+    if total_shares <= 0:
+        return {"status": "no_position"}
+
+    total_cost = sum(t.get("價金",0) + t.get("手續費",0) for t in buys)
+    sell_proceeds = sum(t.get("價金",0) - t.get("手續費",0) - t.get("交易稅",0) for t in sells)
+    net_cost = total_cost - sell_proceeds
+    avg_cost = net_cost / total_shares if total_shares > 0 else 0
+    avg_price_per_share = avg_cost / 1   # 價金 already = 股數×成交價
+
+    # Recalculate avg cost per share from raw data
+    total_qty_cost = sum(t.get("股數",0) * t.get("成交價",0) + t.get("手續費",0) for t in buys)
+    sold_qty = sum(t.get("股數",0) for t in sells)
+    bought_qty = sum(t.get("股數",0) for t in buys)
+    if bought_qty > 0:
+        avg_px_per_share = total_qty_cost / bought_qty
+    else:
+        avg_px_per_share = 0
+
+    mkt_val  = cur_price * total_shares
+    cost_val = avg_px_per_share * total_shares
+    unreal   = mkt_val - cost_val
+    unreal_p = unreal / cost_val * 100 if cost_val > 0 else 0
+
+    # ATR-based stop (simple: avg_cost × 0.93 = -7%)
+    atr_stop  = round(avg_px_per_share * 0.93, 1)
+    stop_hit  = cur_price <= atr_stop
+
+    # Buy dates for holding period
+    dates = sorted([t.get("交易日","") for t in buys])
+    first_buy = dates[0] if dates else ""
+    last_buy  = dates[-1] if dates else ""
+
+    # ── Strategy decision (5 paths) ─────────────────────
+    if stop_hit and unreal_p < -10:
+        action = "🚨 立即停損"
+        color  = "#ff0033"
+        reason = f"現價 {cur_price} 已跌破停損位 {atr_stop}，虧損 {unreal_p:.1f}%，建議清倉 {total_shares} 股"
+        urgency = "立即"
+    elif unreal_p < -15:
+        action = "🔴 考慮停損"
+        color  = "#ff3355"
+        reason = f"深度虧損 {unreal_p:.1f}%，已超過 -15% 警戒線，建議先減碼 50%（賣 {total_shares//2} 股）"
+        urgency = "本週"
+    elif unreal_p < -7:
+        action = "🟡 攤平評估"
+        color  = "#f0a500"
+        reason = f"虧損 {unreal_p:.1f}%，已有 {len(buys)} 筆買入，評估是否底部加買或設停損"
+        urgency = "觀察"
+    elif unreal_p >= 20:
+        action = "🟡 分批獲利"
+        color  = "#f0a500"
+        reason = f"獲利 {unreal_p:.1f}%，建議分批出場，先賣 {total_shares//2} 股鎖定利潤"
+        urgency = "本週"
+    elif unreal_p >= 10:
+        action = "🟢 續抱觀察"
+        color  = "#00cc66"
+        reason = f"獲利 {unreal_p:.1f}%，趨勢未反轉前繼續持有，設移動停損 {round(cur_price*0.95,1)}"
+        urgency = "觀察"
+    else:
+        # Check if price near multi-buy average → potential bottom accumulation zone
+        buy_prices = [t.get("成交價",0) for t in buys]
+        min_bp = min(buy_prices) if buy_prices else cur_price
+        if cur_price <= min_bp * 1.03 and len(buys) < 15:
+            action = "🔵 底部觀察"
+            color  = "#00aaff"
+            reason = f"現價 {cur_price} 接近最低買入成本 {min_bp}，若技術訊號確認可考慮少量加碼"
+            urgency = "觀察"
+        else:
+            action = "⚪ 持有觀察"
+            color  = "#5a8fb0"
+            reason = f"損益 {unreal_p:+.1f}%，無明顯操作訊號，等待技術面確認方向"
+            urgency = "觀察"
+
+    # DCA analysis
+    buy_prices_list = sorted([t.get("成交價",0) for t in buys])
+    dca_summary = f"共 {len(buys)} 次買入，最低 {min(buy_prices_list):.1f}，最高 {max(buy_prices_list):.1f}，均 {avg_px_per_share:.1f}" if buy_prices_list else ""
+
+    return {
+        "code":         code,
+        "total_shares": total_shares,
+        "avg_cost":     round(avg_px_per_share, 2),
+        "cur_price":    cur_price,
+        "cost_val":     round(cost_val, 0),
+        "mkt_val":      round(mkt_val, 0),
+        "unreal":       round(unreal, 0),
+        "unreal_p":     round(unreal_p, 2),
+        "atr_stop":     atr_stop,
+        "stop_hit":     stop_hit,
+        "action":       action,
+        "color":        color,
+        "reason":       reason,
+        "urgency":      urgency,
+        "dca_summary":  dca_summary,
+        "first_buy":    first_buy,
+        "last_buy":     last_buy,
+        "n_buys":       len(buys),
+        "status":       "active",
+    }
+
+
+def check_and_send_alerts(token, chat_id, codes, quotes):
     """
     Check all stocks against their target/stop prices.
     Send Telegram alert if triggered and not yet sent today.
@@ -455,8 +634,9 @@ if not codes:
     st.info("👈 從左側側欄新增股票代號開始使用")
     st.stop()
 
-tab_overview, tab_cards, tab_monitor, tab_notes, tab_alerts = st.tabs([
-    "📊 總覽表格", "🃏 卡片視圖", "📈 每日監控", "📝 備忘錄", "🎯 目標價警報"
+tab_overview, tab_cards, tab_monitor, tab_notes, tab_alerts, tab_port = st.tabs([
+    "📊 總覽表格", "🃏 卡片視圖", "📈 每日監控",
+    "📝 備忘錄", "🎯 目標價警報", "💼 持倉分析",
 ])
 
 # ─── Fetch all quotes ──────────────────────────────────────
@@ -893,6 +1073,267 @@ with tab_alerts:
                 f'</div>',
                 unsafe_allow_html=True,
             )
+
+
+# ═════════════════════════════════════════════════════════
+# TAB 6 — 💼 持倉分析（買賣記錄匯入 + 策略建議 + GS同步）
+# ═════════════════════════════════════════════════════════
+with tab_port:
+    st.markdown("#### 💼 持倉分析 — 買賣記錄匯入 & 策略評估")
+    st.caption("匯入券商的買賣明細 → 自動計算均成本與損益 → 策略建議 → 同步 Google Sheets → Telegram 通知")
+
+    trades_all = port_get()
+
+    # ── SECTION A: 匯入買賣記錄 ──────────────────────────
+    with st.expander("📥 匯入買賣記錄", expanded=not trades_all):
+        st.markdown("""
+        **支援格式（Excel 欄位）：**
+        `商品 | 交易日 | 交易別 | 股數 | 成交價 | 價金 | 手續費 | 交易稅 | 備註`
+
+        直接從券商 App 截圖的「未實現損益明細」或「成交明細」匯出 Excel 貼上即可。
+        """)
+
+        imp_file = st.file_uploader("選擇 Excel 檔案", type=["xlsx","xls"], key="port_imp")
+        if imp_file:
+            try:
+                df_imp = pd.read_excel(imp_file)
+                # Flexible column mapping
+                col_map = {
+                    "商品": ["商品","股票","代號","名稱"],
+                    "交易日": ["交易日","日期","成交日"],
+                    "交易別": ["交易別","買賣","方向"],
+                    "股數":   ["股數","數量","張數"],
+                    "成交價": ["成交價","價格","單價"],
+                    "價金":   ["價金","金額","成交金額"],
+                    "手續費": ["手續費","費用"],
+                    "交易稅": ["交易稅","稅"],
+                }
+                result_cols = {}
+                for target, candidates in col_map.items():
+                    for c in candidates:
+                        matched = [col for col in df_imp.columns if c in col]
+                        if matched:
+                            result_cols[target] = matched[0]
+                            break
+                if "商品" not in result_cols or "交易日" not in result_cols:
+                    st.error("找不到必要欄位（商品、交易日）。請確認 Excel 格式。")
+                else:
+                    df_mapped = pd.DataFrame()
+                    for target, src_col in result_cols.items():
+                        df_mapped[target] = df_imp[src_col]
+                    for col in ["商品","交易日","交易別","股數","成交價","價金","手續費","交易稅","備註"]:
+                        if col not in df_mapped:
+                            df_mapped[col] = 0 if col in ["股數","成交價","價金","手續費","交易稅"] else ""
+
+                    # Convert types
+                    for num_col in ["股數","成交價","價金","手續費","交易稅"]:
+                        df_mapped[num_col] = pd.to_numeric(df_mapped[num_col], errors="coerce").fillna(0)
+
+                    st.success(f"✅ 預覽 {len(df_mapped)} 筆記錄")
+                    st.dataframe(df_mapped.head(5), hide_index=True)
+                    if st.button("✅ 確認匯入", type="primary", key="port_confirm"):
+                        port_save(df_mapped.to_dict("records"))
+                        st.success(f"已匯入 {len(df_mapped)} 筆記錄")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"匯入失敗：{e}")
+
+        # Manual entry
+        st.divider()
+        st.markdown("**或手動新增一筆**")
+        with st.form("add_trade_form"):
+            mc1, mc2, mc3 = st.columns(3)
+            t_code  = mc1.text_input("商品代號", placeholder="3019亞光")
+            t_date  = mc2.date_input("交易日", value=date.today())
+            t_type  = mc3.selectbox("交易別", ["現買","現賣"])
+            mc4, mc5, mc6, mc7 = st.columns(4)
+            t_qty   = mc4.number_input("股數", min_value=1, value=50, step=1)
+            t_price = mc5.number_input("成交價", min_value=0.1, value=100.0, step=0.5)
+            t_fee   = mc6.number_input("手續費", min_value=0, value=int(t_qty*t_price*0.001425*0.6), step=1)
+            t_tax   = mc7.number_input("交易稅", min_value=0,
+                                        value=int(t_qty*t_price*0.003) if t_type=="現賣" else 0, step=1)
+            submitted = st.form_submit_button("新增", type="primary")
+            if submitted:
+                new_t = {
+                    "商品": t_code, "交易日": str(t_date), "交易別": t_type,
+                    "股數": int(t_qty), "成交價": float(t_price),
+                    "價金": int(t_qty * t_price), "手續費": int(t_fee),
+                    "交易稅": int(t_tax), "備註": "",
+                }
+                existing = port_get()
+                existing.append(new_t)
+                port_save(existing)
+                st.success("已新增")
+                st.rerun()
+
+    if not trades_all:
+        st.info("請先匯入買賣記錄")
+        st.stop()
+
+    # ── SECTION B: 損益分析 & 策略建議 ───────────────────
+    st.markdown("---")
+    st.markdown("#### 📊 持倉損益分析 & 策略建議")
+
+    # Get unique stock codes from trades
+    all_trade_codes = sorted(set(
+        str(t.get("商品",""))[:4] for t in trades_all
+        if t.get("商品") and str(t.get("商品","")).strip()
+    ))
+
+    evals = []
+    for code in all_trade_codes:
+        code_trades = [t for t in trades_all if str(t.get("商品","")).startswith(code)]
+        q = fetch_quote(code)
+        cur_px = q.get("price", 0)
+        if cur_px == 0:
+            # Try with .TW suffix
+            q = fetch_quote(code + ".TW")
+            cur_px = q.get("price", 0)
+        ev = evaluate_position(code, code_trades, cur_px)
+        if ev.get("status") == "active":
+            evals.append(ev)
+
+    if not evals:
+        st.warning("無有效持倉（可能全部已賣出，或代號格式不符）")
+    else:
+        # Summary metrics
+        total_cost = sum(e["cost_val"] for e in evals)
+        total_mkt  = sum(e["mkt_val"]  for e in evals)
+        total_unrl = total_mkt - total_cost
+        total_p    = total_unrl / total_cost * 100 if total_cost else 0
+
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1.metric("持倉支數", len(evals))
+        sm2.metric("總投入成本", f"{total_cost/1e4:.1f} 萬")
+        sm3.metric("目前市值",   f"{total_mkt/1e4:.1f} 萬")
+        sm4.metric("未實現損益", f"{total_unrl/1e4:+.2f} 萬", f"{total_p:+.1f}%")
+
+        # Summary table
+        tbl = pd.DataFrame([{
+            "代號":      e["code"],
+            "名稱":      cn_name(e["code"]),
+            "持股":      e["total_shares"],
+            "均成本":    e["avg_cost"],
+            "現價":      e["cur_price"],
+            "市值":      e["mkt_val"],
+            "損益":      e["unreal"],
+            "損益%":     e["unreal_p"],
+            "建議":      e["action"],
+            "緊急程度":  e["urgency"],
+        } for e in evals])
+
+        st.dataframe(tbl, width="stretch", hide_index=True,
+            column_config={
+                "損益%":   st.column_config.NumberColumn(format="%+.2f%%"),
+                "損益":    st.column_config.NumberColumn(format="$%+,.0f"),
+                "市值":    st.column_config.NumberColumn(format="$%,.0f"),
+            })
+
+        # Strategy cards (sorted by urgency)
+        urgency_order = {"立即": 0, "本週": 1, "觀察": 2}
+        evals_sorted  = sorted(evals, key=lambda e: urgency_order.get(e["urgency"], 3))
+
+        st.markdown("##### 🎯 個股策略建議")
+        for ev in evals_sorted:
+            clr = ev["color"]
+            urg_clrs = {"立即":"#ff0033","本週":"#ff6600","觀察":"#5a8fb0"}
+            uc = urg_clrs.get(ev["urgency"], "#5a8fb0")
+            pnl_c = "#00cc66" if ev["unreal_p"] >= 0 else "#ff3355"
+
+            st.markdown(
+                f'<div style="background:#0a1220;border:2px solid {clr};'
+                f'border-radius:12px;padding:14px 16px;margin-bottom:12px">'
+                f'<div style="display:flex;justify-content:space-between;'
+                f'align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+                f'<span style="font-size:1.1rem;font-weight:700;color:#e8f4fd;'
+                f'font-family:Space Mono,monospace">{ev["code"]} {cn_name(ev["code"])}</span>'
+                f'<span style="color:{uc};border:1px solid {uc};padding:1px 8px;'
+                f'border-radius:4px;font-size:0.72rem">⏰ {ev["urgency"]}</span>'
+                f'<span style="font-weight:700;color:{clr};font-size:1rem">{ev["action"]}</span>'
+                f'</div>'
+                f'<div style="color:#8a9bb5;font-size:0.8rem;border-left:3px solid {clr};'
+                f'padding-left:8px;margin-bottom:8px">{ev["reason"]}</div>'
+                f'<div style="display:flex;gap:14px;font-size:0.75rem;flex-wrap:wrap">'
+                f'<span>持股 <b style="color:#e8f4fd">{ev["total_shares"]:,}</b></span>'
+                f'<span>均成本 <b style="color:#8a9bb5">{ev["avg_cost"]:.2f}</b></span>'
+                f'<span>現價 <b style="color:#e8f4fd">{ev["cur_price"]:.2f}</b></span>'
+                f'<span>損益 <b style="color:{pnl_c}">{ev["unreal_p"]:+.1f}%</b>'
+                f' (<b style="color:{pnl_c}">{ev["unreal"]:+,.0f}</b>)</span>'
+                f'<span>停損位 <b style="color:#ff6666">{ev["atr_stop"]:.1f}</b></span>'
+                f'</div>'
+                f'<div style="font-size:0.7rem;color:#37474f;margin-top:6px">'
+                f'{ev["dca_summary"]}　首買 {ev["first_buy"]}　最近買 {ev["last_buy"]}'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── SECTION C: Telegram push ──────────────────────
+        st.divider()
+        st.markdown("#### 📲 推播策略建議到 Telegram")
+        _tok = st.session_state.get("wl_tg_token","")
+        _cid = st.session_state.get("wl_tg_chat","")
+        if st.button("📲 推播所有持倉建議", type="primary", key="port_tg",
+                     width="stretch"):
+            if not _tok or not _cid:
+                st.warning("請先在側欄設定 Telegram Token 和 Chat ID")
+            else:
+                sent = 0
+                for ev in evals_sorted:
+                    msg = (
+                        f"{ev['action']}  {ev['code']} {cn_name(ev['code'])}\n"
+                        f"現價 {ev['cur_price']:.2f}  均成本 {ev['avg_cost']:.2f}\n"
+                        f"損益 {ev['unreal_p']:+.1f}% ({ev['unreal']:+,.0f}元)\n"
+                        f"持股 {ev['total_shares']:,} 股\n"
+                        f"策略：{ev['reason'][:80]}\n"
+                        f"停損位：{ev['atr_stop']:.1f}\n"
+                        f"⏰ {ev['urgency']} — {tw_now().strftime('%m/%d %H:%M')}"
+                    )
+                    ok, _ = _tg_send(_tok, _cid, msg)
+                    if ok:
+                        sent += 1
+                st.success(f"✅ 已推播 {sent}/{len(evals)} 支持倉建議")
+
+        # ── SECTION D: Google Sheets sync ────────────────
+        st.divider()
+        st.markdown("#### 📊 同步到 Google Sheets")
+        st.caption("格式與系統一致：商品|交易日|交易別|股數|成交價|價金|手續費|交易稅|備註")
+
+        gs_col1, gs_col2 = st.columns(2)
+        gs_sheet = gs_col1.text_input("Sheet ID", key="port_gs_id",
+            placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms")
+        gs_token = gs_col2.text_input("OAuth Bearer Token", type="password",
+            key="port_gs_token", placeholder="ya29.xxx")
+
+        if st.button("⬆️ 上傳買賣記錄到 Google Sheets", key="port_gs_push",
+                     width="stretch"):
+            with st.spinner("上傳中…"):
+                ok, err = gs_write_portfolio(gs_sheet, gs_token, trades_all)
+            if ok:
+                st.success("✅ 已上傳到 Portfolio 工作表")
+            else:
+                st.error(f"❌ {err}")
+                st.caption("需要 OAuth Bearer Token (ya29.xxx)，可從 Google OAuth Playground 取得")
+
+        # ── SECTION E: Export & Delete ───────────────────
+        st.divider()
+        with st.expander("📤 匯出 / 🗑 清除記錄"):
+            df_export = pd.DataFrame(trades_all)
+            buf = _io.BytesIO()
+            import openpyxl as _xl
+            wb = _xl.Workbook(); ws = wb.active; ws.title = "買賣記錄"
+            cols = ["商品","交易日","交易別","股數","成交價","價金","手續費","交易稅","備註"]
+            ws.append(cols)
+            for t in trades_all:
+                ws.append([t.get(c,"") for c in cols])
+            wb.save(buf); buf.seek(0)
+            st.download_button("📤 匯出 Excel", data=buf,
+                file_name=f"portfolio_{tw_now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch")
+            if st.button("🗑 清除所有記錄", key="port_clear"):
+                port_save([])
+                st.rerun()
+
 
 # ── Footer ────────────────────────────────────────────────
 st.markdown("---")
