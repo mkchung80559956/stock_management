@@ -343,11 +343,11 @@ with tab_overview:
             "代號":   code,
             "名稱":   cn_name(code),
             "分組":   wl_get_group(code),
-            "現價":   round(price, 2) if price else "─",
-            "漲跌%":  round(chg, 2) if q.get("ok") else "─",
-            "目標價": target or "─",
-            "停損價": stop or "─",
-            "上漲空間%": upside or "─",
+            "現價":   round(price, 2) if price else None,
+            "漲跌%":  round(chg, 2) if q.get("ok") else None,
+            "目標價": float(target) if target else None,
+            "停損價": float(stop) if stop else None,
+            "上漲空間%": upside,
             "備忘":   (n.get("note","")[:20] + "…") if len(n.get("note","")) > 20
                        else n.get("note",""),
         })
@@ -421,6 +421,11 @@ with tab_cards:
                 badge += '<span style="background:#ffd700;color:#000;padding:1px 6px;border-radius:3px;font-size:0.68rem;margin-left:4px">🎯達標</span>'
             if stop and price and price <= stop:
                 badge += '<span style="background:#ff3355;color:#fff;padding:1px 6px;border-radius:3px;font-size:0.68rem;margin-left:4px">🛑停損</span>'
+
+            # Pre-compute display strings (can't use :.2f inside f-string conditional)
+            price_txt = f"{price:.2f}" if price else "─"
+            high_txt  = f"{high:.2f}"  if high  else "─"
+            low_txt   = f"{low:.2f}"   if low   else "─"
 
             with cols[ci]:
                 st.markdown(f"""
@@ -692,10 +697,10 @@ with tab_alerts:
         alert_rows.append({
             "代號":     c,
             "名稱":     cn_name(c),
-            "現價":     round(px, 2) if px else "─",
-            "目標價":   tgt or "─",
-            "停損價":   stp or "─",
-            "上漲空間": f"{upside:+.1f}%" if upside else "─",
+            "現價":     round(px, 2) if px else None,
+            "目標價":   float(tgt) if tgt else None,
+            "停損價":   float(stp) if stp else None,
+            "上漲空間": f"{upside:+.1f}%" if upside is not None else None,
             "狀態":     " ".join(status),
         })
 
