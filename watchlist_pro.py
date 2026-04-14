@@ -109,7 +109,12 @@ div[data-testid="stMetricDelta"]             { font-size: 0.8rem !important; }
 .stSuccess, .stInfo, .stWarning, .stError { font-family: var(--mono); font-size: 0.8rem; border-radius: 6px; }
 
 /* Hide Streamlit chrome */
-#MainMenu, footer, header { display: none !important; }
+#MainMenu { display: none !important; }
+footer    { display: none !important; }
+/* Hide Streamlit top-right toolbar but NOT the header bar (needed for sidebar toggle on mobile) */
+[data-testid="stToolbar"]    { display: none !important; }
+[data-testid="stDecoration"] { display: none !important; }
+[data-testid="stStatusWidget"] { display: none !important; }
 .block-container { padding-top: 16px !important; max-width: 1400px; }
 
 /* Custom card */
@@ -539,6 +544,28 @@ with st.sidebar:
         st.cache_data.clear(); st.rerun()
 
 # ══════════════════════════════════════════════════════════
+# ──  EMERGENCY RESET — always visible, before any st.stop()  ──
+# ══════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown('<div style="height:1px;background:#1a2d44;margin:16px 0"></div>',
+                unsafe_allow_html=True)
+    with st.expander("⚠️ 緊急重置", expanded=False):
+        st.caption("若 App 卡住或資料異常，點此清除 /tmp 資料並重載")
+        if st.button("🗑 清除所有暫存資料", use_container_width=True, key="emergency_reset"):
+            for f in [_WL_FILE, _NOTES_FILE, _PORT_FILE, _ALERT_FILE]:
+                try: os.remove(f)
+                except: pass
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.success("已清除，重新載入中…")
+            st.rerun()
+        if st.button("🔄 只清除自選股清單", use_container_width=True, key="reset_wl"):
+            try: os.remove(_WL_FILE)
+            except: pass
+            st.cache_resource.clear()
+            st.rerun()
+
+# ══════════════════════════════════════════════════════════
 # ──  GUARD: no stocks  ──
 # ══════════════════════════════════════════════════════════
 codes = wl_codes()
@@ -553,28 +580,6 @@ if not codes:
       </div>
     </div>""", unsafe_allow_html=True)
     st.stop()
-
-# ══════════════════════════════════════════════════════════
-# ──  EMERGENCY RESET (always visible) ──
-# ══════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown('<div style="height:1px;background:#1a2d44;margin:16px 0"></div>',
-                unsafe_allow_html=True)
-    with st.expander("⚠️ 緊急重置", expanded=False):
-        st.caption("若 App 卡住或資料異常，點此清除所有 /tmp 資料並重載")
-        if st.button("🗑 清除所有暫存資料", use_container_width=True, key="emergency_reset"):
-            for f in [_WL_FILE, _NOTES_FILE, _PORT_FILE, _ALERT_FILE]:
-                try: os.remove(f)
-                except: pass
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.success("已清除，重新載入中…")
-            st.rerun()
-        if st.button("🔄 只清除自選股清單", use_container_width=True, key="reset_wl"):
-            try: os.remove(_WL_FILE)
-            except: pass
-            st.cache_resource.clear()
-            st.rerun()
 
 # ══════════════════════════════════════════════════════════
 # ──  FETCH ALL QUOTES  ──
