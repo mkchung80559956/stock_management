@@ -111,11 +111,29 @@ div[data-testid="stMetricDelta"]             { font-size: 0.8rem !important; }
 /* Hide Streamlit chrome */
 #MainMenu { display: none !important; }
 footer    { display: none !important; }
-/* Hide Streamlit top-right toolbar but NOT the header bar (needed for sidebar toggle on mobile) */
-[data-testid="stToolbar"]    { display: none !important; }
-[data-testid="stDecoration"] { display: none !important; }
+[data-testid="stToolbar"]      { display: none !important; }
+[data-testid="stDecoration"]   { display: none !important; }
 [data-testid="stStatusWidget"] { display: none !important; }
-.block-container { padding-top: 16px !important; max-width: 1400px; }
+
+/* Layout */
+.block-container { padding-top: 12px !important; padding-left: 1rem !important;
+  padding-right: 1rem !important; max-width: 1400px; }
+
+/* Mobile responsive: stack columns on narrow screens */
+@media (max-width: 640px) {
+  .block-container { padding-left: 0.5rem !important; padding-right: 0.5rem !important; }
+  .stTabs [data-baseweb="tab"] { padding: 8px 10px; font-size: 0.72rem; letter-spacing: 0.04em; }
+  div[data-testid="stMetric"]  { padding: 10px 12px; }
+  div[data-testid="stMetricValue"] { font-size: 1.05rem !important; }
+}
+
+/* Make buttons bigger / easier to tap on mobile */
+.stButton > button { min-height: 42px; padding: 8px 16px; }
+.stButton > button[kind="primary"] { min-height: 48px; font-size: 0.9rem; }
+
+/* Inputs */
+.stTextInput input  { min-height: 44px; font-size: 0.95rem !important; }
+.stSelectbox select { min-height: 44px; }
 
 /* Custom card */
 .wl-card { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; transition: border-color 0.2s; }
@@ -429,21 +447,17 @@ PRESET_GROUPS = ["未分組","半導體","金融","電子","傳產","ETF","觀�
 # ──  HEADER  ──
 # ══════════════════════════════════════════════════════════
 st.markdown(f"""
-<div style="border-bottom:1px solid #1a2d44;padding-bottom:14px;margin-bottom:20px">
-  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
-    <div style="font-family:'IBM Plex Mono',monospace;font-size:1.4rem;
-      font-weight:700;color:#cdd9e8;letter-spacing:-0.02em;white-space:nowrap">
-      WATCHLIST <span style="color:#00c8ff">PRO</span>
-      <span style="font-size:0.72rem;color:#5d7a94;font-weight:400;
-        letter-spacing:0.1em;text-transform:uppercase;margin-left:12px">
-        v{APP_VERSION} · {APP_UPDATED}
-      </span>
-    </div>
-    <div style="font-family:'IBM Plex Mono',monospace;font-size:0.7rem;color:#5d7a94;white-space:nowrap">
-      {now_tw().strftime("%Y-%m-%d  %H:%M")} CST
-    </div>
+<div style="border-bottom:1px solid #1a2d44;padding-bottom:12px;margin-bottom:18px">
+  <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+    <span style="font-family:'IBM Plex Mono',monospace;font-size:1.25rem;
+      font-weight:700;color:#cdd9e8">WATCHLIST&nbsp;<span style="color:#00c8ff">PRO</span></span>
+    <span style="font-size:0.68rem;color:#5d7a94;letter-spacing:0.08em">
+      v{APP_VERSION} &nbsp;·&nbsp; {now_tw().strftime("%m/%d %H:%M")}
+    </span>
   </div>
-  <div style="font-size:0.72rem;color:#3d5470;margin-top:4px">台股自選股管理系統</div>
+  <div style="font-size:0.7rem;color:#3d5470;margin-top:3px;letter-spacing:0.04em">
+    台股自選股管理系統
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -576,20 +590,21 @@ if not codes:
       <div style="color:#3d5470;font-size:0.82rem;margin-top:6px">新增股票代號開始使用</div>
     </div>""", unsafe_allow_html=True)
 
-    # Inline add form — works on mobile without needing the sidebar
+    # Inline add form — mobile-first stacked layout
     with st.container():
-        ia1, ia2, ia3 = st.columns([3, 2, 1])
-        in_code  = ia1.text_input("股票代號", placeholder="2330 / 3019 / 0050",
-                                   label_visibility="collapsed", key="inline_code")
-        in_group = ia2.selectbox("分組", PRESET_GROUPS,
-                                  label_visibility="collapsed", key="inline_group")
-        if ia3.button("新增", type="primary", use_container_width=True, key="inline_add"):
+        in_code  = st.text_input("股票代號", placeholder="輸入代號  例：2330 / 3019 / 0050",
+                                  label_visibility="collapsed", key="inline_code")
+        in_group = st.selectbox("分組", PRESET_GROUPS,
+                                 label_visibility="collapsed", key="inline_group")
+        if st.button("➕  新增到自選股", type="primary", use_container_width=True, key="inline_add"):
             bare = in_code.strip().upper().replace(".TW","").replace(".TWO","")
             if bare and _is_valid_code(bare):
                 wl_add(bare); wl_set_group(bare, in_group)
                 st.success(f"✓ 已新增 {bare}  {cn(bare)}"); st.rerun()
             elif bare:
-                st.error("代號格式不正確（應為 4-6 位數字）")
+                st.error(f"「{bare}」格式不正確（台股代號為 4-6 位數字）")
+            else:
+                st.warning("請輸入股票代號")
 
     st.markdown("""
     <div style="text-align:center;margin-top:16px;color:#3d5470;font-size:0.78rem">
@@ -649,12 +664,11 @@ with tab_ov:
         df_ov = pd.DataFrame(rows)
         # Summary
         valid = [r for r in rows if r["漲跌%"] is not None]
-        c1,c2,c3,c4,c5 = st.columns(5)
-        c1.metric("持倉", len(codes))
-        c2.metric("🔴 上漲", sum(1 for r in valid if r["漲跌%"]>0))
-        c3.metric("🟢 下跌", sum(1 for r in valid if r["漲跌%"]<0))
-        c4.metric("⚪ 平盤", sum(1 for r in valid if r["漲跌%"]==0))
-        c5.metric("警報", sum(1 for r in rows if r["狀態"]!="─"))
+        m1,m2 = st.columns(2); m3,m4 = st.columns(2)
+        m1.metric("總持倉", len(codes))
+        m2.metric("警報", sum(1 for r in rows if r["狀態"]!="─"))
+        m3.metric("🔴 上漲", sum(1 for r in valid if r["漲跌%"]>0))
+        m4.metric("🟢 下跌", sum(1 for r in valid if r["漲跌%"]<0))
         st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
         st.dataframe(df_ov, use_container_width=True, hide_index=True,
             column_config={
@@ -673,9 +687,11 @@ with tab_card:
     elif col_sort == "跌幅↓": sc.sort(key=lambda x: Q.get(x,{}).get("chg_p",0))
     elif col_sort == "分組": sc.sort(key=lambda x: wl_group(x))
 
-    for i in range(0, len(sc), 3):
-        chunk = sc[i:i+3]
-        cols = st.columns(3)
+    # 2 columns on mobile, 3 on desktop
+    n_cols = 2
+    for i in range(0, len(sc), n_cols):
+        chunk = sc[i:i+n_cols]
+        cols = st.columns(n_cols)
         for ci, c in enumerate(chunk):
             q = Q.get(c,{}); n = note_get(c)
             px = q.get("px",0); chg = q.get("chg_p",0)
@@ -928,13 +944,13 @@ with tab_port:
             t_c=r1c1.text_input("商品",placeholder="3019亞光")
             t_d=r1c2.date_input("交易日",value=date.today())
             t_t=r1c3.selectbox("交易別",["現買","現賣"])
-            r2c1,r2c2,r2c3,r2c4=st.columns(4)
-            t_q=r2c1.number_input("股數",min_value=1,value=50,step=1)
-            t_p=r2c2.number_input("成交價",min_value=0.1,value=100.0,step=0.5)
+            _c1,_c2=st.columns(2); _c3,_c4=st.columns(2)
+            t_q=_c1.number_input("股數",min_value=1,value=50,step=1)
+            t_p=_c2.number_input("成交價",min_value=0.1,value=100.0,step=0.5)
             auto_fee=int(t_q*t_p*0.001425*0.6)
             auto_tax=int(t_q*t_p*0.003) if t_t=="現賣" else 0
-            t_f=r2c3.number_input("手續費",min_value=0,value=auto_fee)
-            t_x=r2c4.number_input("交易稅",min_value=0,value=auto_tax)
+            t_f=_c3.number_input("手續費",min_value=0,value=auto_fee)
+            t_x=_c4.number_input("交易稅",min_value=0,value=auto_tax)
             if st.form_submit_button("新增",type="primary"):
                 ex_t=port_trades()
                 ex_t.append({"商品":t_c,"交易日":str(t_d),"交易別":t_t,"股數":int(t_q),
@@ -974,11 +990,11 @@ with tab_port:
         tc,tm,tu,tp = sum(e["cst"] for e in evals),sum(e["mkt"] for e in evals),\
                       sum(e["unrl"] for e in evals),0
         tp = tu/tc*100 if tc else 0
-        sm1,sm2,sm3,sm4 = st.columns(4)
-        sm1.metric("持倉支數", len(evals))
-        sm2.metric("投入成本", f"{tc/1e4:.1f}萬")
-        sm3.metric("目前市值", f"{tm/1e4:.1f}萬")
-        sm4.metric("未實現損益", f"{tu/1e4:+.2f}萬", f"{tp:+.1f}%")
+        pm1,pm2 = st.columns(2); pm3,pm4 = st.columns(2)
+        pm1.metric("持倉支數",  len(evals))
+        pm2.metric("總投入",    f"{tc/1e4:.1f}萬")
+        pm3.metric("目前市值",  f"{tm/1e4:.1f}萬")
+        pm4.metric("損益",      f"{tu/1e4:+.2f}萬", f"{tp:+.1f}%")
 
         st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
 
