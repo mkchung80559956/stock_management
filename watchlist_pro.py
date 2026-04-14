@@ -429,22 +429,21 @@ PRESET_GROUPS = ["未分組","半導體","金融","電子","傳產","ETF","觀�
 # ──  HEADER  ──
 # ══════════════════════════════════════════════════════════
 st.markdown(f"""
-<div style="display:flex;align-items:center;justify-content:space-between;
-  border-bottom:1px solid #1a2d44;padding-bottom:14px;margin-bottom:20px">
-  <div>
-    <div style="font-family:'IBM Plex Mono',monospace;font-size:1.5rem;
-      font-weight:700;color:#cdd9e8;letter-spacing:-0.02em">
+<div style="border-bottom:1px solid #1a2d44;padding-bottom:14px;margin-bottom:20px">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:1.4rem;
+      font-weight:700;color:#cdd9e8;letter-spacing:-0.02em;white-space:nowrap">
       WATCHLIST <span style="color:#00c8ff">PRO</span>
+      <span style="font-size:0.72rem;color:#5d7a94;font-weight:400;
+        letter-spacing:0.1em;text-transform:uppercase;margin-left:12px">
+        v{APP_VERSION} · {APP_UPDATED}
+      </span>
     </div>
-    <div style="font-size:0.72rem;color:#5d7a94;letter-spacing:0.1em;
-      text-transform:uppercase;margin-top:2px">
-      台股自選股管理系統  ·  v{APP_VERSION}  ·  {APP_UPDATED}
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:0.7rem;color:#5d7a94;white-space:nowrap">
+      {now_tw().strftime("%Y-%m-%d  %H:%M")} CST
     </div>
   </div>
-  <div style="text-align:right;font-family:'IBM Plex Mono',monospace;
-    font-size:0.7rem;color:#5d7a94">
-    {now_tw().strftime("%Y-%m-%d %H:%M")} CST
-  </div>
+  <div style="font-size:0.72rem;color:#3d5470;margin-top:4px">台股自選股管理系統</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -571,13 +570,30 @@ with st.sidebar:
 codes = wl_codes()
 if not codes:
     st.markdown("""
-    <div style="text-align:center;padding:80px 20px">
-      <div style="font-size:3rem;margin-bottom:16px">📋</div>
-      <div style="font-family:'IBM Plex Mono',monospace;font-size:1.1rem;
-        color:#5d7a94;letter-spacing:0.05em">WATCHLIST EMPTY</div>
-      <div style="color:#3d5470;font-size:0.85rem;margin-top:8px">
-        從左側側欄輸入股票代號開始使用
-      </div>
+    <div style="text-align:center;padding:40px 0 20px 0">
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:0.9rem;
+        color:#5d7a94;letter-spacing:0.12em">WATCHLIST EMPTY</div>
+      <div style="color:#3d5470;font-size:0.82rem;margin-top:6px">新增股票代號開始使用</div>
+    </div>""", unsafe_allow_html=True)
+
+    # Inline add form — works on mobile without needing the sidebar
+    with st.container():
+        ia1, ia2, ia3 = st.columns([3, 2, 1])
+        in_code  = ia1.text_input("股票代號", placeholder="2330 / 3019 / 0050",
+                                   label_visibility="collapsed", key="inline_code")
+        in_group = ia2.selectbox("分組", PRESET_GROUPS,
+                                  label_visibility="collapsed", key="inline_group")
+        if ia3.button("新增", type="primary", use_container_width=True, key="inline_add"):
+            bare = in_code.strip().upper().replace(".TW","").replace(".TWO","")
+            if bare and _is_valid_code(bare):
+                wl_add(bare); wl_set_group(bare, in_group)
+                st.success(f"✓ 已新增 {bare}  {cn(bare)}"); st.rerun()
+            elif bare:
+                st.error("代號格式不正確（應為 4-6 位數字）")
+
+    st.markdown("""
+    <div style="text-align:center;margin-top:16px;color:#3d5470;font-size:0.78rem">
+      常用代號：2330 台積電 ／ 2317 鴻海 ／ 0050 元大台灣50 ／ 3019 亞光
     </div>""", unsafe_allow_html=True)
     st.stop()
 
