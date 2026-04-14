@@ -500,7 +500,7 @@ with st.sidebar:
         uf = st.file_uploader("↑ 匯入 Excel", type=["xlsx"], label_visibility="collapsed")
         if uf:
             try:
-                df_i = pd.read_excel(uf)
+                df_i = pd.read_excel(uf, sheet_name=0)
                 added=0
                 for _,r in df_i.iterrows():
                     c=str(r.get("代號",r.get("code",""))).strip().upper()
@@ -833,11 +833,11 @@ with tab_port:
                 for hr in [0,1,2]:
                     try:
                         imp_f.seek(0)
-                        df_t = pd.read_excel(imp_f, header=hr)
+                        df_t = pd.read_excel(imp_f, header=hr, sheet_name=0)
                         if any(k in " ".join(str(c) for c in df_t.columns) for k in ["商品","交易日","代號"]):
                             df_im = df_t; break
                     except: pass
-                if df_im is None: imp_f.seek(0); df_im = pd.read_excel(imp_f)
+                if df_im is None: imp_f.seek(0); df_im = pd.read_excel(imp_f, sheet_name=0)
                 col_map = {"商品":["商品","股票","代號"],"交易日":["交易日","日期"],"交易別":["交易別","買賣"],
                            "股數":["股數","數量"],"成交價":["成交價","價格"],"價金":["價金","金額"],
                            "手續費":["手續費","費用"],"交易稅":["交易稅","稅"]}
@@ -888,7 +888,20 @@ with tab_port:
     st.markdown('<div style="font-size:0.72rem;color:#5d7a94;letter-spacing:0.1em;'
                 'text-transform:uppercase;margin-bottom:14px">POSITION ANALYSIS</div>', unsafe_allow_html=True)
 
-    all_codes_p = sorted(set(str(t.get("商品",""))[:4] for t in trades_all if t.get("商品")))
+    def _valid_code(raw):
+        """Only accept codes that are purely numeric (Taiwan stock codes are digits only)."""
+        bare = str(raw).upper().replace(".TW","").replace(".TWO","").replace("亞光","").replace("台積電","").strip()
+        # Extract leading digits
+        import re as _rev
+        m = _rev.match(r'^(\d{4,6})', bare)
+        return m.group(1) if m else None
+
+    all_codes_p = sorted(set(
+        c for c in (
+            _valid_code(str(t.get("商品","")))
+            for t in trades_all if t.get("商品")
+        ) if c
+    ))
     evals = []
     for code in all_codes_p:
         q2 = quote(code); px2 = q2.get("px",0)
