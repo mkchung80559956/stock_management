@@ -155,7 +155,25 @@ def _atomic(path, data):
     with open(tmp,"w") as f: json.dump(data, f, ensure_ascii=False)
     os.replace(tmp, path)
 
-def wl_codes():          return _wl()["codes"]
+import re as _re_v
+
+def _is_valid_code(raw: str) -> bool:
+    """Taiwan stock codes are 4-6 digits only (e.g. 2330, 0050, 00878)."""
+    bare = str(raw).upper().replace(".TW","").replace(".TWO","").strip()
+    # Strip Chinese characters if mixed (e.g. "3019亞光" → "3019")
+    bare = _re_v.sub(r'[^\x00-\x7F\d]', '', bare).strip()
+    return bool(_re_v.fullmatch(r'\d{4,6}', bare))
+
+def wl_codes():
+    raw = _wl()["codes"]
+    valid = [c for c in raw if _is_valid_code(c)]
+    # Auto-purge: if invalid codes were found, rewrite the file clean
+    if len(valid) != len(raw):
+        s = _wl()
+        s["codes"] = valid
+        try: _atomic(_WL_FILE, s)
+        except: pass
+    return valid
 def wl_group(c):         return _wl().get("groups",{}).get(c,"未分組")
 def wl_add(c):
     s = _wl(); c = c.upper()
@@ -535,6 +553,28 @@ if not codes:
       </div>
     </div>""", unsafe_allow_html=True)
     st.stop()
+
+# ══════════════════════════════════════════════════════════
+# ──  EMERGENCY RESET (always visible) ──
+# ══════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown('<div style="height:1px;background:#1a2d44;margin:16px 0"></div>',
+                unsafe_allow_html=True)
+    with st.expander("⚠️ 緊急重置", expanded=False):
+        st.caption("若 App 卡住或資料異常，點此清除所有 /tmp 資料並重載")
+        if st.button("🗑 清除所有暫存資料", use_container_width=True, key="emergency_reset"):
+            for f in [_WL_FILE, _NOTES_FILE, _PORT_FILE, _ALERT_FILE]:
+                try: os.remove(f)
+                except: pass
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.success("已清除，重新載入中…")
+            st.rerun()
+        if st.button("🔄 只清除自選股清單", use_container_width=True, key="reset_wl"):
+            try: os.remove(_WL_FILE)
+            except: pass
+            st.cache_resource.clear()
+            st.rerun()
 
 # ══════════════════════════════════════════════════════════
 # ──  FETCH ALL QUOTES  ──
