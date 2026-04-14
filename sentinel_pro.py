@@ -3150,7 +3150,7 @@ def _pro_strategy(sig_k, trend_s, conf_s, accel_s,
 
 def main():
     # ── Header ──────────────────────────────────
-    st.markdown("""
+    st.markdown(f"""
     <div class="sentinel-header">
       <div class="sentinel-title">🛡️ Sentinel Pro <span style="color:#00d4ff;font-size:0.9em">v{APP_VERSION}</span></div>
       <div class="sentinel-sub">台股掃描器 · CCI × KD × OBV × 成交量 · 更新於 {APP_UPDATED}</div>
@@ -3692,19 +3692,54 @@ def main():
                 })
 
             prog.empty()
-            # Track which signals changed since the previous scan (NEW badge)
+            # ── Track signal change timestamps ─────────────────────────
+            # signal_fired_at: {code: {"sig_key": str, "fired_at": str}}
+            # Persists to /tmp so it survives page refresh within same container
+            _SIG_TS_FILE = "/tmp/sentinel_sig_timestamps.json"
+
+            # Load from file first (survives page refresh)
+            try:
+                if os.path.exists(_SIG_TS_FILE):
+                    with open(_SIG_TS_FILE) as _f:
+                        signal_fired_at = json.load(_f)
+                else:
+                    signal_fired_at = st.session_state.get("signal_fired_at", {})
+            except Exception:
+                signal_fired_at = st.session_state.get("signal_fired_at", {})
+
             prev_keys = st.session_state.get("prev_sig_keys", {})
             new_signals = set()
-            signal_fired_at = st.session_state.get("signal_fired_at", {})
             fired_ts = tw_now().strftime("%Y-%m-%d %H:%M")
-            for r in rows:
-                old_sig = prev_keys.get(r["代號"])
-                if old_sig != r["_sig_key"] and r["_sig_key"] not in ("NEUTRAL", "RISING", "FALLING", "BULL_ZONE", "BEAR_ZONE"):
-                    new_signals.add(r["代號"])
-                    signal_fired_at[r["代號"]] = fired_ts   # record exact time
-                r["_is_new"]    = r["代號"] in new_signals
-                r["_fired_at"]  = signal_fired_at.get(r["代號"], "")
 
+            for r in rows:
+                code    = r["代號"]
+                cur_sig = r["_sig_key"]
+                old_sig = prev_keys.get(code)
+                cached  = signal_fired_at.get(code, {})
+
+                # Signal changed → update timestamp
+                if old_sig != cur_sig and cur_sig not in ("NEUTRAL","RISING","FALLING","BULL_ZONE","BEAR_ZONE"):
+                    signal_fired_at[code] = {"sig_key": cur_sig, "fired_at": fired_ts}
+                    new_signals.add(code)
+                elif not cached:
+                    # First time seeing this code — record it
+                    signal_fired_at[code] = {"sig_key": cur_sig, "fired_at": fired_ts}
+
+                # _is_new = True if this is the SAME signal as when it was first recorded
+                # (keeps badge until signal changes again, not just one scan)
+                cached_now = signal_fired_at.get(code, {})
+                r["_is_new"]   = (cached_now.get("sig_key") == cur_sig
+                                  and code in new_signals)
+                r["_fired_at"] = cached_now.get("fired_at", "")
+
+            # Persist to file (atomic) and session state
+            try:
+                _tmp = _SIG_TS_FILE + ".tmp"
+                with open(_tmp, "w") as _f:
+                    json.dump(signal_fired_at, _f, ensure_ascii=False)
+                os.replace(_tmp, _SIG_TS_FILE)
+            except Exception:
+                pass
             st.session_state.signal_fired_at = signal_fired_at
 
             # Save current signals as previous for next comparison
@@ -3830,8 +3865,13 @@ def main():
                             new_badge = (
                                 f'<span style="background:#ff9900;color:#000;padding:1px 6px;'
                                 f'border-radius:3px;font-size:0.62rem;font-weight:700;'
-                                f'margin-left:4px">NEW {fired_at}</span>'
+                                f'margin-left:4px">NEW</span>'
                             ) if r.get("_is_new") else ""
+                            # Show signal detection time on ALL buy cards (not just NEW)
+                            time_label = (
+                                f'<div style="font-size:0.62rem;color:#37474f;margin-top:3px">'
+                                f'📍 訊號出現：{fired_at}</div>'
+                            ) if fired_at else ""
                             with cols[ci]:
                                 st.markdown(f"""
                                 <div style="background:#0d1a2d;border:1.5px solid {border};
@@ -3856,6 +3896,7 @@ def main():
                                 <div style="font-size:0.68rem;color:#37474f;margin-top:4px;
                                     white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
                                 {r['_detail'][:45]}</div>
+                                {time_label}
                                 </div>""", unsafe_allow_html=True)
 
                 # Sell signal cards
