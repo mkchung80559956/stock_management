@@ -1,5 +1,5 @@
 """
-Sentinel Pro — 台股多股掃描器 v2.0
+Sentinel Pro — 台股多股掃描器 v3.0
 CCI × 成交量 × 價格行為 量價策略訊號系統
 """
 
@@ -17,6 +17,9 @@ import os
 import re as _re
 import urllib.request as _urllib_req
 import urllib.parse  as _urllib_parse
+
+APP_VERSION   = "3.0"
+APP_UPDATED   = "2026-04-12"   # ← bump this string on every update
 import warnings
 import logging
 import pytz
@@ -1386,6 +1389,58 @@ def fetch_quote(symbol: str) -> dict:
         except Exception:
             pass
     return {}
+
+
+@st.cache_data(ttl=60)
+def batch_fetch_quotes(symbols: tuple) -> dict:
+    """
+    Fetch live quotes for ALL symbols in one yf.download() call.
+    ~10x faster than calling fetch_quote() per-stock in a loop.
+    Returns {bare_code: {"price": float, "change_pct": float}}.
+    """
+    if not symbols:
+        return {}
+    # Build full ticker list
+    tickers = []
+    bare_map = {}   # full_ticker → bare_code
+    for s in symbols:
+        bare = s.upper().replace(".TW","").replace(".TWO","")
+        full = s if s.upper().endswith((".TW",".TWO")) else bare + ".TW"
+        tickers.append(full)
+        bare_map[full] = bare
+
+    result = {}
+    try:
+        # Single batch download — period="2d" gives today + yesterday for change%
+        df_batch = yf.download(
+            tickers=" ".join(tickers),
+            period="2d", interval="1d",
+            auto_adjust=True, progress=False,
+            group_by="ticker",
+        )
+        if df_batch.empty:
+            return {}
+
+        # Multi-ticker layout: columns are (field, ticker)
+        for full in tickers:
+            bare = bare_map[full]
+            try:
+                if len(tickers) == 1:
+                    closes = df_batch["Close"].dropna()
+                else:
+                    closes = df_batch["Close"][full].dropna()
+                if len(closes) < 1:
+                    continue
+                last = float(closes.iloc[-1])
+                prev = float(closes.iloc[-2]) if len(closes) >= 2 else last
+                chg_p = (last - prev) / prev * 100 if prev else 0
+                result[bare] = {"price": round(last, 2),
+                                "change_pct": round(chg_p, 2)}
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return result
 
 
 # ══════════════════════════════════════════════
@@ -3097,8 +3152,8 @@ def main():
     # ── Header ──────────────────────────────────
     st.markdown("""
     <div class="sentinel-header">
-      <div class="sentinel-title">🛡️ Sentinel Pro <span style="color:#00d4ff;font-size:0.9em">v2.1</span></div>
-      <div class="sentinel-sub">台股掃描器 · CCI × KD × OBV × 成交量</div>
+      <div class="sentinel-title">🛡️ Sentinel Pro <span style="color:#00d4ff;font-size:0.9em">v{APP_VERSION}</span></div>
+      <div class="sentinel-sub">台股掃描器 · CCI × KD × OBV × 成交量 · 更新於 {APP_UPDATED}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -3111,6 +3166,8 @@ def main():
         st.session_state.auto_refresh = False
     if "prev_sig_keys" not in st.session_state:
         st.session_state.prev_sig_keys = {}
+    if "signal_fired_at" not in st.session_state:
+        st.session_state.signal_fired_at = {}   # {代號: "YYYY-MM-DD HH:MM"}
     # Portfolio trades now managed via port_get_trades() / port_add_trade()
     # No session_state needed — cache_resource + /tmp file handle persistence
 
@@ -3481,11 +3538,21 @@ def main():
             failed    = []
             wl        = st.session_state.watchlist
             total_n   = max(len(wl), 1)
-            # ▶ Load names first (no progress advance — prevents backwards bar)
+            # ▶ Load names (instant static table)
             try:
                 name_cache = batch_fetch_names(tuple(wl))
             except Exception:
                 name_cache = {}
+
+            # ▶ Batch-fetch ALL quotes in ONE yf.download() call BEFORE the loop
+            # This replaces 145 individual fetch_quote() HTTP requests with 1 call
+            # Speedup: ~10× (145 × 0.3s → 1 × ~4s)
+            quote_cache: dict = {}
+            try:
+                quote_cache = batch_fetch_quotes(tuple(wl))
+            except Exception:
+                quote_cache = {}
+
             prog = st.progress(0, text="掃描中…")
 
             for i, code in enumerate(wl):
@@ -3514,8 +3581,11 @@ def main():
                     continue
 
                 bt    = backtest(df_sig, holding_days, profit_target, stop_loss)
-                quote = fetch_quote(code)
-                import time as _time_rl; _time_rl.sleep(0.05)  # 50ms rate-limit guard
+
+                # Use batch-prefetched quote; fall back to individual call only if missing
+                bare_q = code.upper().replace(".TW","").replace(".TWO","")
+                quote  = quote_cache.get(bare_q) or fetch_quote(code)
+                import time as _time_rl; _time_rl.sleep(0.02)  # 20ms guard (reduced from 50ms)
 
                 cached = name_cache.get(bare)
                 if cached and cached[0]:
@@ -3618,17 +3688,24 @@ def main():
                     "_mtf_ok":  mtf_ok,
                     "_w_sig":   w_sig,
                     "_is_new":  False,
+                    "_fired_at": "",
                 })
 
             prog.empty()
             # Track which signals changed since the previous scan (NEW badge)
             prev_keys = st.session_state.get("prev_sig_keys", {})
             new_signals = set()
+            signal_fired_at = st.session_state.get("signal_fired_at", {})
+            fired_ts = tw_now().strftime("%Y-%m-%d %H:%M")
             for r in rows:
                 old_sig = prev_keys.get(r["代號"])
                 if old_sig != r["_sig_key"] and r["_sig_key"] not in ("NEUTRAL", "RISING", "FALLING", "BULL_ZONE", "BEAR_ZONE"):
                     new_signals.add(r["代號"])
-                r["_is_new"] = r["代號"] in new_signals
+                    signal_fired_at[r["代號"]] = fired_ts   # record exact time
+                r["_is_new"]    = r["代號"] in new_signals
+                r["_fired_at"]  = signal_fired_at.get(r["代號"], "")
+
+            st.session_state.signal_fired_at = signal_fired_at
 
             # Save current signals as previous for next comparison
             st.session_state.prev_sig_keys  = {r["代號"]: r["_sig_key"] for r in rows}
@@ -3749,7 +3826,12 @@ def main():
                             chg_color = "#e8414e" if r["_chg_p"] >= 0 else "#22cc66"
                             wr_color  = "#00ff88" if r["_win_rate"] >= 60 else "#f0a500" if r["_win_rate"] >= 45 else "#aaaaaa"
                             border    = "#ffd700" if sig_key == "HIGH_CONF_BUY" else "#00ff88"
-                            new_badge = '<span style="background:#ff9900;color:#000;padding:1px 6px;border-radius:3px;font-size:0.65rem;font-weight:700;margin-left:4px">NEW</span>' if r.get("_is_new") else ""
+                            fired_at  = r.get("_fired_at", "")
+                            new_badge = (
+                                f'<span style="background:#ff9900;color:#000;padding:1px 6px;'
+                                f'border-radius:3px;font-size:0.62rem;font-weight:700;'
+                                f'margin-left:4px">NEW {fired_at}</span>'
+                            ) if r.get("_is_new") else ""
                             with cols[ci]:
                                 st.markdown(f"""
                                 <div style="background:#0d1a2d;border:1.5px solid {border};
