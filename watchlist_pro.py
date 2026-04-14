@@ -9,6 +9,9 @@ import yfinance as yf
 import json
 import os
 import pytz
+import urllib.request as _urllib_req
+import urllib.parse  as _urllib_parse
+import re as _re
 from datetime import datetime
 
 # ── App config ───────────────────────────────────────────
@@ -30,6 +33,126 @@ TZ_TW = pytz.timezone("Asia/Taipei")
 
 def tw_now():
     return datetime.now(TZ_TW)
+
+# ── Telegram helpers ──────────────────────────────────────
+ALERT_SENT_FILE = "/tmp/watchlist_alerts_sent.json"  # {code+type: last_sent_date}
+
+def _tg_send(token: str, chat_id: str, text: str) -> tuple[bool, str]:
+    """Send Telegram message. Returns (ok, error)."""
+    if not token or not chat_id:
+        return False, "Token 或 Chat ID 未設定"
+    clean = _re.sub(r'<[^>]+>', '', text)
+    try:
+        url  = f"https://api.telegram.org/bot{token.strip()}/sendMessage"
+        data = _urllib_parse.urlencode({
+            "chat_id": str(chat_id).strip(),
+            "text":    clean,
+        }).encode()
+        req = _urllib_req.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with _urllib_req.urlopen(req, timeout=10) as r:
+            return (True, "") if r.status == 200 else (False, f"HTTP {r.status}")
+    except Exception as e:
+        err = str(e)
+        if hasattr(e, 'read'):
+            try: err += " | " + e.read().decode()[:200]
+            except Exception: pass
+        return False, err
+
+
+def _alert_sent_today(code: str, alert_type: str) -> bool:
+    """Returns True if we already sent this alert today."""
+    try:
+        if os.path.exists(ALERT_SENT_FILE):
+            with open(ALERT_SENT_FILE) as f:
+                sent = json.load(f)
+        else:
+            sent = {}
+        key  = f"{code}_{alert_type}"
+        today = tw_now().strftime("%Y-%m-%d")
+        return sent.get(key) == today
+    except Exception:
+        return False
+
+
+def _mark_alert_sent(code: str, alert_type: str) -> None:
+    try:
+        sent = {}
+        if os.path.exists(ALERT_SENT_FILE):
+            with open(ALERT_SENT_FILE) as f:
+                sent = json.load(f)
+        sent[f"{code}_{alert_type}"] = tw_now().strftime("%Y-%m-%d")
+        tmp = ALERT_SENT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(sent, f)
+        os.replace(tmp, ALERT_SENT_FILE)
+    except Exception:
+        pass
+
+
+def check_and_send_alerts(token: str, chat_id: str,
+                          codes: list, quotes: dict) -> list[str]:
+    """
+    Check all stocks against their target/stop prices.
+    Send Telegram alert if triggered and not yet sent today.
+    Returns list of alert messages sent.
+    """
+    if not token or not chat_id:
+        return []
+    sent_msgs = []
+    for code in codes:
+        n  = notes_get(code)
+        q  = quotes.get(code, {})
+        px = q.get("price", 0)
+        if not px:
+            continue
+        tgt = n.get("target")
+        stp = n.get("stop")
+        name = cn_name(code)
+        chg  = q.get("chg_pct", 0)
+
+        # Target hit
+        if tgt and px >= tgt and not _alert_sent_today(code, "target"):
+            msg = (
+                f"🎯 目標價達標！\n"
+                f"{code} {name}\n"
+                f"現價 {px:.2f}  目標 {tgt}\n"
+                f"漲跌 {chg:+.2f}%\n"
+                f"時間 {tw_now().strftime('%Y-%m-%d %H:%M')}"
+            )
+            ok, _ = _tg_send(token, chat_id, msg)
+            if ok:
+                _mark_alert_sent(code, "target")
+                sent_msgs.append(f"🎯 {code} 達標 {px:.2f}")
+
+        # Stop hit
+        if stp and px <= stp and not _alert_sent_today(code, "stop"):
+            msg = (
+                f"🛑 停損價觸發！\n"
+                f"{code} {name}\n"
+                f"現價 {px:.2f}  停損 {stp}\n"
+                f"漲跌 {chg:+.2f}%\n"
+                f"時間 {tw_now().strftime('%Y-%m-%d %H:%M')}"
+            )
+            ok, _ = _tg_send(token, chat_id, msg)
+            if ok:
+                _mark_alert_sent(code, "stop")
+                sent_msgs.append(f"🛑 {code} 觸停損 {px:.2f}")
+
+        # Near target (within 2%)
+        if tgt and px < tgt and (tgt - px) / tgt * 100 <= 2 and not _alert_sent_today(code, "near_target"):
+            msg = (
+                f"⚠️ 接近目標價\n"
+                f"{code} {name}\n"
+                f"現價 {px:.2f}  目標 {tgt}  距離 {(tgt-px)/tgt*100:.1f}%\n"
+                f"時間 {tw_now().strftime('%H:%M')}"
+            )
+            ok, _ = _tg_send(token, chat_id, msg)
+            if ok:
+                _mark_alert_sent(code, "near_target")
+                sent_msgs.append(f"⚠️ {code} 接近目標")
+
+    return sent_msgs
 
 # ── Dark theme CSS ────────────────────────────────────────
 st.markdown("""
@@ -285,6 +408,33 @@ with st.sidebar:
             st.error(f"匯入失敗：{e}")
 
     st.divider()
+    st.markdown("### 📲 Telegram 到價提醒")
+    # Read from st.secrets if available
+    _tg_sec = {}
+    try: _tg_sec = st.secrets.get("telegram", {})
+    except Exception: pass
+
+    tg_token   = st.text_input("Bot Token",
+        value=_tg_sec.get("token", ""),
+        type="password", key="wl_tg_token",
+        help="從 @BotFather 取得。可存入 Streamlit Secrets [telegram] token='...'")
+    tg_chat_id = st.text_input("Chat ID",
+        value=_tg_sec.get("chat_id", ""),
+        key="wl_tg_chat",
+        help="傳訊息給 Bot 後，用 api.telegram.org/bot<TOKEN>/getUpdates 查詢")
+    if tg_token and len(tg_token) > 20:
+        st.markdown(
+            f"[🔍 查詢 Chat ID](https://api.telegram.org/bot{tg_token}/getUpdates)"
+            " ← 先傳任意訊息給 Bot"
+        )
+    tg_near = st.checkbox("⚠️ 接近目標價也通知（距離 ≤2%）",
+                           value=True, key="wl_tg_near")
+    if st.button("🧪 測試推播", key="wl_tg_test", width="stretch"):
+        ok, err = _tg_send(tg_token, tg_chat_id,
+            f"✅ Watchlist Pro 推播測試\n設定正確，到價提醒已啟用\n"
+            f"時間 {tw_now().strftime('%Y-%m-%d %H:%M')}")
+        st.success("✅ 測試成功！") if ok else st.error(f"❌ {err}")
+
     st.divider()
     st.markdown("### ⏱ 自動更新")
     auto_ref = st.toggle("啟用自動更新", value=False, key="auto_ref")
@@ -316,6 +466,15 @@ def bulk_quotes(code_tuple):
 
 with st.spinner("載入報價…"):
     quotes = bulk_quotes(tuple(codes))
+
+# ── Auto-check price alerts after every quote refresh ────
+_tg_tok = st.session_state.get("wl_tg_token", "")
+_tg_cid = st.session_state.get("wl_tg_chat", "")
+if _tg_tok and _tg_cid:
+    _alerts_sent = check_and_send_alerts(_tg_tok, _tg_cid, codes, quotes)
+    if _alerts_sent:
+        for _a in _alerts_sent:
+            st.toast(f"📲 已推播：{_a}", icon="✅")
 
 # ═════════════════════════════════════════════════════════
 # TAB 1 — 總覽表格
@@ -643,7 +802,16 @@ with tab_notes:
 # ═════════════════════════════════════════════════════════
 with tab_alerts:
     st.markdown("#### 🎯 目標價 & 停損設定")
-    st.caption("設定每支股票的目標價和停損價，達到時卡片會顯示警報標籤")
+
+    # Telegram status banner
+    _tok = st.session_state.get("wl_tg_token","")
+    _cid = st.session_state.get("wl_tg_chat","")
+    if _tok and _cid:
+        st.success("📲 Telegram 推播已啟用 — 到價時自動發送通知（每次刷新自動檢查）")
+    else:
+        st.warning("📲 Telegram 未設定 — 在左側「📲 Telegram 到價提醒」填入 Token 和 Chat ID 即可啟用自動推播")
+
+    st.caption("設定每支股票的目標價和停損價，達到時卡片會顯示警報標籤並自動推播")
 
     # Edit targets
     with st.expander("✏️ 編輯目標價 / 停損價", expanded=True):
