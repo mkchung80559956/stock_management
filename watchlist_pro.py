@@ -237,19 +237,20 @@ with st.sidebar:
     st.divider()
     st.markdown("### 📤 匯出 / 📥 匯入")
     if all_codes:
+        import io as _io, openpyxl as _xl
         export_df = pd.DataFrame({
             "代號": all_codes,
             "名稱": [cn_name(c) for c in all_codes],
             "分組": [wl_get_group(c) for c in all_codes],
         })
-        buf = __import__("io").BytesIO()
-        with __import__("openpyxl").Workbook() as wb:
-            ws = wb.active
-            ws.title = "自選股"
-            ws.append(["代號","名稱","分組"])
-            for _, row in export_df.iterrows():
-                ws.append([row["代號"], row["名稱"], row["分組"]])
-            wb.save(buf)
+        buf = _io.BytesIO()
+        wb = _xl.Workbook()
+        ws = wb.active
+        ws.title = "自選股"
+        ws.append(["代號","名稱","分組"])
+        for _, row in export_df.iterrows():
+            ws.append([row["代號"], row["名稱"], row["分組"]])
+        wb.save(buf)
         buf.seek(0)
         st.download_button("📤 匯出 Excel", data=buf,
                            file_name=f"watchlist_{tw_now().strftime('%Y%m%d')}.xlsx",
