@@ -422,12 +422,12 @@ with tab_cards:
                   </div>
                   <div style="color:#8a9bb5;font-size:0.8rem;margin-bottom:8px">{cn_name(code)}</div>
                   <div style="font-size:1.4rem;font-weight:700;color:{clr};margin-bottom:4px">
-                    {price:.2f if price else '─'}
+                    {price_txt}
                     <span style="font-size:0.85rem">{chg_txt}</span>
                   </div>
                   <div style="display:flex;gap:10px;font-size:0.72rem;color:#37474f">
-                    <span>H {high:.2f if high else '─'}</span>
-                    <span>L {low:.2f if low else '─'}</span>
+                    <span>H {high_txt}</span>
+                    <span>L {low_txt}</span>
                     {"<span>🎯 " + str(target) + "</span>" if target else ""}
                     {"<span>🛑 " + str(stop) + "</span>" if stop else ""}
                   </div>
