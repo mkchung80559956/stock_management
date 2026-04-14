@@ -1096,7 +1096,28 @@ with tab_port:
         imp_file = st.file_uploader("選擇 Excel 檔案", type=["xlsx","xls"], key="port_imp")
         if imp_file:
             try:
-                df_imp = pd.read_excel(imp_file)
+                # Auto-detect header row: try row 0 first, then row 1
+                # Handles files with a title row above the actual headers
+                df_imp = None
+                for header_row in [0, 1, 2]:
+                    try:
+                        df_try = pd.read_excel(imp_file, header=header_row)
+                        # Check if standard columns are present
+                        cols_str = " ".join(str(c) for c in df_try.columns)
+                        if any(k in cols_str for k in ["商品","交易日","代號","日期"]):
+                            df_imp = df_try
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        imp_file.seek(0)
+                    except Exception:
+                        pass
+                if df_imp is None:
+                    # Last resort: just read with header=0
+                    try: imp_file.seek(0)
+                    except Exception: pass
+                    df_imp = pd.read_excel(imp_file, header=0)
                 # Flexible column mapping
                 col_map = {
                     "商品": ["商品","股票","代號","名稱"],
@@ -1298,11 +1319,54 @@ with tab_port:
         st.markdown("#### 📊 同步到 Google Sheets")
         st.caption("格式與系統一致：商品|交易日|交易別|股數|成交價|價金|手續費|交易稅|備註")
 
+        # Read GS credentials from Streamlit Secrets if available
+        _gs_sec = {}
+        try: _gs_sec = st.secrets.get("gsheets", {})
+        except Exception: pass
+
         gs_col1, gs_col2 = st.columns(2)
-        gs_sheet = gs_col1.text_input("Sheet ID", key="port_gs_id",
-            placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms")
-        gs_token = gs_col2.text_input("OAuth Bearer Token", type="password",
-            key="port_gs_token", placeholder="ya29.xxx")
+        gs_sheet = gs_col1.text_input("Sheet ID",
+            value=_gs_sec.get("sheet_id", ""),
+            key="port_gs_id",
+            help="從 Google Sheets URL 取得：\nhttps://docs.google.com/spreadsheets/d/【這段就是Sheet ID】/edit",
+            placeholder="1BxiMVs0XRA5nFMdK...")
+        gs_token = gs_col2.text_input("OAuth Bearer Token",
+            value=_gs_sec.get("token", ""),
+            type="password", key="port_gs_token",
+            help="從 Google OAuth Playground 取得（ya29.xxx），有效期1小時\nhttps://developers.google.com/oauthplayground",
+            placeholder="ya29.xxx")
+
+        # Show secret storage instructions
+        with st.expander("🔐 如何安全儲存這兩個設定（不需要每次輸入）"):
+            st.markdown("""
+**最安全的方法：存入 Streamlit Cloud Secrets**
+
+1. 進入 Streamlit Cloud → 你的 Watchlist App → `⋮` 右上角 → **Settings** → **Secrets**
+2. 貼上以下格式：
+
+```toml
+[gsheets]
+sheet_id = "你的Sheet ID"
+token    = "ya29.你的OAuth Token"
+```
+
+3. 儲存後 App 自動讀取，**不需要輸入，也不會進入 GitHub**
+
+**取得 Sheet ID**
+```
+URL 範例：
+https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms/edit
+                                       ↑ 這一段就是 Sheet ID
+```
+
+**取得 OAuth Token（每小時需更新）**
+1. 開啟 https://developers.google.com/oauthplayground
+2. 右上角齒輪 → 勾選「Use your own OAuth credentials」（或直接用預設）
+3. 左側選 `Google Sheets API v4` → `https://www.googleapis.com/auth/spreadsheets`
+4. 按 **Authorize APIs** → 登入 Google 帳號
+5. 按 **Exchange authorization code for tokens**
+6. 複製 **Access token**（以 ya29. 開頭）
+""")
 
         if st.button("⬆️ 上傳買賣記錄到 Google Sheets", key="port_gs_push",
                      width="stretch"):
@@ -1312,7 +1376,7 @@ with tab_port:
                 st.success("✅ 已上傳到 Portfolio 工作表")
             else:
                 st.error(f"❌ {err}")
-                st.caption("需要 OAuth Bearer Token (ya29.xxx)，可從 Google OAuth Playground 取得")
+                st.caption("需要 OAuth Bearer Token (ya29.xxx)，API Key 無法寫入")
 
         # ── SECTION E: Export & Delete ───────────────────
         st.divider()
