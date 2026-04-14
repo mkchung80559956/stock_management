@@ -5,7 +5,6 @@ Shared watchlist via /tmp/shared_watchlist.json
 """
 import streamlit as st
 import pandas as pd
-import numpy as np
 import yfinance as yf
 import json
 import os
@@ -220,6 +219,18 @@ with st.sidebar:
                 st.rerun()
             else:
                 st.warning(f"{c} 已在清單中")
+
+    st.divider()
+    st.markdown("### 🗑 刪除股票")
+    all_codes_del = wl_get()
+    if all_codes_del:
+        del_code = st.selectbox("選擇要刪除的股票", all_codes_del,
+                                 format_func=lambda x: f"{x} {cn_name(x)}",
+                                 key="del_code")
+        if st.button("🗑 從清單移除", width="stretch", key="del_btn"):
+            if wl_remove(del_code):
+                st.success(f"已移除 {del_code}")
+                st.rerun()
 
     st.divider()
     st.markdown("### 🗂 管理分組")
