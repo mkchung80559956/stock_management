@@ -48,105 +48,279 @@ _ALERT_FILE   = "/tmp/wlpro_alerts_sent.json"
 # ══════════════════════════════════════════════
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
 
+/* ═══ TOKENS ═══ */
 :root {
-  --bg:       #080c14;
-  --bg2:      #0d1420;
-  --bg3:      #111d2e;
-  --border:   #1a2d44;
-  --border2:  #243d5c;
-  --text:     #cdd9e8;
-  --muted:    #5d7a94;
-  --accent:   #00c8ff;
-  --green:    #00e676;
-  --red:      #ff4455;
-  --gold:     #ffd600;
-  --orange:   #ff9100;
-  --mono:     'IBM Plex Mono', monospace;
-  --sans:     'IBM Plex Sans', sans-serif;
+  --bg0:     #04070f;
+  --bg1:     #080d18;
+  --bg2:     #0c1220;
+  --bg3:     #101928;
+  --bg4:     #162035;
+  --glass:   rgba(16,25,40,0.85);
+  --line:    rgba(0,200,255,0.12);
+  --line2:   rgba(0,200,255,0.06);
+  --text:    #dce8f5;
+  --muted:   #4d6880;
+  --dim:     #253545;
+  --accent:  #00c8ff;
+  --green:   #00f5a0;
+  --red:     #ff3b52;
+  --gold:    #ffc94d;
+  --orange:  #ff8c42;
+  --purple:  #a78bfa;
+  --mono:    'JetBrains Mono', monospace;
+  --sans:    'Space Grotesk', sans-serif;
+  --r4: 4px; --r8: 8px; --r12: 12px;
 }
 
-html, body, .stApp          { background: var(--bg) !important; color: var(--text); font-family: var(--sans); }
-.stApp > div                { background: var(--bg) !important; }
-section[data-testid="stSidebar"] { background: var(--bg2) !important; border-right: 1px solid var(--border); }
+/* ═══ RESET ═══ */
+html, body, .stApp, [data-testid="stAppViewContainer"],
+[data-testid="stMain"] > div { background: var(--bg0) !important; }
+* { font-family: var(--sans) !important; box-sizing: border-box; }
+code, .mono { font-family: var(--mono) !important; }
+
+/* ═══ SCROLLBAR ═══ */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--bg1); }
+::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 2px; }
+
+/* ═══ SIDEBAR ═══ */
+section[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, var(--bg1) 0%, var(--bg0) 100%) !important;
+  border-right: 1px solid var(--line) !important;
+  backdrop-filter: blur(12px);
+}
 section[data-testid="stSidebar"] * { color: var(--text) !important; }
+section[data-testid="stSidebar"] > div { padding-top: 1rem !important; }
 
-/* Tabs */
-.stTabs [data-baseweb="tab-list"]            { background: var(--bg2); border-bottom: 1px solid var(--border); gap: 0; padding: 0 8px; }
-.stTabs [data-baseweb="tab"]                  { font-family: var(--mono); font-size: 0.78rem; letter-spacing: 0.08em; color: var(--muted) !important; padding: 10px 18px; border-bottom: 2px solid transparent; }
-.stTabs [aria-selected="true"]               { color: var(--accent) !important; border-bottom: 2px solid var(--accent) !important; background: transparent !important; }
-.stTabs [data-baseweb="tab-panel"]           { padding-top: 20px; }
-
-/* Metrics */
-div[data-testid="stMetric"]                  { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
-div[data-testid="stMetricValue"]             { font-family: var(--mono) !important; font-size: 1.3rem !important; color: var(--text) !important; }
-div[data-testid="stMetricLabel"]             { font-size: 0.72rem !important; color: var(--muted) !important; letter-spacing: 0.06em; text-transform: uppercase; }
-div[data-testid="stMetricDelta"]             { font-size: 0.8rem !important; }
-
-/* DataFrames */
-.stDataFrame                                  { border: 1px solid var(--border) !important; border-radius: 8px; overflow: hidden; }
-.stDataFrame th                               { background: var(--bg3) !important; color: var(--muted) !important; font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; }
-.stDataFrame td                               { color: var(--text) !important; font-size: 0.82rem; }
-
-/* Buttons */
-.stButton > button                            { font-family: var(--mono) !important; font-size: 0.78rem; letter-spacing: 0.06em; background: var(--bg3) !important; border: 1px solid var(--border2) !important; color: var(--text) !important; border-radius: 6px; transition: all 0.15s; }
-.stButton > button:hover                      { border-color: var(--accent) !important; color: var(--accent) !important; }
-.stButton > button[kind="primary"]            { background: rgba(0,200,255,0.12) !important; border-color: var(--accent) !important; color: var(--accent) !important; }
-
-/* Inputs */
-.stTextInput input, .stNumberInput input, .stTextArea textarea, .stSelectbox select {
-  background: var(--bg3) !important; border: 1px solid var(--border) !important;
-  color: var(--text) !important; font-family: var(--mono); border-radius: 6px;
+/* ═══ TABS ═══ */
+.stTabs [data-baseweb="tab-list"] {
+  background: transparent !important;
+  border-bottom: 1px solid var(--line) !important;
+  gap: 0; padding: 0;
 }
-.stTextInput input:focus, .stNumberInput input:focus { border-color: var(--accent) !important; box-shadow: 0 0 0 2px rgba(0,200,255,0.15) !important; }
+.stTabs [data-baseweb="tab"] {
+  font-family: var(--mono) !important;
+  font-size: 0.72rem !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.1em;
+  color: var(--muted) !important;
+  padding: 10px 16px !important;
+  border: none !important;
+  border-bottom: 2px solid transparent !important;
+  background: transparent !important;
+  text-transform: uppercase;
+  transition: color 0.2s, border-color 0.2s;
+}
+.stTabs [aria-selected="true"] {
+  color: var(--accent) !important;
+  border-bottom: 2px solid var(--accent) !important;
+}
+.stTabs [data-baseweb="tab-panel"] { padding-top: 20px !important; }
 
-/* Expanders */
-.streamlit-expanderHeader { background: var(--bg3) !important; border: 1px solid var(--border) !important; border-radius: 8px; font-family: var(--mono); font-size: 0.82rem; color: var(--muted) !important; }
-.streamlit-expanderContent { background: var(--bg2) !important; border: 1px solid var(--border); border-top: none; border-radius: 0 0 8px 8px; }
+/* ═══ METRICS ═══ */
+div[data-testid="stMetric"] {
+  background: var(--bg2) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--r8) !important;
+  padding: 14px 16px !important;
+  position: relative; overflow: hidden;
+}
+div[data-testid="stMetric"]::before {
+  content: '';
+  position: absolute; top: 0; left: 0;
+  width: 3px; height: 100%;
+  background: linear-gradient(180deg, var(--accent), transparent);
+}
+div[data-testid="stMetricLabel"] {
+  font-family: var(--mono) !important;
+  font-size: 0.65rem !important;
+  color: var(--muted) !important;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+div[data-testid="stMetricValue"] {
+  font-family: var(--mono) !important;
+  font-size: 1.25rem !important;
+  font-weight: 700 !important;
+  color: var(--text) !important;
+}
 
-/* Alerts */
-.stSuccess, .stInfo, .stWarning, .stError { font-family: var(--mono); font-size: 0.8rem; border-radius: 6px; }
+/* ═══ DATAFRAME ═══ */
+.stDataFrame iframe { border: none !important; }
+.stDataFrame [data-testid="stDataFrameResizable"] {
+  border: 1px solid var(--line) !important;
+  border-radius: var(--r8) !important;
+  overflow: hidden;
+}
 
-/* Hide Streamlit chrome */
-#MainMenu { display: none !important; }
-footer    { display: none !important; }
-[data-testid="stToolbar"]      { display: none !important; }
-[data-testid="stDecoration"]   { display: none !important; }
-[data-testid="stStatusWidget"] { display: none !important; }
+/* ═══ BUTTONS ═══ */
+.stButton > button {
+  font-family: var(--mono) !important;
+  font-size: 0.78rem !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.06em !important;
+  text-transform: uppercase !important;
+  background: var(--bg3) !important;
+  border: 1px solid var(--dim) !important;
+  color: var(--muted) !important;
+  border-radius: var(--r8) !important;
+  min-height: 44px !important;
+  transition: all 0.15s ease !important;
+}
+.stButton > button:hover {
+  border-color: var(--accent) !important;
+  color: var(--accent) !important;
+  background: rgba(0,200,255,0.06) !important;
+  box-shadow: 0 0 16px rgba(0,200,255,0.12) !important;
+}
+.stButton > button[kind="primary"] {
+  background: linear-gradient(135deg, rgba(0,200,255,0.15), rgba(0,200,255,0.08)) !important;
+  border-color: var(--accent) !important;
+  color: var(--accent) !important;
+  box-shadow: 0 0 20px rgba(0,200,255,0.1) !important;
+  min-height: 50px !important;
+  font-size: 0.85rem !important;
+}
+.stButton > button[kind="primary"]:hover {
+  background: linear-gradient(135deg, rgba(0,200,255,0.25), rgba(0,200,255,0.12)) !important;
+  box-shadow: 0 0 30px rgba(0,200,255,0.2) !important;
+}
 
-/* Layout */
-.block-container { padding-top: 12px !important; padding-left: 1rem !important;
-  padding-right: 1rem !important; max-width: 1400px; }
+/* ═══ INPUTS ═══ */
+.stTextInput > label,
+.stSelectbox > label,
+.stNumberInput > label,
+.stTextArea > label { color: var(--muted) !important; font-size: 0.72rem !important; letter-spacing: 0.06em; }
+.stTextInput input, .stNumberInput input {
+  background: var(--bg3) !important;
+  border: 1px solid var(--dim) !important;
+  border-radius: var(--r8) !important;
+  color: var(--text) !important;
+  font-family: var(--mono) !important;
+  font-size: 0.95rem !important;
+  min-height: 46px !important;
+  padding: 0 14px !important;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.stTextInput input:focus, .stNumberInput input:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px rgba(0,200,255,0.12) !important;
+  outline: none !important;
+}
+.stTextArea textarea {
+  background: var(--bg3) !important;
+  border: 1px solid var(--dim) !important;
+  border-radius: var(--r8) !important;
+  color: var(--text) !important;
+  font-size: 0.88rem !important;
+}
+[data-baseweb="select"] > div {
+  background: var(--bg3) !important;
+  border: 1px solid var(--dim) !important;
+  border-radius: var(--r8) !important;
+  color: var(--text) !important;
+  min-height: 46px !important;
+}
+[data-baseweb="select"] > div:focus-within {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px rgba(0,200,255,0.1) !important;
+}
+[data-baseweb="popover"] { background: var(--bg3) !important; border: 1px solid var(--line) !important; }
+[role="option"] { background: var(--bg3) !important; color: var(--text) !important; }
+[role="option"]:hover { background: var(--bg4) !important; }
 
-/* Mobile responsive: stack columns on narrow screens */
+/* ═══ EXPANDERS ═══ */
+.streamlit-expanderHeader {
+  background: var(--bg2) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--r8) !important;
+  color: var(--muted) !important;
+  font-size: 0.8rem !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.04em;
+}
+.streamlit-expanderContent {
+  background: var(--bg1) !important;
+  border: 1px solid var(--line);
+  border-top: none;
+  border-radius: 0 0 var(--r8) var(--r8) !important;
+}
+
+/* ═══ ALERTS ═══ */
+.stSuccess { background: rgba(0,245,160,0.08) !important; border-left: 3px solid var(--green) !important; border-radius: var(--r8) !important; }
+.stInfo    { background: rgba(0,200,255,0.08) !important; border-left: 3px solid var(--accent) !important; border-radius: var(--r8) !important; }
+.stWarning { background: rgba(255,140,66,0.08) !important; border-left: 3px solid var(--orange) !important; border-radius: var(--r8) !important; }
+.stError   { background: rgba(255,59,82,0.08) !important; border-left: 3px solid var(--red) !important; border-radius: var(--r8) !important; }
+
+/* ═══ TOGGLE / CHECKBOX ═══ */
+[data-testid="stCheckbox"] label { color: var(--text) !important; }
+
+/* ═══ DIVIDER ═══ */
+hr { border-color: var(--line) !important; }
+
+/* ═══ HIDE CHROME ═══ */
+#MainMenu, footer { display: none !important; }
+[data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] { display: none !important; }
+
+/* ═══ LAYOUT ═══ */
+.block-container {
+  padding: 1rem 1.2rem 2rem 1.2rem !important;
+  max-width: 1200px !important;
+}
+
+/* ═══ MOBILE ═══ */
 @media (max-width: 640px) {
-  .block-container { padding-left: 0.5rem !important; padding-right: 0.5rem !important; }
-  .stTabs [data-baseweb="tab"] { padding: 8px 10px; font-size: 0.72rem; letter-spacing: 0.04em; }
-  div[data-testid="stMetric"]  { padding: 10px 12px; }
+  .block-container { padding: 0.75rem 0.6rem 1.5rem 0.6rem !important; }
+  .stTabs [data-baseweb="tab"] { padding: 8px 10px !important; font-size: 0.65rem !important; }
   div[data-testid="stMetricValue"] { font-size: 1.05rem !important; }
 }
 
-/* Make buttons bigger / easier to tap on mobile */
-.stButton > button { min-height: 42px; padding: 8px 16px; }
-.stButton > button[kind="primary"] { min-height: 48px; font-size: 0.9rem; }
+/* ═══ CUSTOM COMPONENTS ═══ */
+.price-card {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: var(--r12);
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  position: relative;
+  overflow: hidden;
+  transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+.price-card::after {
+  content: '';
+  position: absolute; top: 0; right: 0;
+  width: 40%; height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(0,200,255,0.02));
+  pointer-events: none;
+}
+.price-card.up   { border-left: 3px solid var(--red);    background: linear-gradient(135deg, rgba(255,59,82,0.06) 0%, var(--bg2) 60%); }
+.price-card.down { border-left: 3px solid var(--green);  background: linear-gradient(135deg, rgba(0,245,160,0.05) 0%, var(--bg2) 60%); }
+.price-card.flat { border-left: 3px solid var(--dim);    }
+.price-card.hit-target { border-left: 3px solid var(--gold);   background: linear-gradient(135deg, rgba(255,201,77,0.06) 0%, var(--bg2) 60%); }
+.price-card.hit-stop   { border-left: 3px solid var(--red);    background: linear-gradient(135deg, rgba(255,59,82,0.1)  0%, var(--bg2) 60%); }
 
-/* Inputs */
-.stTextInput input  { min-height: 44px; font-size: 0.95rem !important; }
-.stSelectbox select { min-height: 44px; }
-
-/* Custom card */
-.wl-card { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; transition: border-color 0.2s; }
-.wl-card:hover { border-color: var(--border2); }
-.wl-card.bull  { border-left: 3px solid var(--green); }
-.wl-card.bear  { border-left: 3px solid var(--red);   }
-.wl-card.flat  { border-left: 3px solid var(--muted); }
-.wl-card.alert-gold { border-left: 3px solid var(--gold); background: rgba(255,214,0,0.04); }
-.wl-card.alert-red  { border-left: 3px solid var(--red);  background: rgba(255,68,85,0.04); }
-
-/* Strategy decision card */
-.strat-card { border-radius: 10px; padding: 16px 20px; margin-bottom: 12px; font-family: var(--sans); }
-.ticker-mono { font-family: var(--mono); font-weight: 700; }
+.section-label {
+  font-family: var(--mono) !important;
+  font-size: 0.65rem;
+  color: var(--muted);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-bottom: 14px;
+  display: flex; align-items: center; gap: 10px;
+}
+.section-label::after {
+  content: '';
+  flex: 1; height: 1px;
+  background: linear-gradient(90deg, var(--line), transparent);
+}
+.strat-pill {
+  display: inline-flex; align-items: center;
+  padding: 3px 10px; border-radius: 20px;
+  font-size: 0.7rem; font-weight: 600; font-family: var(--mono);
+  letter-spacing: 0.06em;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -473,7 +647,7 @@ with st.sidebar:
     with st.expander("➕ 新增股票", expanded=True):
         nc = st.text_input("代號", placeholder="2330  /  3019  /  6415.TWO", label_visibility="collapsed")
         ng = st.selectbox("分組", PRESET_GROUPS, label_visibility="collapsed")
-        if st.button("新增", type="primary", use_container_width=True):
+        if st.button("新增", type="primary", width='stretch'):
             bare = nc.strip().upper().replace(".TW","").replace(".TWO","")
             if bare:
                 if wl_add(bare): wl_set_group(bare, ng); st.success(f"✓ {bare}  {cn(bare)}"); st.rerun()
@@ -484,13 +658,13 @@ with st.sidebar:
     if codes:
         with st.expander("🗑 移除股票"):
             dc = st.selectbox("選擇", codes, format_func=lambda x: f"{x}  {cn(x)}", label_visibility="collapsed")
-            if st.button("從清單移除", use_container_width=True):
+            if st.button("從清單移除", width='stretch'):
                 wl_remove(dc); st.success(f"已移除 {dc}"); st.rerun()
 
         with st.expander("🗂 調整分組"):
             mc = st.selectbox("股票", codes, format_func=lambda x:f"{x} {cn(x)}", key="mg_c", label_visibility="collapsed")
             mg = st.selectbox("分組", PRESET_GROUPS, key="mg_g", label_visibility="collapsed")
-            if st.button("更新", use_container_width=True):
+            if st.button("更新", width='stretch'):
                 wl_set_group(mc, mg); st.success("✓"); st.rerun()
 
     st.markdown('<div style="height:1px;background:#1a2d44;margin:16px 0"></div>', unsafe_allow_html=True)
@@ -510,7 +684,7 @@ with st.sidebar:
                        f'target="_blank" style="font-size:0.72rem;color:#00c8ff">'
                        f'↗ getUpdates（查 Chat ID）</a>', unsafe_allow_html=True)
         c1,c2 = st.columns(2)
-        if c1.button("測試", use_container_width=True):
+        if c1.button("測試", width='stretch'):
             ok,e = tg_send(tg_tok, tg_cid, f"✅ Watchlist Pro 推播測試\n{now_tw().strftime('%H:%M')}")
             (st.success("✓") if ok else st.error(e))
         near_alert = c2.checkbox("接近提醒", value=True)
@@ -532,7 +706,7 @@ with st.sidebar:
             st.download_button("↓ 匯出自選股 Excel", data=buf2,
                 file_name=f"watchlist_{today_str()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True)
+                width='stretch')
         uf = st.file_uploader("↑ 匯入 Excel", type=["xlsx"], label_visibility="collapsed")
         if uf:
             try:
@@ -553,7 +727,7 @@ with st.sidebar:
             secs = {"30秒":30,"1分":60,"5分":300}[ivl]
             st.markdown(f'<meta http-equiv="refresh" content="{secs}">', unsafe_allow_html=True)
             st.caption(f"每 {ivl} 自動刷新")
-    if st.button("↻ 立即刷新報價", use_container_width=True):
+    if st.button("↻ 立即刷新報價", width='stretch'):
         st.cache_data.clear(); st.rerun()
 
 # ══════════════════════════════════════════════════════════
@@ -564,7 +738,7 @@ with st.sidebar:
                 unsafe_allow_html=True)
     with st.expander("⚠️ 緊急重置", expanded=False):
         st.caption("若 App 卡住或資料異常，點此清除 /tmp 資料並重載")
-        if st.button("🗑 清除所有暫存資料", use_container_width=True, key="emergency_reset"):
+        if st.button("🗑 清除所有暫存資料", width='stretch', key="emergency_reset"):
             for f in [_WL_FILE, _NOTES_FILE, _PORT_FILE, _ALERT_FILE]:
                 try: os.remove(f)
                 except: pass
@@ -572,7 +746,7 @@ with st.sidebar:
             st.cache_resource.clear()
             st.success("已清除，重新載入中…")
             st.rerun()
-        if st.button("🔄 只清除自選股清單", use_container_width=True, key="reset_wl"):
+        if st.button("🔄 只清除自選股清單", width='stretch', key="reset_wl"):
             try: os.remove(_WL_FILE)
             except: pass
             st.cache_resource.clear()
@@ -596,7 +770,7 @@ if not codes:
                                   label_visibility="collapsed", key="inline_code")
         in_group = st.selectbox("分組", PRESET_GROUPS,
                                  label_visibility="collapsed", key="inline_group")
-        if st.button("➕  新增到自選股", type="primary", use_container_width=True, key="inline_add"):
+        if st.button("➕  新增到自選股", type="primary", width='stretch', key="inline_add"):
             bare = in_code.strip().upper().replace(".TW","").replace(".TWO","")
             if bare and _is_valid_code(bare):
                 wl_add(bare); wl_set_group(bare, in_group)
@@ -670,7 +844,7 @@ with tab_ov:
         m3.metric("🔴 上漲", sum(1 for r in valid if r["漲跌%"]>0))
         m4.metric("🟢 下跌", sum(1 for r in valid if r["漲跌%"]<0))
         st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
-        st.dataframe(df_ov, use_container_width=True, hide_index=True,
+        st.dataframe(df_ov, width='stretch', hide_index=True,
             column_config={
                 "漲跌%": st.column_config.NumberColumn(format="%+.2f%%"),
                 "上漲空間%": st.column_config.NumberColumn(format="%+.1f%%"),
@@ -698,12 +872,12 @@ with tab_card:
             tgt = n.get("target"); stp = n.get("stop")
             hi = q.get("hi",0);   lo  = q.get("lo",0)
 
-            if not q.get("ok"):    clr, card_cls = "#5d7a94", "flat"
-            elif chg > 0:          clr, card_cls = "#ff4455", "bull"
-            elif chg < 0:          clr, card_cls = "#00e676", "bear"
-            else:                  clr, card_cls = "#5d7a94", "flat"
-            if tgt and px and px>=tgt: card_cls = "alert-gold"
-            if stp and px and px<=stp: card_cls = "alert-red"
+            if not q.get("ok"):    clr, card_cls = "var(--muted)", "flat"
+            elif chg > 0:          clr, card_cls = "var(--red)",   "up"
+            elif chg < 0:          clr, card_cls = "var(--green)", "down"
+            else:                  clr, card_cls = "var(--muted)", "flat"
+            if tgt and px and px>=tgt: card_cls = "hit-target"; clr = "var(--gold)"
+            if stp and px and px<=stp: card_cls = "hit-stop";   clr = "var(--red)"
 
             chg_s  = f"+{chg:.2f}%" if chg>0 else f"{chg:.2f}%"
             px_s   = f"{px:.2f}"   if px  else "─"
@@ -749,12 +923,22 @@ with tab_mon:
                     q = Q[c]; chg=q["chg_p"]; px=q["px"]
                     c_icon = "▲" if chg>0 else "▼" if chg<0 else "─"
                     st.markdown(f"""
-<div style="background:#111d2e;border-left:3px solid {clr};
-  padding:8px 12px;border-radius:0 6px 6px 0;margin-bottom:6px;
-  display:flex;justify-content:space-between;align-items:center">
-  <span><span style="font-family:IBM Plex Mono;font-weight:700;color:#cdd9e8">{c}</span>
-  <span style="font-size:0.78rem;color:#5d7a94;margin-left:6px">{cn(c)}</span></span>
-  <span style="font-family:IBM Plex Mono;font-weight:700;color:{clr}">{c_icon} {chg:+.2f}%&nbsp;&nbsp;{px:.2f}</span>
+<div style="background:var(--bg2);border-left:3px solid {clr};
+  padding:10px 14px;border-radius:0 var(--r8) var(--r8) 0;margin-bottom:8px;
+  display:flex;justify-content:space-between;align-items:center;
+  border-top:1px solid var(--line2);border-right:1px solid var(--line2);
+  border-bottom:1px solid var(--line2)">
+  <span>
+    <span style="font-family:var(--mono);font-weight:700;color:var(--text);
+      font-size:0.88rem">{c}</span>
+    <span style="font-size:0.75rem;color:var(--muted);margin-left:8px;
+      font-weight:500">{cn(c)}</span>
+  </span>
+  <span style="font-family:var(--mono);font-weight:700;color:{clr};font-size:0.88rem;
+    display:flex;gap:10px;align-items:center">
+    <span>{chg:+.2f}%</span>
+    <span style="color:var(--text)">{px:.2f}</span>
+  </span>
 </div>""", unsafe_allow_html=True)
 
     st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
@@ -795,7 +979,7 @@ with tab_mon:
             legend=dict(orientation="h",y=1.02))
         fig.update_yaxes(gridcolor="#111d2e",showgrid=True)
         fig.update_xaxes(gridcolor="#111d2e",showgrid=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         last_vol = df_h["Volume"].iloc[-1]
         if last_vol > vol_avg*2:
             st.warning(f"⚠️ 今日成交量 {last_vol:,.0f}，為近期均量 {last_vol/vol_avg:.1f} 倍 — 異常放量")
@@ -828,7 +1012,7 @@ with tab_note:
                "標籤":"、".join(note_get(c).get("tags",[])),
                "均價":note_get(c).get("entry",""),"關注日":note_get(c).get("watch_date","")}
              for c in codes if note_get(c).get("note") or note_get(c).get("tags")]
-    if nrows: st.dataframe(pd.DataFrame(nrows), use_container_width=True, hide_index=True)
+    if nrows: st.dataframe(pd.DataFrame(nrows), width='stretch', hide_index=True)
     else: st.info("尚無備忘記錄")
 
 # ────────────────────────────────────────────────────────
@@ -875,7 +1059,7 @@ with tab_alert:
                          "上漲空間":f"{up3:+.1f}%" if up3 is not None else None,
                          "狀態":" ".join(st_list)})
     if al_rows:
-        st.dataframe(pd.DataFrame(al_rows), use_container_width=True, hide_index=True,
+        st.dataframe(pd.DataFrame(al_rows), width='stretch', hide_index=True,
                      column_config={"現價":st.column_config.NumberColumn(format="%.2f")})
         triggered = [r for r in al_rows if "已達" in r["狀態"] or "跌破" in r["狀態"]]
         if triggered:
@@ -932,7 +1116,7 @@ with tab_port:
                         if col not in df_m: df_m[col] = 0 if col in ["股數","成交價","價金","手續費","交易稅"] else ""
                     for nc in ["股數","成交價","價金","手續費","交易稅"]:
                         df_m[nc]=pd.to_numeric(df_m[nc],errors="coerce").fillna(0)
-                    st.dataframe(df_m.head(8), use_container_width=True, hide_index=True)
+                    st.dataframe(df_m.head(8), width='stretch', hide_index=True)
                     if st.button("✅ 確認匯入", type="primary"):
                         port_save(df_m.to_dict("records")); st.success(f"已匯入 {len(df_m)} 筆"); st.rerun()
             except Exception as e: st.error(str(e))
@@ -1002,7 +1186,7 @@ with tab_port:
         tbl = pd.DataFrame([{"代號":e["code"],"名稱":e["name"],"持股":e["held"],
             "均成本":e["avg"],"現價":e["cur_px"],"損益%":e["unrl_p"],
             "損益(元)":e["unrl"],"建議":e["action"],"緊急":e["urgency"]} for e in evals])
-        st.dataframe(tbl,use_container_width=True,hide_index=True,
+        st.dataframe(tbl,width='stretch',hide_index=True,
             column_config={"損益%":st.column_config.NumberColumn(format="%+.2f%%"),
                            "損益(元)":st.column_config.NumberColumn(format="$%+,.0f")})
 
@@ -1015,30 +1199,43 @@ with tab_port:
         for ev in sorted(evals, key=lambda e: urg_ord.get(e["urgency"],4)):
             pnl_c = "#00e676" if ev["unrl_p"]>=0 else "#ff4455"
             urg_label = {"URGENT":"🔴 立即處理","HIGH":"🟠 本週處理","MED":"🟡 注意觀察","LOW":"⚪ 持續觀察"}.get(ev["urgency"],"")
+            clr_hex = ev['color'] if ev['color'].startswith('#') else '#00c8ff'
+            r,g,b = int(clr_hex[1:3],16),int(clr_hex[3:5],16),int(clr_hex[5:7],16)
+            rgb = f"{r},{g},{b}"
             st.markdown(f"""
-<div style="background:#0d1420;border:1px solid {ev['color']}40;border-left:3px solid {ev['color']};
-  border-radius:8px;padding:16px 18px;margin-bottom:12px">
-  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+<div style="background:linear-gradient(135deg,rgba({rgb},0.06) 0%,var(--bg2) 50%);
+  border:1px solid rgba({rgb},0.2);border-left:3px solid {ev['color']};
+  border-radius:var(--r12);padding:16px 18px;margin-bottom:14px">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;margin-bottom:10px">
     <div>
-      <span class="ticker-mono" style="color:#cdd9e8;font-size:1rem">{ev['code']}</span>
-      <span style="color:#5d7a94;font-size:0.82rem;margin-left:8px">{ev['name']}</span>
+      <span style="font-family:var(--mono);font-size:0.95rem;font-weight:700;color:var(--text)">{ev['code']}</span>
+      <span style="font-size:0.8rem;color:var(--muted);margin-left:8px">{ev['name']}</span>
     </div>
-    <div style="display:flex;gap:10px;align-items:center">
-      <span style="font-size:0.72rem;color:{ev['color']};border:1px solid {ev['color']}60;
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span style="font-size:0.68rem;font-weight:600;color:{ev['color']};font-family:var(--mono);
+        background:rgba({rgb},0.12);border:1px solid rgba({rgb},0.3);
         padding:2px 10px;border-radius:12px">{urg_label}</span>
-      <span style="font-family:IBM Plex Mono;font-size:1rem;font-weight:700;color:{ev['color']}">{ev['action']}</span>
+      <span style="font-family:var(--mono);font-weight:700;color:{ev['color']};font-size:0.9rem">{ev['action']}</span>
     </div>
   </div>
-  <div style="font-size:0.82rem;color:#8a9bb5;border-left:2px solid {ev['color']}40;
-    padding-left:10px;margin-bottom:10px;line-height:1.6">{ev['reason']}</div>
-  <div style="display:flex;gap:16px;font-size:0.75rem;flex-wrap:wrap;font-family:IBM Plex Mono">
-    <span style="color:#5d7a94">持股 <b style="color:#cdd9e8">{ev['held']:,}</b></span>
-    <span style="color:#5d7a94">均成本 <b style="color:#cdd9e8">{ev['avg']:.2f}</b></span>
-    <span style="color:#5d7a94">現價 <b style="color:#cdd9e8">{ev['cur_px']:.2f}</b></span>
-    <span style="color:#5d7a94">損益 <b style="color:{pnl_c}">{ev['unrl_p']:+.1f}% ({ev['unrl']:+,.0f})</b></span>
-    <span style="color:#5d7a94">停損 <b style="color:#ff4455">{ev['stop7']}</b></span>
+  <div style="font-size:0.82rem;color:var(--muted);line-height:1.65;
+    padding:10px 12px;background:var(--bg1);border-radius:var(--r8);
+    margin-bottom:12px;border-left:2px solid rgba({rgb},0.35)">{ev['reason']}</div>
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;
+    font-family:var(--mono);font-size:0.7rem">
+    {"".join([
+      f'<div style="background:var(--bg1);padding:6px 8px;border-radius:var(--r4);border:1px solid var(--line2);text-align:center"><div style="color:var(--muted);font-size:0.58rem;text-transform:uppercase">{label}</div><div style="color:{color};font-weight:700;margin-top:3px">{val}</div></div>'
+      for label,val,color in [
+        ("持股",f"{ev['held']:,}","var(--text)"),
+        ("均成本",f"{ev['avg']:.2f}","var(--text)"),
+        ("現價",f"{ev['cur_px']:.2f}","var(--text)"),
+        ("損益",f"{ev['unrl_p']:+.1f}%",pnl_c),
+        ("停損",f"{ev['stop7']}","var(--red)"),
+      ]
+    ])}
   </div>
-  <div style="font-size:0.7rem;color:#3d5470;margin-top:8px">{ev['dca']}&emsp;首買 {ev['first_buy']}</div>
+  <div style="font-size:0.65rem;color:var(--dim);margin-top:8px;padding-top:8px;
+    border-top:1px solid var(--line2)">{ev['dca']}  ·  首買 {ev['first_buy']}</div>
 </div>""", unsafe_allow_html=True)
 
     # ── GS SYNC ──
@@ -1082,12 +1279,12 @@ https://docs.google.com/spreadsheets/d/【ID在這裡】/edit
 """)
 
     gc1,gc2,gc3 = st.columns(3)
-    if gc1.button("⬆️ 同步到 Google Sheets", type="primary", use_container_width=True):
+    if gc1.button("⬆️ 同步到 Google Sheets", type="primary", width='stretch'):
         with st.spinner("上傳中…"):
             ok,err = gs_push(gs_id, gs_tok, trades_all)
         st.success("✅ 已同步到 Portfolio 工作表") if ok else st.error(f"❌ {err}")
 
-    if gc2.button("📲 推播策略到 Telegram", use_container_width=True):
+    if gc2.button("📲 推播策略到 Telegram", width='stretch'):
         if not _tok or not _cid: st.warning("請先設定 Telegram")
         else:
             n_sent=0
@@ -1106,9 +1303,9 @@ https://docs.google.com/spreadsheets/d/【ID在這裡】/edit
             data=trades_to_excel(trades_all),
             file_name=f"portfolio_{today_str()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True)
+            width='stretch')
 
-    if st.button("🗑 清除所有交易記錄", use_container_width=True, key="clear_trades"):
+    if st.button("🗑 清除所有交易記錄", width='stretch', key="clear_trades"):
         port_save([]); st.rerun()
 
 # ══════════════════════════════════════════════════════════
