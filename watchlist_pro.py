@@ -624,7 +624,7 @@ st.markdown(f"""
 <div style="border-bottom:1px solid #1a2d44;padding-bottom:12px;margin-bottom:18px">
   <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
     <span style="font-family:'IBM Plex Mono',monospace;font-size:1.25rem;
-      font-weight:700;color:#cdd9e8">WATCHLIST&nbsp;<span style="color:#00c8ff">PRO</span></span>
+      font-weight:700;color:#cdd9e8">自選股&nbsp;<span style="color:#00c8ff">PRO</span></span>
     <span style="font-size:0.68rem;color:#5d7a94;letter-spacing:0.08em">
       v{APP_VERSION} &nbsp;·&nbsp; {now_tw().strftime("%m/%d %H:%M")}
     </span>
@@ -639,9 +639,9 @@ st.markdown(f"""
 # ──  SIDEBAR  ──
 # ══════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown('<div style="font-family:IBM Plex Mono;font-size:0.72rem;color:#5d7a94;'
+    st.markdown('<div style="font-family:var(--mono);font-size:0.66rem;color:var(--muted);'
                 'letter-spacing:0.1em;text-transform:uppercase;margin-bottom:12px">'
-                '◈ MANAGE WATCHLIST</div>', unsafe_allow_html=True)
+                '◈ 自選股管理</div>', unsafe_allow_html=True)
 
     # Add stock
     with st.expander("➕ 新增股票", expanded=True):
@@ -667,10 +667,7 @@ with st.sidebar:
             if st.button("更新", width='stretch'):
                 wl_set_group(mc, mg); st.success("✓"); st.rerun()
 
-    st.markdown('<div style="height:1px;background:#1a2d44;margin:16px 0"></div>', unsafe_allow_html=True)
-    st.markdown('<div style="font-family:IBM Plex Mono;font-size:0.72rem;color:#5d7a94;'
-                'letter-spacing:0.1em;text-transform:uppercase;margin-bottom:12px">'
-                '◈ NOTIFICATIONS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">◈ 推播通知</div>', unsafe_allow_html=True)
 
     # Telegram
     with st.expander("📲 Telegram 推播"):
@@ -689,10 +686,7 @@ with st.sidebar:
             (st.success("✓") if ok else st.error(e))
         near_alert = c2.checkbox("接近提醒", value=True)
 
-    st.markdown('<div style="height:1px;background:#1a2d44;margin:16px 0"></div>', unsafe_allow_html=True)
-    st.markdown('<div style="font-family:IBM Plex Mono;font-size:0.72rem;color:#5d7a94;'
-                'letter-spacing:0.1em;text-transform:uppercase;margin-bottom:12px">'
-                '◈ DATA</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">◈ 資料</div>', unsafe_allow_html=True)
 
     # Import/Export
     with st.expander("📁 匯入 / 匯出"):
@@ -730,27 +724,21 @@ with st.sidebar:
     if st.button("↻ 立即刷新報價", width='stretch'):
         st.cache_data.clear(); st.rerun()
 
-# ══════════════════════════════════════════════════════════
-# ──  EMERGENCY RESET — always visible, before any st.stop()  ──
-# ══════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown('<div style="height:1px;background:#1a2d44;margin:16px 0"></div>',
-                unsafe_allow_html=True)
+
+    # ── Emergency reset ──
+    st.markdown('<div style="height:1px;background:var(--line);margin:16px 0"></div>', unsafe_allow_html=True)
     with st.expander("⚠️ 緊急重置", expanded=False):
-        st.caption("若 App 卡住或資料異常，點此清除 /tmp 資料並重載")
+        st.caption("App 卡住或資料異常時使用")
         if st.button("🗑 清除所有暫存資料", width='stretch', key="emergency_reset"):
             for f in [_WL_FILE, _NOTES_FILE, _PORT_FILE, _ALERT_FILE]:
                 try: os.remove(f)
                 except: pass
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.success("已清除，重新載入中…")
-            st.rerun()
+            st.cache_data.clear(); st.cache_resource.clear()
+            st.success("已清除"); st.rerun()
         if st.button("🔄 只清除自選股清單", width='stretch', key="reset_wl"):
             try: os.remove(_WL_FILE)
             except: pass
-            st.cache_resource.clear()
-            st.rerun()
+            st.cache_resource.clear(); st.rerun()
 
 # ══════════════════════════════════════════════════════════
 # ──  GUARD: no stocks  ──
@@ -760,7 +748,7 @@ if not codes:
     st.markdown("""
     <div style="text-align:center;padding:40px 0 20px 0">
       <div style="font-family:'IBM Plex Mono',monospace;font-size:0.9rem;
-        color:#5d7a94;letter-spacing:0.12em">WATCHLIST EMPTY</div>
+        color:#5d7a94;letter-spacing:0.12em">自選股清單為空</div>
       <div style="color:#3d5470;font-size:0.82rem;margin-top:6px">新增股票代號開始使用</div>
     </div>""", unsafe_allow_html=True)
 
@@ -803,7 +791,7 @@ if _tok and _cid:
 # ──  TABS  ──
 # ══════════════════════════════════════════════════════════
 tab_ov, tab_card, tab_mon, tab_note, tab_alert, tab_port = st.tabs([
-    "OVERVIEW", "CARDS", "MONITOR", "NOTES", "ALERTS", "PORTFOLIO"
+    "📊 總覽", "🃏 卡片", "📈 監控", "📝 備忘", "🎯 警報", "💼 持倉"
 ])
 
 # ────────────────────────────────────────────────────────
@@ -811,11 +799,11 @@ tab_ov, tab_card, tab_mon, tab_note, tab_alert, tab_port = st.tabs([
 # ────────────────────────────────────────────────────────
 with tab_ov:
     grp_all = sorted(set(wl_group(c) for c in codes))
-    fg = st.selectbox("分組篩選", ["ALL"] + grp_all, label_visibility="collapsed", key="ov_grp")
+    fg = st.selectbox("分組篩選", ["全部"] + grp_all, label_visibility="collapsed", key="ov_grp")
 
     rows = []
     for c in codes:
-        if fg != "ALL" and wl_group(c) != fg: continue
+        if fg != "全部" and wl_group(c) != fg: continue
         q = Q.get(c,{}); n = note_get(c)
         px = q.get("px",0); chg = q.get("chg_p",0)
         tgt = n.get("target"); stp = n.get("stop")
@@ -1007,7 +995,7 @@ with tab_note:
             st.success("✓ 已儲存")
     st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
     st.markdown('<div style="font-size:0.72rem;color:#5d7a94;letter-spacing:0.1em;'
-                'text-transform:uppercase;margin-bottom:10px">ALL NOTES</div>', unsafe_allow_html=True)
+                'text-transform:uppercase;margin-bottom:10px">所有備忘記錄</div>', unsafe_allow_html=True)
     nrows = [{"代號":c,"名稱":cn(c),"備忘":note_get(c).get("note","")[:40],
                "標籤":"、".join(note_get(c).get("tags",[])),
                "均價":note_get(c).get("entry",""),"關注日":note_get(c).get("watch_date","")}
@@ -1146,8 +1134,7 @@ with tab_port:
 
     # ── ANALYSIS & STRATEGY ──
     st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
-    st.markdown('<div style="font-size:0.72rem;color:#5d7a94;letter-spacing:0.1em;'
-                'text-transform:uppercase;margin-bottom:14px">POSITION ANALYSIS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">持倉損益分析</div>', unsafe_allow_html=True)
 
     def _valid_code(raw):
         """Only accept codes that are purely numeric (Taiwan stock codes are digits only)."""
@@ -1192,7 +1179,7 @@ with tab_port:
 
         st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
         st.markdown('<div style="font-size:0.72rem;color:#5d7a94;letter-spacing:0.1em;'
-                    'text-transform:uppercase;margin-bottom:14px">STRATEGY RECOMMENDATIONS</div>',
+                    'text-transform:uppercase;margin-bottom:14px">策略建議</div>',
                     unsafe_allow_html=True)
 
         urg_ord = {"URGENT":0,"HIGH":1,"MED":2,"LOW":3}
@@ -1240,8 +1227,7 @@ with tab_port:
 
     # ── GS SYNC ──
     st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
-    st.markdown('<div style="font-size:0.72rem;color:#5d7a94;letter-spacing:0.1em;'
-                'text-transform:uppercase;margin-bottom:14px">SYNC & EXPORT</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">同步 & 匯出</div>', unsafe_allow_html=True)
     pc1,pc2 = st.columns(2)
     _gs_s = {}
     try: _gs_s = st.secrets.get("gsheets",{})
@@ -1315,10 +1301,10 @@ st.markdown(f"""
 <div style="border-top:1px solid #1a2d44;margin-top:24px;padding-top:12px;
   display:flex;justify-content:space-between;align-items:center">
   <div style="font-family:IBM Plex Mono;font-size:0.68rem;color:#3d5470">
-    WATCHLIST PRO v{APP_VERSION}  ·  {len(codes)} STOCKS  ·  {now_tw().strftime("%H:%M:%S")} CST
+    自選股 PRO v{APP_VERSION}  ·  {len(codes)} STOCKS  ·  {now_tw().strftime("%H:%M:%S")} CST
   </div>
   <div style="font-family:IBM Plex Mono;font-size:0.68rem;color:#3d5470">
-    SENTINEL PRO COMPANION
+    哨兵系統配套工具
   </div>
 </div>
 """, unsafe_allow_html=True)
