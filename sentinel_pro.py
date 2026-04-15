@@ -18,8 +18,8 @@ import re as _re
 import urllib.request as _urllib_req
 import urllib.parse  as _urllib_parse
 
-APP_VERSION   = "3.0"
-APP_UPDATED   = "2026-04-12"   # ← bump this string on every update
+APP_VERSION   = "3.1"
+APP_UPDATED   = "2026-04-15"   # ← bump this string on every update
 import warnings
 import logging
 import pytz
@@ -256,45 +256,50 @@ def calc_trend_score(df: pd.DataFrame) -> pd.Series:
     原理：只在中期上升趨勢中買入，可剔除逆勢假訊號、大幅降低接刀風險。
     研究顯示趨勢過濾可使勝率提升 15-25%。
 
-    +3 = 強多頭：Price > EMA20 > EMA60，EMA20 斜率為正
-    +2 = 多頭：Price > EMA20 > EMA60
-    +1 = 弱多頭：Price > EMA60 but EMA20 < EMA60（橫盤）
-     0 = 中性：Price 介於 EMA20 / EMA60 之間
-    -1 = 弱空頭：Price < EMA60
-    -2 = 強空頭：Price < EMA20 < EMA60，EMA20 斜率為負
+    EMA200 (年線) 作為主要多空分界：
+    +3 = 強多頭：Price > EMA20 > EMA60，且 Price > EMA200，EMA20 斜率為正
+    +2 = 多頭：Price > EMA20 > EMA60，且 Price > EMA200
+    +1 = 弱多頭：Price > EMA60 > EMA200（橫盤但仍在年線上）
+     0 = 中性：Price 介於 EMA20/EMA60 之間，或剛好貼近 EMA200
+    -1 = 弱空頭：Price < EMA60 但 > EMA200（短期偏弱，長期仍多）
+    -2 = 強空頭：Price < EMA200（跌破年線，逆勢）
     """
     score = pd.Series(0, index=df.index)
     if "EMA1" not in df.columns or "EMA2" not in df.columns or "EMA60" not in df.columns:
         return score
 
-    price = df["Close"]
-    ema20 = df["EMA2"]     # EMA2 = 20-period EMA (default)
-    ema60 = df["EMA60"]
+    price  = df["Close"]
+    ema20  = df["EMA2"]      # EMA2 = 20-period EMA (default)
+    ema60  = df["EMA60"]
+    # EMA200 (年線) — calculated here if not in columns
+    ema200 = df["EMA200"] if "EMA200" in df.columns else \
+             price.ewm(span=200, adjust=False).mean()
 
     # EMA20 斜率：過去 3 根平均方向
     ema20_slope = ema20.diff(3)
 
-    above60   = price > ema60
+    above200   = price > ema200
+    above60    = price > ema60
     ema20_gt60 = ema20 > ema60
 
-    # Strong uptrend
-    strong_up = above60 & ema20_gt60 & (ema20_slope > 0)
+    # Strong uptrend: all EMAs aligned + above 年線
+    strong_up = above200 & above60 & ema20_gt60 & (ema20_slope > 0)
     score[strong_up] = 3
 
-    # Normal uptrend
-    normal_up = above60 & ema20_gt60 & ~strong_up
+    # Normal uptrend: above 年線 + EMA20 > EMA60
+    normal_up = above200 & above60 & ema20_gt60 & ~strong_up
     score[normal_up] = 2
 
-    # Weak uptrend (price above EMA60 but EMA20 below)
-    weak_up = above60 & ~ema20_gt60
+    # Weak uptrend: above 年線, EMA60 > EMA20 (crossover zone)
+    weak_up = above200 & above60 & ~ema20_gt60
     score[weak_up] = 1
 
-    # Weak downtrend
-    weak_dn = ~above60 & ema20_gt60
+    # Neutral / mild pullback: below EMA60 but above 年線
+    weak_dn = above200 & ~above60
     score[weak_dn] = -1
 
-    # Strong downtrend
-    strong_dn = ~above60 & ~ema20_gt60 & (ema20_slope < 0)
+    # Strong downtrend: below 年線 (逆勢, 最強過濾)
+    strong_dn = ~above200
     score[strong_dn] = -2
 
     return score
@@ -596,6 +601,7 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     df["EMA1"]   = calc_ema(df["Close"], p["ema1"])
     df["EMA2"]   = calc_ema(df["Close"], p["ema2"])
     df["EMA60"]  = calc_ema(df["Close"], 60)          # ① medium-term trend anchor
+    df["EMA200"] = calc_ema(df["Close"], 200)          # ① long-term 年線 anchor (new)
     bb_u, bb_m, bb_l = calc_bb(df["Close"], p["bb_period"])
     df["BB_Upper"], df["BB_Mid"], df["BB_Lower"] = bb_u, bb_m, bb_l
     m, ms, mh = calc_macd(df["Close"], p["macd_fast"], p["macd_slow"], p["macd_signal"])
@@ -739,6 +745,30 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     df["Signal"]        = sig
     df["Signal_Detail"] = detail
     df["MomScore"]      = calc_momentum_score(df, p)
+
+    # ── Gap 2: Near-Resistance Filter ─────────────────────────────
+    # If price is within 3% below a resistance level, buy signals face a ceiling.
+    # Downgrade HIGH_CONF_BUY → BUY, BREAKOUT_BUY/STRONG_BUY → WATCH.
+    # This avoids entering right at supply zones where sellers are waiting.
+    try:
+        sr_levels = calc_support_resistance(df)
+        resist_levels = sr_levels.get("resistance", [])
+        if resist_levels:
+            near_resist = pd.Series(False, index=df.index)
+            for lvl in resist_levels:
+                # Within 3% below resistance = danger zone
+                near_resist |= (df["Close"] >= lvl * 0.97) & (df["Close"] <= lvl * 1.01)
+            # Downgrade buy signals that are in the resistance zone
+            in_resist_zone = near_resist & df["Signal"].isin(BUY_SIGNALS)
+            df.loc[in_resist_zone & (df["Signal"] == "HIGH_CONF_BUY"), "Signal_Detail"] = \
+                df.loc[in_resist_zone & (df["Signal"] == "HIGH_CONF_BUY"), "Signal_Detail"] + \
+                " ⚠️ 接近壓力區，謹慎"
+            df.loc[in_resist_zone & df["Signal"].isin({"BREAKOUT_BUY","STRONG_BUY"}), "Signal_Detail"] = \
+                df.loc[in_resist_zone & df["Signal"].isin({"BREAKOUT_BUY","STRONG_BUY"}), "Signal_Detail"] + \
+                " ⚠️ 壓力區買入風險高"
+            df["Near_Resist"] = near_resist   # expose for UI warning
+    except Exception:
+        df["Near_Resist"] = pd.Series(False, index=df.index)
 
     return df
 
@@ -1606,9 +1636,10 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
     ), row=1, col=1)
 
     for col_key, label, color, lw, dash in [
-        ("EMA1",  f"EMA{ema1_p}",  "#f0a500", 1.4, "solid"),
-        ("EMA2",  f"EMA{ema2_p}",  "#2196f3", 1.4, "solid"),
-        ("EMA60", "EMA60",          "#e040fb", 1.0, "dash"),
+        ("EMA1",   f"EMA{ema1_p}",  "#f0a500", 1.4, "solid"),
+        ("EMA2",   f"EMA{ema2_p}",  "#2196f3", 1.4, "solid"),
+        ("EMA60",  "EMA60",          "#e040fb", 1.0, "dash"),
+        ("EMA200", "EMA200 (年線)", "#ffd600", 1.2, "dashdot"),  # 年線 — golden
     ]:
         if col_key in df.columns:
             fig.add_trace(go.Scatter(
@@ -1935,10 +1966,43 @@ def tw_now() -> datetime:
     return datetime.now(_TZ_TW)
 
 
+def _tw_holidays_2026() -> set:
+    """
+    Taiwan Stock Exchange holidays 2026.
+    Source: TWSE official calendar (non-trading days beyond weekends).
+    Returns set of date strings "YYYY-MM-DD".
+    """
+    return {
+        # New Year
+        "2026-01-01",
+        # Lunar New Year (Spring Festival)
+        "2026-01-26","2026-01-27","2026-01-28","2026-01-29",
+        "2026-01-30","2026-01-31","2026-02-01","2026-02-02",
+        # Peace Memorial Day
+        "2026-02-27","2026-02-28",
+        # Children's Day / Tomb Sweeping
+        "2026-04-03","2026-04-04",
+        # Labour Day (if TWSE observes)
+        # Dragon Boat Festival
+        "2026-06-19",
+        # Mid-Autumn Festival
+        "2026-09-25",
+        # National Day
+        "2026-10-09","2026-10-10",
+    }
+
+def _is_tw_holiday(d=None) -> bool:
+    """Returns True if the given date (default: today) is a Taiwan public holiday."""
+    if d is None:
+        d = tw_now().date()
+    return d.strftime("%Y-%m-%d") in _tw_holidays_2026()
+
 def is_market_open() -> bool:
-    """台股盤中：週一到週五 09:00–13:30 台北時間"""
+    """台股盤中：週一到週五 09:00–13:30 台北時間，排除國定假日"""
     now = tw_now()
     if now.weekday() >= 5:          # Saturday / Sunday
+        return False
+    if _is_tw_holiday(now.date()):  # Taiwan public holiday
         return False
     t = now.time()
     import datetime as _dt
@@ -1946,8 +2010,11 @@ def is_market_open() -> bool:
 
 
 def is_market_day() -> bool:
-    """今天是台股交易日（不含假日，僅排除週末）"""
-    return tw_now().weekday() < 5
+    """今天是台股交易日（排除週末 + 國定假日）"""
+    now = tw_now()
+    if now.weekday() >= 5: return False
+    if _is_tw_holiday(now.date()): return False
+    return True
 
 
 def seconds_to_next_refresh(last_ts: str, interval: int = AUTO_REFRESH_INTERVAL) -> int:
@@ -3651,6 +3718,10 @@ def main():
                 win_rate   = opt.get("win_rate",   bt["win_rate"])   if opt.get("optimised") else bt["win_rate"]
                 avg_return = opt.get("avg_return", bt["avg_return"]) if opt.get("optimised") else bt["avg_return"]
 
+                # Resistance zone flag from Gap 2 filter
+                near_resist_flag = bool(latest.get("Near_Resist", False)) \
+                    if "Near_Resist" in df_sig.columns else False
+
                 rows.append({
                     "代號":     bare,
                     "名稱":     cn_name,
@@ -3671,6 +3742,7 @@ def main():
                     "止損說明": sl_label,
                     "週線訊號": SIGNAL_LABEL.get(w_sig, w_sig) if use_mtf_flag else "─",
                     "MTF確認":  mtf_label if use_mtf_flag else "─",
+                    "壓力區":   "⚠️" if near_resist_flag else "─",
                     "勝率%":    win_rate,
                     "平均報酬%": avg_return,
                     "最佳CCI":  best_cci,
@@ -3687,6 +3759,7 @@ def main():
                     "_detail":  recent_detail,
                     "_mtf_ok":  mtf_ok,
                     "_w_sig":   w_sig,
+                    "_near_resist": near_resist_flag,
                     "_is_new":  False,
                     "_fired_at": "",
                 })
@@ -3867,6 +3940,12 @@ def main():
                                 f'border-radius:3px;font-size:0.62rem;font-weight:700;'
                                 f'margin-left:4px">NEW</span>'
                             ) if r.get("_is_new") else ""
+                            # Resistance zone warning badge
+                            resist_badge = (
+                                f'<span style="background:#ff3355;color:#fff;padding:1px 6px;'
+                                f'border-radius:3px;font-size:0.60rem;font-weight:700;'
+                                f'margin-left:4px">⚠️壓力</span>'
+                            ) if r.get("_near_resist") else ""
                             # Show signal detection time on ALL buy cards (not just NEW)
                             time_label = (
                                 f'<div style="font-size:0.62rem;color:#37474f;margin-top:3px">'
@@ -3880,7 +3959,7 @@ def main():
                                     align-items:baseline;margin-bottom:4px">
                                 <span style="font-size:1.05rem;font-weight:700;
                                     color:#e8f4fd;font-family:'Space Mono',monospace">
-                                {r['代號']}{new_badge}</span>
+                                {r['代號']}{new_badge}{resist_badge}</span>
                                 <span style="font-size:0.75rem;color:{chg_color};font-weight:600">
                                 {r['_price']:.2f}　{r['_chg_p']:+.2f}%</span>
                                 </div>
@@ -3973,6 +4052,8 @@ def main():
                                   help="週K線訊號（啟用MTF確認後顯示）"),
                     "MTF確認":  st.column_config.TextColumn(
                                   help="日線+週線雙重確認結果"),
+                    "壓力區":   st.column_config.TextColumn(
+                                  help="⚠️ 現價距壓力位 ≤3%，買入風險較高"),
                 },
                 hide_index=True,
             )
