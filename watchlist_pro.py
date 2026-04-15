@@ -321,8 +321,11 @@ def _atomic(path, data):
     with open(tmp, "w") as f: json.dump(data, f, ensure_ascii=False)
     os.replace(tmp, path)
 
-@st.cache_resource
-def _wl_store():
+# ── Persistence: always reads fresh from disk ──
+# Do NOT use @st.cache_resource for mutable JSON stores —
+# it returns a stale cached dict and group/note changes are lost on rerun.
+
+def _load_wl():
     try:
         if os.path.exists(_WL_FILE):
             d = json.load(open(_WL_FILE))
@@ -330,13 +333,11 @@ def _wl_store():
     except: pass
     return {"codes": [], "groups": {}}
 
-@st.cache_resource
-def _note_store():
+def _load_notes():
     try: return json.load(open(_NOTE_FILE)) if os.path.exists(_NOTE_FILE) else {}
     except: return {}
 
-@st.cache_resource
-def _port_store():
+def _load_port():
     try: return json.load(open(_PORT_FILE)) if os.path.exists(_PORT_FILE) else {"trades": []}
     except: return {"trades": []}
 
@@ -345,31 +346,42 @@ def _is_tw_code(raw):
     return bool(_re.fullmatch(r'\d{4,6}', bare))
 
 def wl_get():
-    raw = _wl_store()["codes"]
+    d = _load_wl()
+    raw = d["codes"]
     valid = [c for c in raw if _is_tw_code(c)]
-    if len(valid) != len(raw):
-        s = _wl_store(); s["codes"] = valid
-        try: _atomic(_WL_FILE, s)
+    if len(valid) != len(raw):          # auto-purge garbage codes
+        d["codes"] = valid
+        try: _atomic(_WL_FILE, d)
         except: pass
     return valid
 
-def wl_group(c): return _wl_store().get("groups", {}).get(c, "未分組")
+def wl_group(c):
+    return _load_wl().get("groups", {}).get(c, "未分組")
+
 def wl_add(c):
-    s = _wl_store(); c = c.upper()
-    if c not in s["codes"]: s["codes"].append(c); _atomic(_WL_FILE, s); return True
+    d = _load_wl(); c = c.upper()
+    if c not in d["codes"]:
+        d["codes"].append(c); _atomic(_WL_FILE, d); return True
     return False
+
 def wl_remove(c):
-    s = _wl_store()
-    if c in s["codes"]: s["codes"].remove(c); _atomic(_WL_FILE, s); return True
+    d = _load_wl()
+    if c in d["codes"]:
+        d["codes"].remove(c); _atomic(_WL_FILE, d); return True
     return False
+
 def wl_set_group(c, g):
-    s = _wl_store(); s.setdefault("groups", {})[c] = g; _atomic(_WL_FILE, s)
-def note_get(c): return _note_store().get(c, {})
-def note_set(c, d):
-    s = _note_store(); s[c] = d; _atomic(_NOTE_FILE, s)
-def port_get(): return _port_store().get("trades", [])
+    d = _load_wl()
+    d.setdefault("groups", {})[c] = g
+    _atomic(_WL_FILE, d)
+
+def note_get(c): return _load_notes().get(c, {})
+def note_set(c, nd):
+    d = _load_notes(); d[c] = nd; _atomic(_NOTE_FILE, d)
+
+def port_get(): return _load_port().get("trades", [])
 def port_save(t):
-    s = _port_store(); s["trades"] = t; _atomic(_PORT_FILE, s)
+    d = _load_port(); d["trades"] = t; _atomic(_PORT_FILE, d)
 
 # ──────────────────────────────────────
 # NAMES
@@ -635,11 +647,11 @@ with st.sidebar:
             for f in [_WL_FILE,_NOTE_FILE,_PORT_FILE,_ALERT_FILE]:
                 try: os.remove(f)
                 except: pass
-            st.cache_data.clear(); st.cache_resource.clear(); st.rerun()
+            st.cache_data.clear(); st.rerun()
         if st.button("只清自選股清單", width='stretch', key="er_wl"):
             try: os.remove(_WL_FILE)
             except: pass
-            st.cache_resource.clear(); st.rerun()
+            st.rerun()
 
 # ──────────────────────────────────────
 # EMPTY STATE — inline form
