@@ -22,7 +22,7 @@ st.set_page_config(
     page_title="自選股 PRO",
     page_icon="🎯",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 APP_VERSION = "3.0"
@@ -77,7 +77,37 @@ section[data-testid="stSidebar"] {
 section[data-testid="stSidebar"] * { color: var(--c-text) !important; }
 section[data-testid="stSidebar"] > div { padding-top: 0.75rem !important; }
 
-/* Hide Streamlit chrome — keep header for mobile sidebar toggle */
+
+/* ── Sidebar toggle button — always visible, large tap target on mobile ── */
+[data-testid="collapsedControl"] {
+  display: flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  position: fixed !important;
+  top: 8px !important;
+  left: 8px !important;
+  z-index: 9999 !important;
+  background: var(--c-surface) !important;
+  border: 1px solid var(--c-border) !important;
+  border-radius: 8px !important;
+  width: 40px !important;
+  height: 40px !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4) !important;
+}
+[data-testid="collapsedControl"]:hover {
+  border-color: var(--c-accent) !important;
+  background: rgba(14,165,233,0.1) !important;
+}
+[data-testid="collapsedControl"] svg {
+  fill: var(--c-text) !important;
+  width: 18px !important;
+  height: 18px !important;
+}
+
+/* Hide Streamlit chrome — keep header and collapsedControl for sidebar toggle */
 #MainMenu, footer,
 [data-testid="stToolbar"],
 [data-testid="stDecoration"],
@@ -89,7 +119,9 @@ section[data-testid="stSidebar"] > div { padding-top: 0.75rem !important; }
   max-width: 1100px !important;
 }
 @media (max-width: 640px) {
-  .block-container { padding: 0.6rem 0.5rem 1.5rem !important; }
+  .block-container {
+    padding: 0.6rem 0.6rem 1.5rem 56px !important;
+  }
 }
 
 /* Tabs — text only, no emoji to avoid overlap */
