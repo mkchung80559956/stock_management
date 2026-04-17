@@ -5271,9 +5271,9 @@ def main():
             # ── Sort (on filtered display_rows) ──
             if sort_mode == "⭐ 共振分數":
                 rows_sorted = sorted(display_rows, key=lambda r: (-SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_conf"], -r["_mom"]))
-            elif sort_mode == "🔥 動能分數":
+            elif sort_mode in ("🔥 動能", "🔥 動能分數"):
                 rows_sorted = sorted(display_rows, key=lambda r: -r["_mom"])
-            elif sort_mode == "📈 量比":
+            elif sort_mode in ("📈 量比",):
                 rows_sorted = sorted(display_rows, key=lambda r: -r["_vol_r"])
             else:
                 rows_sorted = sorted(display_rows, key=lambda r: SIGNAL_ORDER.get(r["_sig_key"], 9))
