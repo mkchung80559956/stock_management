@@ -4518,8 +4518,6 @@ def main():
             if n_expired:
                 st.toast(f"⏰ {n_expired} 筆訊號已自動失效", icon="🔕")
             lc_active = lifecycle_get_active()
-            if lc_active and tg_token_v and tg_chat_v:
-                lifecycle_tg_reminder(lc_active, tg_token_v, tg_chat_v)
 
             # ── Telegram push for NEW actionable signals ──────────────
             tg_token_v   = st.session_state.get("tg_token", "")
@@ -4527,6 +4525,9 @@ def main():
             tg_sigs_v    = set(st.session_state.get("tg_sigs",
                                 ["HIGH_CONF_BUY","BREAKOUT_BUY","STRONG_BUY"]))
             tg_min_conf_v= int(st.session_state.get("tg_min_conf", 5))
+            # Lifecycle reminders now that tg vars are defined
+            if lc_active and tg_token_v and tg_chat_v:
+                lifecycle_tg_reminder(lc_active, tg_token_v, tg_chat_v)
             if tg_token_v and tg_chat_v:
                 scan_ts = tw_now().strftime("%H:%M")
                 new_buy  = [r for r in rows
