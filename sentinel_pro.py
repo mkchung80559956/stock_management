@@ -19,7 +19,7 @@ import urllib.request as _urllib_req
 import urllib.parse  as _urllib_parse
 
 APP_VERSION   = "3.1"
-APP_UPDATED   = "2026-04-18"   # ← bump this string on every update
+APP_UPDATED   = "2026-04-15"   # ← bump this string on every update
 import warnings
 import logging
 import pytz
@@ -7368,8 +7368,7 @@ def main():
                             cdf = result["combo_df"]
                             best_t = result["best_threshold"]
 
-                            # Bar chart
-                            import plotly.graph_objects as go
+                            # Bar chart (go imported at top of file)
                             bar_colors = ["#00ff88" if int(r["評分門檻≥"]) == best_t
                                           else "#2196f3" for _, r in cdf.iterrows()]
                             fig_combo = go.Figure(go.Bar(
