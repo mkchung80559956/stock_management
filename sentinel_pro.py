@@ -19,7 +19,7 @@ import urllib.request as _urllib_req
 import urllib.parse  as _urllib_parse
 
 APP_VERSION   = "3.1"
-APP_UPDATED   = "2026-04-15"   # ← bump this string on every update
+APP_UPDATED   = "2026-04-18"   # ← bump this string on every update
 import warnings
 import logging
 import pytz
