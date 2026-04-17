@@ -3427,12 +3427,90 @@ def overnight_factor_backtest(df: pd.DataFrame) -> dict:
         },
     }
 
+    # ── Verdict: can we buy today? ────────────────────────────────
+    # Three questions → single traffic-light judgement
+    best_row = {}
+    if combo_rows:
+        df_combo2 = pd.DataFrame(combo_rows)
+        bi = df_combo2["期望值%"].idxmax()
+        best_row = df_combo2.loc[bi].to_dict()
+
+    best_wr   = best_row.get("勝率%",      0)
+    best_ev   = best_row.get("期望值%",    0)
+    best_n    = best_row.get("符合天數",   0)
+    up_wr     = mkt_filter["大盤上漲日"]["勝率%"]
+    dn_wr     = mkt_filter["大盤下跌日"]["勝率%"]
+    mkt_gap   = round(up_wr - dn_wr, 1)
+    mkt_sens  = mkt_gap >= 10   # market direction matters
+
+    # Edge exists?
+    edge_ok    = best_wr >= 55 and best_ev > 0 and best_n >= 15
+
+    # Determine verdict
+    if best_n < 15:
+        verdict = "insufficient"
+        verdict_label  = "⚫ 資料不足"
+        verdict_color  = "#5a8fb0"
+        verdict_bg     = "rgba(90,143,176,0.08)"
+        verdict_border = "#5a8fb0"
+        verdict_msg    = "歷史樣本不足 15 次，統計結論不可靠。建議選更長的回測區間。"
+    elif best_wr >= 65 and best_ev >= 0.10 and best_n >= 30:
+        verdict = "strong_buy"
+        verdict_label  = "🟢 強力可買"
+        verdict_color  = "#00ff88"
+        verdict_bg     = "rgba(0,255,136,0.06)"
+        verdict_border = "#00ff88"
+        verdict_msg    = (
+            f"歷史數據顯示強烈正期望值（勝率 {best_wr:.1f}%，期望值 +{best_ev:.3f}%）。"
+            f"樣本足夠（{best_n} 次），統計可靠。"
+            + ("今日若評分達門檻，大盤方向需確認。" if mkt_sens else "今日若評分達門檻，可直接進場。")
+        )
+    elif best_wr >= 58 and best_ev > 0:
+        verdict = "caution_buy"
+        verdict_label  = "🟡 謹慎可買"
+        verdict_color  = "#ffd600"
+        verdict_bg     = "rgba(255,214,0,0.06)"
+        verdict_border = "#ffd600"
+        verdict_msg    = (
+            f"有正期望值（勝率 {best_wr:.1f}%），但邊際不強。"
+            + ("大盤影響顯著（上漲日勝率高出 " + str(mkt_gap) + "%），建議僅在大盤上漲日操作。"
+               if mkt_sens else f"建議評分達 ≥{best_threshold} 分再進場，控制次數。")
+        )
+    else:
+        verdict = "no_buy"
+        verdict_label  = "🔴 不建議進場"
+        verdict_color  = "#ff3355"
+        verdict_bg     = "rgba(255,51,85,0.06)"
+        verdict_border = "#ff3355"
+        verdict_msg    = (
+            f"勝率 {best_wr:.1f}%，期望值 {best_ev:+.3f}%，統計優勢不明顯。"
+            "此股隔日沖歷史表現未達標準，建議跳過或改用波段策略。"
+        )
+
+    verdict_data = {
+        "verdict":        verdict,
+        "label":          verdict_label,
+        "color":          verdict_color,
+        "bg":             verdict_bg,
+        "border":         verdict_border,
+        "msg":            verdict_msg,
+        "best_wr":        best_wr,
+        "best_ev":        best_ev,
+        "best_n":         best_n,
+        "best_threshold": best_threshold,
+        "mkt_sens":       mkt_sens,
+        "mkt_gap":        mkt_gap,
+        "up_wr":          up_wr,
+        "dn_wr":          dn_wr,
+    }
+
     return {
-        "factor_results":   results,
-        "combo_df":         df_combo,
-        "best_threshold":   best_threshold,
-        "market_filter":    mkt_filter,
-        "detail":           valid_s,
+        "factor_results": results,
+        "combo_df":       df_combo,
+        "best_threshold": best_threshold,
+        "market_filter":  mkt_filter,
+        "detail":         valid_s,
+        "verdict":        verdict_data,
     }
 
 
@@ -6884,6 +6962,100 @@ def main():
                     if not result:
                         st.error("回測樣本不足")
                     else:
+                        # ── 🚦 VERDICT CARD — 最頂部，最醒目 ────────────
+                        vd = result.get("verdict", {})
+                        if vd:
+                            # Compute today's score for display
+                            df_today  = _overnight_factors(df_ovn)
+                            today_row = df_today.iloc[-1]
+                            today_sc  = overnight_score(today_row)
+                            thresh    = vd["best_threshold"]
+                            today_ok  = today_sc >= thresh
+
+                            # Today score badges
+                            score_badges = []
+                            factor_icons = {
+                                "F_close_near_high": "收盤強度",
+                                "F_gain_3_7":        "漲幅甜區",
+                                "F_vol_surge":       "量能放大",
+                                "F_obv_new_high":    "OBV新高",
+                                "F_trend_ok":        "均線多頭",
+                                "F_above_200":       "站上年線",
+                                "F_breakout_20d":    "突破20高",
+                                "F_tail_ok":         "尾盤強度",
+                            }
+                            hit = []
+                            miss = []
+                            for col, label in factor_icons.items():
+                                if today_row.get(col):
+                                    hit.append(label)
+                                else:
+                                    miss.append(label)
+
+                            entry_gate = "✅ 今日達門檻，可考慮進場" if today_ok \
+                                         else f"⏳ 今日評分 {today_sc}/8 未達門檻 ≥{thresh}，今日不宜進場"
+                            entry_color = vd["color"] if today_ok else "#ff3355"
+
+                            st.markdown(
+                                f'<div style="background:{vd["bg"]};'
+                                f'border:2px solid {vd["border"]};'
+                                f'border-radius:12px;padding:18px 20px;margin-bottom:20px">'
+
+                                # Verdict label (large)
+                                f'<div style="font-size:1.3rem;font-weight:800;'
+                                f'color:{vd["color"]};margin-bottom:6px">{vd["label"]}</div>'
+
+                                # Key stats row
+                                f'<div style="display:grid;grid-template-columns:repeat(4,1fr);'
+                                f'gap:8px;margin-bottom:12px">'
+                                + "".join(
+                                    f'<div style="background:#0a0e1a;padding:8px 10px;border-radius:8px;text-align:center">'
+                                    f'<div style="font-size:0.62rem;color:#5a8fb0;text-transform:uppercase;letter-spacing:0.08em">{lbl}</div>'
+                                    f'<div style="font-family:monospace;font-size:1rem;font-weight:700;color:{col};margin-top:4px">{val}</div>'
+                                    f'</div>'
+                                    for lbl, val, col in [
+                                        ("歷史勝率",   f"{vd['best_wr']:.1f}%",
+                                         "#00ff88" if vd["best_wr"]>=65 else "#ffd600" if vd["best_wr"]>=55 else "#ff3355"),
+                                        ("期望值",     f"{vd['best_ev']:+.3f}%",
+                                         "#00ff88" if vd["best_ev"]>0.05 else "#ffd600" if vd["best_ev"]>0 else "#ff3355"),
+                                        ("樣本次數",   f"{int(vd['best_n'])} 次",
+                                         "#00ff88" if vd["best_n"]>=30 else "#ffd600" if vd["best_n"]>=15 else "#ff3355"),
+                                        ("最佳門檻",   f"≥{thresh}/8 分",
+                                         vd["color"]),
+                                    ]
+                                )
+                                + f'</div>'
+
+                                # Explanation
+                                f'<div style="font-size:0.82rem;color:#8a9bb5;'
+                                f'line-height:1.65;margin-bottom:12px">{vd["msg"]}</div>'
+
+                                # Today's entry gate
+                                f'<div style="background:#080c18;border-radius:8px;'
+                                f'padding:10px 14px;margin-bottom:10px">'
+                                f'<div style="font-size:0.78rem;color:{entry_color};'
+                                f'font-weight:700;margin-bottom:6px">{entry_gate}</div>'
+                                f'<div style="font-size:0.72rem;color:#5a8fb0">'
+                                f'今日評分 {today_sc}/8　'
+                                f'命中：{" / ".join(hit) if hit else "無"}　'
+                                f'未中：{" / ".join(miss) if miss else "無"}'
+                                f'</div></div>'
+
+                                # Market sensitivity
+                                + (
+                                    f'<div style="font-size:0.75rem;color:#ffd600;'
+                                    f'border-top:1px solid rgba(255,214,0,0.2);padding-top:8px">'
+                                    f'⚡ 大盤敏感：上漲日勝率 {vd["up_wr"]:.1f}% vs 下跌日 {vd["dn_wr"]:.1f}%'
+                                    f'（差距 {vd["mkt_gap"]:.1f}%）— 建議僅在大盤上漲日操作</div>'
+                                    if vd["mkt_sens"] else
+                                    f'<div style="font-size:0.72rem;color:#5a8fb0;'
+                                    f'border-top:1px solid rgba(90,143,176,0.2);padding-top:8px">'
+                                    f'大盤方向影響較小（差距僅 {vd["mkt_gap"]:.1f}%）</div>'
+                                )
+                                + '</div>',
+                                unsafe_allow_html=True,
+                            )
+
                         # ── 各因素勝率表 ─────────────────────
                         st.markdown("##### 各因素獨立勝率")
                         st.caption("每個因素獨立成立時，次日開盤報酬的統計")
