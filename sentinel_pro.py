@@ -5357,6 +5357,179 @@ def main():
                     unsafe_allow_html=True,
                 )
 
+                # ── Signal Timeline Panel ─────────────────────────
+                # Scan last 30 bars for all buy/sell signals → timeline
+                sig_events = []
+                lookback_bars = min(60, len(df_sig))
+                for idx_pos in range(len(df_sig) - lookback_bars, len(df_sig)):
+                    row_s   = df_sig.iloc[idx_pos]
+                    s_key   = str(row_s.get("Signal", "NEUTRAL") or "NEUTRAL")
+                    s_date  = df_sig.index[idx_pos]
+                    if s_key in BUY_SIGNALS | SELL_SIGNALS:
+                        s_close = float(row_s["Close"])
+                        s_atr   = float(row_s.get("ATR", 0) or 0)
+                        s_stop  = round(s_close - s_atr * 1.5, 2) if s_atr else round(s_close * 0.93, 2)
+                        s_t1    = round(s_close + (s_close - s_stop) * 1.5, 2)
+                        s_t2    = round(s_close + (s_close - s_stop) * 2.5, 2)
+                        days_ago = (df_sig.index[-1] - s_date).days
+                        sig_events.append({
+                            "date":    s_date,
+                            "key":     s_key,
+                            "label":   SIGNAL_LABEL.get(s_key, s_key),
+                            "close":   s_close,
+                            "stop":    s_stop,
+                            "t1":      s_t1,
+                            "t2":      s_t2,
+                            "days_ago": days_ago,
+                            "detail":  str(row_s.get("Signal_Detail","") or ""),
+                        })
+
+                if sig_events:
+                    latest_ev = sig_events[-1]
+                    is_buy    = latest_ev["key"] in BUY_SIGNALS
+                    is_sell   = latest_ev["key"] in SELL_SIGNALS
+                    ev_color  = MARKER_SHAPE.get(latest_ev["key"], ("","#5a8fb0",10,""))[1]
+                    cfg       = SIGNAL_LIFECYCLE.get(latest_ev["key"], SIGNAL_LIFECYCLE.get("BUY", {}))
+                    entry_latest = cfg.get("entry_latest", 2)
+                    decay_days   = cfg.get("decay_days",   3)
+                    days_since   = latest_ev["days_ago"]
+                    still_valid  = days_since <= decay_days
+
+                    # Recommendation text
+                    if is_buy and still_valid:
+                        rec_title = "✅ 建議進場"
+                        rec_color = "#00ff88"
+                        rec_bg    = "rgba(0,255,136,0.06)"
+                        rec_msg   = (
+                            f"訊號日 {latest_ev['date'].strftime('%m/%d')} 出現「{latest_ev['label']}」，"
+                            f"距今 {days_since} 天，仍在有效期內（{decay_days} 天）。\n"
+                            f"建議在 {cfg.get('entry_time','收盤前')} 進場，"
+                            f"停損 {latest_ev['stop']:.2f}，目標 {latest_ev['t1']:.2f} / {latest_ev['t2']:.2f}。"
+                        )
+                    elif is_buy and not still_valid:
+                        rec_title = "⏰ 訊號已過期"
+                        rec_color = "#ffd600"
+                        rec_bg    = "rgba(255,214,0,0.05)"
+                        rec_msg   = (
+                            f"訊號日 {latest_ev['date'].strftime('%m/%d')} 出現「{latest_ev['label']}」，"
+                            f"距今已 {days_since} 天，超過有效期 {decay_days} 天。"
+                            "不建議追入，等待新訊號形成。"
+                        )
+                    elif is_sell:
+                        rec_title = "🔴 建議減碼 / 出場"
+                        rec_color = "#ff3355"
+                        rec_bg    = "rgba(255,51,85,0.06)"
+                        rec_msg   = (
+                            f"訊號日 {latest_ev['date'].strftime('%m/%d')} 出現「{latest_ev['label']}」，"
+                            f"距今 {days_since} 天。"
+                            f"建議評估減碼或設移動停損保護獲利。"
+                        )
+                    else:
+                        rec_title = "─ 觀望"
+                        rec_color = "#5a8fb0"
+                        rec_bg    = "rgba(90,143,176,0.04)"
+                        rec_msg   = "近期無明確買賣訊號，維持觀望。"
+
+                    # ── Main recommendation card ──
+                    grid_html = ""
+                    if is_buy:
+                        grid_html = (
+                            '<div style="display:grid;grid-template-columns:repeat(4,1fr);'
+                            'gap:6px;margin-bottom:10px">'
+                            + "".join([
+                                f'<div style="background:#0a0e1a;padding:7px 10px;border-radius:6px;text-align:center">'
+                                f'<div style="font-size:0.6rem;color:#5a8fb0;text-transform:uppercase">{lbl}</div>'
+                                f'<div style="font-family:monospace;font-size:0.9rem;font-weight:700;color:{col};margin-top:3px">{val}</div>'
+                                f'</div>'
+                                for lbl, val, col in [
+                                    ("訊號收盤", f"{latest_ev['close']:.2f}", "#e8f4fd"),
+                                    ("停損價",  f"{latest_ev['stop']:.2f}",  "#ff3355"),
+                                    ("目標1",   f"{latest_ev['t1']:.2f}",    "#00ff88"),
+                                    ("目標2",   f"{latest_ev['t2']:.2f}",    "#ffd600"),
+                                ]
+                            ])
+                            + '</div>'
+                        )
+                    lifecycle_row = ""
+                    if is_buy and cfg:
+                        lifecycle_row = (
+                            f'<div style="margin-top:8px;padding-top:8px;'
+                            f'border-top:1px solid {rec_color}20;font-size:0.72rem;color:#5a8fb0">'
+                            f'進場時機：{cfg.get("entry_time","─")}　'
+                            f'停損方式：{cfg.get("stop_method","─")}　'
+                            f'持倉：{cfg.get("holding","─")}</div>'
+                        )
+                    validity_badge = (
+                        "  ✅ 有效" if still_valid and is_buy
+                        else "  ⏰ 過期" if not still_valid and is_buy
+                        else ""
+                    )
+                    card_html = (
+                        f'<div style="background:{rec_bg};border:1.5px solid {rec_color}40;'
+                        f'border-left:4px solid {rec_color};border-radius:10px;'
+                        f'padding:14px 18px;margin:10px 0 6px 0">'
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:6px">'
+                        f'<span style="font-size:1rem;font-weight:800;color:{rec_color}">{rec_title}</span>'
+                        f'<span style="font-size:0.72rem;color:{ev_color};'
+                        f'border:1px solid {ev_color}60;padding:2px 10px;border-radius:10px">'
+                        f'{latest_ev["label"]}  {latest_ev["date"].strftime("%m/%d")}{validity_badge}</span>'
+                        f'</div>'
+                        + grid_html
+                        + f'<div style="font-size:0.8rem;color:#8a9bb5;line-height:1.65">{rec_msg}</div>'
+                        + lifecycle_row
+                        + '</div>'
+                    )
+                    st.markdown(card_html, unsafe_allow_html=True)
+
+                    # ── Signal timeline (last 10 events) ──
+                    if len(sig_events) > 1:
+                        st.markdown(
+                            '<div style="font-size:0.68rem;color:#5a8fb0;'
+                            'letter-spacing:0.08em;text-transform:uppercase;'
+                            'margin:12px 0 6px 0">近期訊號時間軸</div>',
+                            unsafe_allow_html=True,
+                        )
+                        timeline_html = '<div style="display:flex;flex-direction:column;gap:4px">'
+                        for ev in reversed(sig_events[-10:]):
+                            ev_c  = MARKER_SHAPE.get(ev["key"], ("","#5a8fb0",10,""))[1]
+                            is_b  = ev["key"] in BUY_SIGNALS
+                            bg    = "rgba(0,255,136,0.04)" if is_b else "rgba(255,51,85,0.04)"
+                            pnl   = ""
+                            if is_b:
+                                cur_ret = (price - ev["close"]) / ev["close"] * 100
+                                pnl_c   = "#00ff88" if cur_ret >= 0 else "#ff3355"
+                                pnl     = f'<span style="color:{pnl_c};font-family:monospace;font-size:0.7rem">{cur_ret:+.1f}%</span>'
+                            is_latest_marker = "◀" if ev is sig_events[-1] else ""
+                            timeline_html += (
+                                f'<div style="display:flex;align-items:center;gap:8px;'
+                                f'background:{bg};border-left:2px solid {ev_c};'
+                                f'padding:4px 10px;border-radius:0 6px 6px 0;'
+                                f'{"border:1px solid "+ev_c+"40;" if ev is sig_events[-1] else ""}">'
+                                f'<span style="font-family:monospace;font-size:0.72rem;'
+                                f'color:#5a8fb0;min-width:40px">{ev["date"].strftime("%m/%d")}</span>'
+                                f'<span style="font-size:0.75rem;color:{ev_c};font-weight:600;'
+                                f'min-width:80px">{ev["label"]}</span>'
+                                f'<span style="font-family:monospace;font-size:0.72rem;color:#e8f4fd">'
+                                f'{ev["close"]:.2f}</span>'
+                                f'{pnl}'
+                                f'<span style="font-size:0.65rem;color:#37474f;flex:1;'
+                                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
+                                f'{ev["detail"][:45]}</span>'
+                                f'<span style="color:{ev_c};font-size:0.72rem">{is_latest_marker}</span>'
+                                f'</div>'
+                            )
+                        timeline_html += '</div>'
+                        st.markdown(timeline_html, unsafe_allow_html=True)
+
+                else:
+                    st.markdown(
+                        '<div style="background:#0d1226;border:1px solid #1a2d44;'
+                        'border-radius:8px;padding:12px 16px;color:#5a8fb0;font-size:0.82rem;margin:10px 0">'
+                        '近 60 根 K 棒無明確買賣訊號，建議觀望等待。</div>',
+                        unsafe_allow_html=True,
+                    )
+
                 # ── Chart (with S/R + stop + R:R) ──
                 sr = calc_support_resistance(df_sig)
                 fig = build_chart(df_sig, bare_t, params,
