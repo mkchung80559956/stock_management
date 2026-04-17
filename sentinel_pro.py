@@ -1884,10 +1884,14 @@ def lookup_name(code: str) -> tuple[str, str]:
     then fall back to yfinance .info if not found.
     Returns (name, market_label).
     """
-    bare = code.upper().replace(".TWO", "").replace(".TW", "")
+    bare = code.upper().replace(".TWO", "").replace(".TW", "").strip()
     if bare in _TW_NAMES:
         return _TW_NAMES[bare]
-    # Fallback: infer market from suffix
+    # Also try with common ETF format (e.g. "00878" stored as "878")
+    bare_no_lead = bare.lstrip("0")
+    if bare_no_lead in _TW_NAMES:
+        return _TW_NAMES[bare_no_lead]
+    # Infer market from suffix
     mkt = "上櫃" if code.upper().endswith(".TWO") else "上市"
     return "", mkt
 
@@ -4412,6 +4416,20 @@ def main():
 
         st.caption(f"共 **{len(st.session_state.watchlist)}** 支股票")
 
+        # ── Missing name detector ──────────────────────────────
+        no_name = []
+        for c in st.session_state.watchlist:
+            bare_c = c.upper().replace(".TW","").replace(".TWO","").strip()
+            name_c, _ = lookup_name(c)
+            if not name_c:
+                no_name.append(bare_c)
+        if no_name:
+            st.warning(
+                f"⚠️ **{len(no_name)} 支無中文名稱**（會顯示代號）：\n"
+                + "  ".join(no_name[:20])
+                + ("…" if len(no_name) > 20 else "")
+            )
+
         # Export watchlist template
         wl_export = pd.DataFrame({"股票代號": st.session_state.watchlist})
         st.download_button(
@@ -4880,6 +4898,9 @@ def main():
                     cn_name, mkt_label = fetch_name(code)
                     if not mkt_label:
                         mkt_label = "上櫃" if code.upper().endswith(".TWO") else "上市"
+                # Always show something — use code as display name if no Chinese name found
+                if not cn_name:
+                    cn_name = bare   # bare code as fallback (better than blank)
 
                 latest = df_sig.iloc[-1]
                 prev   = df_sig.iloc[-2]
