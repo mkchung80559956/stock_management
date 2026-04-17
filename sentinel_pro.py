@@ -3406,7 +3406,7 @@ def overnight_scan(watchlist: list, min_score: int = 5,
             c_pos  = float(latest.get("F_close_pos", 0) or 0)
             candidates.append({
                 "代號":       code,
-                "名稱":       lookup_name(code),
+                "名稱":       lookup_name(code)[0],
                 "評分":       score,
                 "漲幅%":      round(gain, 2),
                 "量比":       round(vol_r, 2),
@@ -6622,10 +6622,11 @@ def main():
             st.caption("選擇股票，系統分析歷史上各因素對次日開盤報酬的實際貢獻。")
 
             col_s1, col_s2, col_s3 = st.columns([2, 2, 1])
+            _ovn_wl = [c.replace(".TW","").replace(".TWO","")
+                       for c in st.session_state.get("watchlist", DEFAULT_WATCHLIST)]
             ovn_sym  = col_s1.selectbox(
-                "股票", [r[4:].split("(")[0].strip() if "(" in r else r
-                        for r in params.get("watchlist", watchlist)],
-                format_func=lambda x: f"{x}  {lookup_name(x)}",
+                "股票", _ovn_wl,
+                format_func=lambda x: f"{x}  {fetch_name(x)[0] or x}",
                 key="ovn_sym",
             )
             ovn_period = col_s2.radio("回測區間", ["1y","2y","3y"], horizontal=True,
@@ -6815,7 +6816,8 @@ def main():
                         st.stop()
 
                 prog_ovn = st.progress(0, text="掃描候選股…")
-                wl_ovn = wl if wl else DEFAULT_WATCHLIST[:30]
+                wl_ovn = [c.replace(".TW","").replace(".TWO","")
+                          for c in st.session_state.get("watchlist", DEFAULT_WATCHLIST)]
                 candidates = []
                 for ii, code in enumerate(wl_ovn):
                     prog_ovn.progress((ii+1)/len(wl_ovn),
@@ -6834,7 +6836,7 @@ def main():
                         chg_p = q.get("change_pct", float(latest_f.get("F_gain_pct", 0)))
                         candidates.append({
                             "代號":       code,
-                            "名稱":       lookup_name(code),
+                            "名稱":       lookup_name(code)[0],
                             "評分 /8":    sc,
                             "現價":       round(price, 2),
                             "今日漲%":    round(float(latest_f.get("F_gain_pct", chg_p)), 2),
