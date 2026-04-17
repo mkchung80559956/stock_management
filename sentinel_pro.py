@@ -4495,6 +4495,80 @@ def main():
                             "4. 網路限制 — Streamlit Cloud 免費版可能封鎖外部請求"
                         )
 
+        # ── #4 價格警報（Price Alert）─────────────────────────
+        with st.expander("🎯 價格警報設定", expanded=False):
+            st.caption(
+                "為個別股票設定目標價或停損警報。"
+                "每次掃描時自動檢查，觸發後立即推播 Telegram。"
+            )
+            # Alert store in session state (persists across reruns)
+            if "price_alerts" not in st.session_state:
+                st.session_state.price_alerts = {}  # {code: {target, stop, added}}
+
+            pa_c1, pa_c2 = st.columns(2)
+            pa_code   = pa_c1.text_input("代號", placeholder="2330", key="pa_code",
+                                          label_visibility="collapsed")
+            pa_type   = pa_c2.radio("類型", ["🎯 目標價達到", "🛑 跌破停損"],
+                                    horizontal=True, key="pa_type",
+                                    label_visibility="collapsed")
+            pa_price  = st.number_input("警報價格", min_value=0.01, value=100.0,
+                                        step=0.5, key="pa_price",
+                                        label_visibility="collapsed")
+            if st.button("➕ 新增警報", key="pa_add", width='stretch'):
+                bare_pa = pa_code.strip().upper().replace(".TW","").replace(".TWO","")
+                if bare_pa:
+                    if bare_pa not in st.session_state.price_alerts:
+                        st.session_state.price_alerts[bare_pa] = {}
+                    alert_type_key = "target" if "目標" in pa_type else "stop"
+                    st.session_state.price_alerts[bare_pa][alert_type_key] = pa_price
+                    st.session_state.price_alerts[bare_pa]["added"] = tw_now().strftime("%Y-%m-%d")
+                    st.success(f"✓ 已設定 {bare_pa} {'目標' if alert_type_key=='target' else '停損'} {pa_price:.2f}")
+
+            # Show current alerts
+            if st.session_state.price_alerts:
+                st.markdown('<div style="font-size:0.72rem;color:#5a8fb0;margin-top:8px">目前警報</div>',
+                            unsafe_allow_html=True)
+                for code_a, cfg_a in list(st.session_state.price_alerts.items()):
+                    q_a   = fetch_quote(code_a)
+                    px_a  = q_a.get("price", 0)
+                    tgt_a = cfg_a.get("target")
+                    stp_a = cfg_a.get("stop")
+                    # Hit detection
+                    tgt_hit = tgt_a and px_a and px_a >= tgt_a
+                    stp_hit = stp_a and px_a and px_a <= stp_a
+                    border  = "#ffd700" if tgt_hit else "#ff3355" if stp_hit else "#1a2d44"
+                    st.markdown(
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'align-items:center;border:1px solid {border};'
+                        f'border-radius:6px;padding:5px 10px;margin-bottom:4px;font-size:0.78rem">'
+                        f'<span style="color:#e8f4fd;font-weight:700">{code_a}</span>'
+                        f'{"<span style=color:#ffd700>🎯 "+str(tgt_a)+"</span>" if tgt_a else ""}'
+                        f'{"&nbsp;" if tgt_a and stp_a else ""}'
+                        f'{"<span style=color:#ff3355>🛑 "+str(stp_a)+"</span>" if stp_a else ""}'
+                        f'<span style="color:#5a8fb0">現價 {px_a:.2f}</span>'
+                        f'{"<span style=color:#ffd700;font-weight:700>⚡達標</span>" if tgt_hit else ""}'
+                        f'{"<span style=color:#ff3355;font-weight:700>⚡觸損</span>" if stp_hit else ""}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    # Push Telegram if hit
+                    _tg_t = st.session_state.get("tg_token","")
+                    _tg_c = st.session_state.get("tg_chat_id","")
+                    if (tgt_hit or stp_hit) and _tg_t and _tg_c:
+                        _alert_key = f"pa_{code_a}_{'tgt' if tgt_hit else 'stp'}_{tw_now().strftime('%Y%m%d')}"
+                        if not st.session_state.get(_alert_key):
+                            msg = (f"{'🎯 目標達標' if tgt_hit else '🛑 停損觸發'}\n"
+                                   f"{code_a}  現價 {px_a:.2f}\n"
+                                   f"{'目標 '+str(tgt_a) if tgt_hit else '停損 '+str(stp_a)}\n"
+                                   f"{tw_now().strftime('%H:%M')}")
+                            _tg_send(_tg_t, _tg_c, msg)
+                            st.session_state[_alert_key] = True
+                            st.toast(f"📲 推播 {code_a} 警報", icon="🎯" if tgt_hit else "🛑")
+
+                if st.button("清除所有警報", key="pa_clear", width='stretch'):
+                    st.session_state.price_alerts = {}
+                    st.rerun()
+
         # ── Google Sheets 儲存設定 ─────────────────────────
         with st.expander("📊 Google Sheets 交易記錄雲端同步", expanded=False):
             st.caption("將買賣記錄永久儲存到 Google Sheets，重啟後自動還原")
@@ -4575,6 +4649,40 @@ def main():
         run_opt  = c_opt.button("⚡ 優化CCI", width='stretch',
                                 help="為每支股票獨立回測，找出最佳CCI週期（約1-2分鐘）")
 
+        # ── #1 掃描模式 ─────────────────────────────────────────
+        sm_col, _ = st.columns([3, 1])
+        scan_mode = sm_col.radio(
+            "掃描範圍",
+            ["🔖 自選股（快速）", "🌏 全市場（284支）", "📋 自訂清單"],
+            horizontal=True, label_visibility="collapsed",
+            key="scan_mode",
+            help=(
+                "🔖 自選股：只掃你加入自選股的股票，速度最快（30秒內）。\n"
+                "🌏 全市場：掃描內建全部 284 支股票，需等待 60–90 秒。\n"
+                "📋 自訂清單：臨時輸入代號，彈性組合，不影響自選股設定。"
+            ),
+        )
+        custom_scan_codes = []
+        if scan_mode == "📋 自訂清單":
+            raw_input = st.text_area(
+                "輸入代號（每行一個，或逗號分隔）",
+                placeholder="2330\n2317\n2454\n或：2330, 2317, 2454",
+                height=80, label_visibility="collapsed",
+                key="custom_scan_input",
+            )
+            if raw_input.strip():
+                import re as _re_scan
+                raw_codes = _re_scan.split(r'[\s,，、\n]+', raw_input.strip())
+                custom_scan_codes = [
+                    c.upper().replace(".TW","").replace(".TWO","")
+                    for c in raw_codes
+                    if c.strip() and _re_scan.fullmatch(r'\d{4,6}', c.strip().replace(".TW","").replace(".TWO",""))
+                ]
+                if custom_scan_codes:
+                    st.caption(f"✓ 識別到 {len(custom_scan_codes)} 支：{' '.join(custom_scan_codes[:8])}{'…' if len(custom_scan_codes)>8 else ''}")
+                else:
+                    st.warning("未識別到有效代號（需4–6位數字）")
+
         # ── Auto-refresh control row ──
         ar_col, status_col = st.columns([1, 3])
         auto_refresh = ar_col.toggle(
@@ -4622,12 +4730,30 @@ def main():
         if should_auto_scan:
             run_scan = True   # piggyback on existing scan logic below
 
-        # Sort mode selector
-        sort_mode = st.radio(
-            "排序方式",
+        # ── #3 快速篩選 + 排序 ─────────────────────────────────
+        flt_col1, flt_col2, flt_col3 = st.columns(3)
+        sort_mode = flt_col1.radio(
+            "排序",
             ["📶 訊號強度", "⭐ 共振分數", "🔥 動能分數", "📈 量比"],
             horizontal=True, label_visibility="collapsed",
+            key="sort_mode_radio",
         )
+        sig_filter = flt_col2.multiselect(
+            "顯示訊號",
+            options=list(BUY_SIGNALS | SELL_SIGNALS | {"FAKE_BREAKOUT","WATCH","NEUTRAL"}),
+            default=[],
+            format_func=lambda x: SIGNAL_LABEL.get(x, x),
+            placeholder="全部訊號（不篩選）",
+            label_visibility="collapsed",
+            key="sig_filter",
+            help="留空 = 顯示全部。選擇後只顯示勾選的訊號類型。",
+        )
+        resist_only = flt_col3.toggle(
+            "⚠️ 只看壓力警告",
+            value=False, key="resist_only",
+            help="只顯示現價接近壓力位的股票（需注意風險）",
+        )
+
 
         # ── ⚡ Optimise CCI per stock (separate, deferred) ──────────────────
         if run_opt and st.session_state.get("scan_rows"):
@@ -4664,7 +4790,16 @@ def main():
         if run_scan:
             rows      = []
             failed    = []
-            wl        = st.session_state.watchlist
+            # Determine watchlist based on scan_mode
+            _mode = st.session_state.get("scan_mode", "🔖 自選股（快速）")
+            if _mode == "🌏 全市場（284支）":
+                wl = DEFAULT_WATCHLIST.copy()
+            elif _mode == "📋 自訂清單":
+                wl = custom_scan_codes if custom_scan_codes else st.session_state.watchlist
+                if not wl:
+                    st.warning("自訂清單為空，請先輸入股票代號"); wl = []
+            else:
+                wl = st.session_state.watchlist   # 🔖 自選股（預設）
             total_n   = max(len(wl), 1)
             # ▶ Load names (instant static table)
             try:
@@ -4971,6 +5106,21 @@ def main():
         failed    = st.session_state.get("scan_failed", [])
         scan_time = st.session_state.get("scan_timestamp", "")
 
+        # ── #3 Apply quick filters to display rows ───────────────────────
+        _sig_filter   = st.session_state.get("sig_filter",   [])
+        _resist_only  = st.session_state.get("resist_only",  False)
+        display_rows  = rows
+        if _sig_filter:
+            display_rows = [r for r in display_rows if r.get("_sig_key") in _sig_filter]
+        if _resist_only:
+            display_rows = [r for r in display_rows if r.get("壓力區","─") != "─"]
+        if _sig_filter or _resist_only:
+            st.caption(
+                f"篩選中：顯示 **{len(display_rows)}** / {len(rows)} 支"
+                + (f"　訊號：{', '.join(SIGNAL_LABEL.get(s,s) for s in _sig_filter)}" if _sig_filter else "")
+                + ("　⚠️ 壓力區" if _resist_only else "")
+            )
+
         # ── Auto-rerun countdown (only while market open + auto on) ──
         if auto_refresh and market_open and scan_time:
             secs = seconds_to_next_refresh(scan_time)
@@ -5000,9 +5150,9 @@ def main():
             ACTION_SELL = {"STRONG_SELL", "SELL", "DIV_SELL"}
             ACTION_WARN = {"FAKE_BREAKOUT", "KD_HIGH"}
 
-            today_buy  = [r for r in rows if r["_sig_key"] in ACTION_BUY]
-            today_sell = [r for r in rows if r["_sig_key"] in ACTION_SELL]
-            today_warn = [r for r in rows if r["_sig_key"] in ACTION_WARN]
+            today_buy  = [r for r in display_rows if r["_sig_key"] in ACTION_BUY]
+            today_sell = [r for r in display_rows if r["_sig_key"] in ACTION_SELL]
+            today_warn = [r for r in display_rows if r["_sig_key"] in ACTION_WARN]
 
             today_buy  = sorted(today_buy,  key=lambda r: (SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_win_rate"]))
             today_sell = sorted(today_sell, key=lambda r: (SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_win_rate"]))
@@ -5112,22 +5262,28 @@ def main():
 
                 st.divider()
 
-            # ── Sort ──
+            # ── Sort (on filtered display_rows) ──
             if sort_mode == "⭐ 共振分數":
-                rows_sorted = sorted(rows, key=lambda r: (-SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_conf"], -r["_mom"]))
+                rows_sorted = sorted(display_rows, key=lambda r: (-SIGNAL_ORDER.get(r["_sig_key"], 9), -r["_conf"], -r["_mom"]))
             elif sort_mode == "🔥 動能分數":
-                rows_sorted = sorted(rows, key=lambda r: -r["_mom"])
+                rows_sorted = sorted(display_rows, key=lambda r: -r["_mom"])
             elif sort_mode == "📈 量比":
-                rows_sorted = sorted(rows, key=lambda r: -r["_vol_r"])
+                rows_sorted = sorted(display_rows, key=lambda r: -r["_vol_r"])
             else:
-                rows_sorted = sorted(rows, key=lambda r: SIGNAL_ORDER.get(r["_sig_key"], 9))
+                rows_sorted = sorted(display_rows, key=lambda r: SIGNAL_ORDER.get(r["_sig_key"], 9))
 
             df_display = pd.DataFrame(rows_sorted)
             show_cols  = [c for c in df_display.columns if not c.startswith("_")]
             df_display = df_display[show_cols]
 
+            # Caption shows both total scanned and filtered count
+            _mode_lbl = {"🔖 自選股（快速）":"自選股","🌏 全市場（284支）":"全市場","📋 自訂清單":"自訂清單"}.get(
+                st.session_state.get("scan_mode","🔖 自選股（快速）"), "自選股")
             if scan_time:
-                st.caption(f"🕐 最後更新：{scan_time}　共 {len(rows)} 支　"
+                total_scanned = len(rows)
+                showing = len(display_rows)
+                filter_note = f"　篩選後顯示 {showing} 支" if showing < total_scanned else ""
+                st.caption(f"🕐 最後更新：{scan_time}　{_mode_lbl}共掃描 {total_scanned} 支{filter_note}　"
                            f"買入訊號 {len(today_buy)} 支　賣出訊號 {len(today_sell)} 支")
 
             st.dataframe(
