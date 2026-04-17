@@ -1234,6 +1234,7 @@ def lifecycle_tg_reminder(active_records: list, token: str, chat_id: str) -> int
 
 
 
+def backtest(df: pd.DataFrame, holding_days: int, profit_pct: float, stop_pct: float) -> dict:
     """
     Backtest buy signals. Entry is at the NEXT bar's open (simulated as next
     bar's close) to avoid look-ahead bias — you can only act after the signal
@@ -6846,7 +6847,8 @@ def main():
                             "均線多頭":   "✅" if latest_f.get("F_trend_ok")  else "─",
                             "突破20高":   "✅" if latest_f.get("F_breakout_20d") else "─",
                             "OBV新高":    "✅" if latest_f.get("F_obv_new_high") else "─",
-                            "_sc": sc,
+                            "_sc":    sc,
+                            "_price": round(price, 2),   # used by TG push
                         })
                     except Exception:
                         continue
