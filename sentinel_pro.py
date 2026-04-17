@@ -4731,29 +4731,35 @@ def main():
             run_scan = True   # piggyback on existing scan logic below
 
         # ── #3 快速篩選 + 排序 ─────────────────────────────────
-        flt_col1, flt_col2, flt_col3 = st.columns(3)
+        st.markdown(
+            '<div style="background:#0a1020;border:1px solid #1a2d44;border-radius:8px;'
+            'padding:8px 14px 4px 14px;margin:8px 0 4px 0">'
+            '<div style="font-size:0.68rem;color:#5a8fb0;letter-spacing:0.08em;'
+            'text-transform:uppercase;margin-bottom:6px">🔍 篩選 & 排序</div>',
+            unsafe_allow_html=True,
+        )
+        flt_col1, flt_col2, flt_col3 = st.columns([2, 2, 1])
         sort_mode = flt_col1.radio(
             "排序",
-            ["📶 訊號強度", "⭐ 共振分數", "🔥 動能分數", "📈 量比"],
-            horizontal=True, label_visibility="collapsed",
+            ["📶 訊號強度", "⭐ 共振分數", "🔥 動能", "📈 量比"],
+            horizontal=True, label_visibility="visible",
             key="sort_mode_radio",
         )
         sig_filter = flt_col2.multiselect(
-            "顯示訊號",
-            options=list(BUY_SIGNALS | SELL_SIGNALS | {"FAKE_BREAKOUT","WATCH","NEUTRAL"}),
+            "只顯示訊號",
+            options=list(BUY_SIGNALS | SELL_SIGNALS | {"FAKE_BREAKOUT","WATCH"}),
             default=[],
             format_func=lambda x: SIGNAL_LABEL.get(x, x),
-            placeholder="全部訊號（不篩選）",
-            label_visibility="collapsed",
+            placeholder="全部（不篩選）",
             key="sig_filter",
-            help="留空 = 顯示全部。選擇後只顯示勾選的訊號類型。",
+            help="留空 = 顯示全部訊號。勾選後只顯示選中類型。",
         )
         resist_only = flt_col3.toggle(
-            "⚠️ 只看壓力警告",
+            "⚠️ 只看壓力區",
             value=False, key="resist_only",
-            help="只顯示現價接近壓力位的股票（需注意風險）",
+            help="只顯示現價距壓力位 ≤3% 的股票",
         )
-
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # ── ⚡ Optimise CCI per stock (separate, deferred) ──────────────────
         if run_opt and st.session_state.get("scan_rows"):
