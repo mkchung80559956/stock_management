@@ -480,7 +480,8 @@ def detect_bearish_divergence(price, cci, lookback=30):
 # ══════════════════════════════════════════════
 
 SIGNAL_ORDER = {
-    "HIGH_CONF_BUY":  0,
+    "HIGH_CONF_BUY":      0,
+    "HIGH_CONF_PULLBACK": 0,   # same priority as HC_BUY — confirmed re-entry
     "BREAKOUT_BUY":   1, "STRONG_BUY":  2, "BUY": 3, "DIV_BUY": 3,
     "KD_GOLDEN_ZONE": 3,
     "BULL_ZONE": 4, "RISING": 5,
@@ -490,7 +491,8 @@ SIGNAL_ORDER = {
 }
 
 SIGNAL_LABEL = {
-    "HIGH_CONF_BUY":  "⭐ 三重共振",
+    "HIGH_CONF_BUY":      "⭐ 三重共振",
+    "HIGH_CONF_PULLBACK": "💎 共振回調買",   # new
     "BREAKOUT_BUY":   "🟠 噴發買",
     "STRONG_BUY":     "🟢 強買",
     "BUY":            "🔵 買入",
@@ -770,6 +772,77 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     except Exception:
         df["Near_Resist"] = pd.Series(False, index=df.index)
 
+    # ── HIGH_CONF_PULLBACK detector ────────────────────────────────
+    # After a HIGH_CONF_BUY or BREAKOUT_BUY fires, watch for a healthy
+    # pullback within the next 1–3 bars.  Entry here typically has a
+    # tighter stop and better risk/reward than chasing on signal day.
+    #
+    # Conditions (all must be true on the pullback bar):
+    #   1. A HIGH_CONF_BUY or BREAKOUT_BUY occurred within last 3 bars
+    #   2. Price dipped at least 0.5% from the signal-day close  ← confirms a real pullback
+    #   3. Decline < 5%                                           ← not a reversal
+    #   4. Volume < 80% of signal-day volume                     ← weak supply (健康縮量)
+    #   5. CCI still above 0                                      ← momentum intact
+    #   6. Close > EMA20                                          ← structure intact
+    #   7. Current bar has no own buy signal yet                  ← avoid duplication
+    try:
+        hc_idx = set(df.index[df["Signal"].isin({"HIGH_CONF_BUY", "BREAKOUT_BUY"})])
+        if hc_idx:
+            pullback_mask = pd.Series(False, index=df.index)
+            for i, idx in enumerate(df.index):
+                if i < 1:
+                    continue
+                # Check if any HC signal fired in the prior 1–3 bars
+                lookback = df.index[max(0, i-3):i]
+                prior_hc = [d for d in lookback if d in hc_idx]
+                if not prior_hc:
+                    continue
+                sig_bar   = df.loc[prior_hc[-1]]   # most recent HC bar
+                cur       = df.iloc[i]
+
+                # Compute conditions
+                sig_close  = float(sig_bar["Close"])
+                cur_close  = float(cur["Close"])
+                cur_vol    = float(cur["Volume"])
+                sig_vol    = float(sig_bar["Volume"])
+                cur_cci    = float(cur.get("CCI", 0) or 0)
+                cur_ema20  = float(cur.get("EMA2", cur_close) or cur_close)
+
+                price_drop = (sig_close - cur_close) / sig_close * 100  # positive = down
+                vol_ratio  = cur_vol / sig_vol if sig_vol > 0 else 1.0
+
+                cond_dip        = price_drop >= 0.5            # real pullback ≥0.5%
+                cond_not_crash  = price_drop < 5.0             # not a reversal
+                cond_vol_shrink = vol_ratio < 0.80             # volume dried up
+                cond_cci_ok     = cur_cci > 0                  # momentum intact
+                cond_above_ema  = cur_close > cur_ema20        # above EMA20
+                cond_no_signal  = df.index[i] not in hc_idx and \
+                                   df.at[idx, "Signal"] not in BUY_SIGNALS
+
+                if (cond_dip and cond_not_crash and cond_vol_shrink
+                        and cond_cci_ok and cond_above_ema and cond_no_signal):
+                    pullback_mask.at[idx] = True
+
+            # Assign signal — only to NEUTRAL bars (don't overwrite existing signals)
+            pb_new = pullback_mask & (df["Signal"] == "NEUTRAL")
+            df.loc[pb_new, "Signal"] = "HIGH_CONF_PULLBACK"
+            for idx in df.index[pb_new]:
+                sig_bar_idx = [d for d in df.index[max(0, df.index.get_loc(idx)-3):
+                                                    df.index.get_loc(idx)]
+                               if d in hc_idx]
+                ref_date = str(sig_bar_idx[-1].date()) if sig_bar_idx else "近期"
+                drop_pct  = round((float(df.at[sig_bar_idx[-1], "Close"])
+                                   - float(df.at[idx, "Close"]))
+                                  / float(df.at[sig_bar_idx[-1], "Close"]) * 100, 2) \
+                            if sig_bar_idx else 0
+                df.at[idx, "Signal_Detail"] = (
+                    f"💎 共振後回調買：{ref_date} 三重共振，"
+                    f"縮量回調 -{drop_pct:.1f}%，CCI>0 結構完整，"
+                    f"風險報酬比優於訊號日追入"
+                )
+    except Exception:
+        pass   # pullback detection is best-effort; never break the main flow
+
     return df
 
 
@@ -777,11 +850,390 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
 # BACKTESTING
 # ══════════════════════════════════════════════
 
-BUY_SIGNALS  = {"HIGH_CONF_BUY", "STRONG_BUY", "BUY", "DIV_BUY", "BREAKOUT_BUY"}
+BUY_SIGNALS  = {"HIGH_CONF_BUY", "HIGH_CONF_PULLBACK",
+                "STRONG_BUY", "BUY", "DIV_BUY", "BREAKOUT_BUY"}
 SELL_SIGNALS = {"STRONG_SELL", "SELL", "DIV_SELL"}
 
 
-def backtest(df: pd.DataFrame, holding_days: int, profit_pct: float, stop_pct: float) -> dict:
+# ══════════════════════════════════════════════════════════════════
+# SIGNAL  LIFECYCLE  ENGINE
+# 訊號生命週期管理：進場窗口 / 退場條件 / 狀態追蹤 / 說明
+# ══════════════════════════════════════════════════════════════════
+
+# ── Per-signal lifecycle definition ───────────────────────────────
+# Each entry defines the DNA of a signal:
+#   entry_day   : when to enter relative to signal day (D+0 = same day)
+#   entry_latest: last acceptable entry day (after this → EXPIRED)
+#   entry_time  : recommended clock time for entry
+#   holding     : typical holding description
+#   stop_method : how to set stop loss
+#   stop_pct    : default fixed stop %
+#   target_r    : target R-multiples (list)
+#   exit_triggers: conditions that force exit
+#   decay_days  : signal loses validity after N days without entry
+#   trade_type  : overnight / swing / longterm
+#   explanation : plain-language explanation shown in UI
+SIGNAL_LIFECYCLE = {
+    "HIGH_CONF_BUY": dict(
+        label="⭐ 三重共振",
+        color="#ffd700",
+        entry_day=0,
+        entry_latest=2,
+        entry_time="13:20–13:30（收盤前）",
+        holding="彈性：隔日沖 / 波段 / 長線皆宜",
+        stop_method="ATR × 1.5 或 固定 -7%",
+        stop_pct=7.0,
+        target_r=[1.5, 2.5],
+        decay_days=3,
+        trade_type="swing",
+        exit_triggers=["跌破停損", "CCI跌破0軸+放量", "出現頂背離", "第4日未突破"],
+        explanation=(
+            "三重共振是最高勝率訊號，但**訊號日追高風險大**。\n\n"
+            "**最佳策略**：訊號日觀察，等收盤前 13:20 確認量能未萎縮再進，"
+            "或等次日縮量回調（💎 共振回調買）再進場，停損更近。\n\n"
+            "**有效期**：3 個交易日。第 4 天若股價未能突破訊號日高點，"
+            "視為主力動能衰減，訊號失效不再追入。\n\n"
+            "**退場原則**：\n"
+            "• 短線：次日開盤 +3% 以上分批出\n"
+            "• 波段：CCI 突破 +100 後設移動停損，讓利潤奔跑\n"
+            "• 長線：跌破 EMA200 年線才考慮全出"
+        ),
+    ),
+    "HIGH_CONF_PULLBACK": dict(
+        label="💎 共振回調買",
+        color="#00e5ff",
+        entry_day=0,
+        entry_latest=0,
+        entry_time="訊號出現當日任意時間",
+        holding="同三重共振，但停損更緊",
+        stop_method="訊號日低點下方 0.5%",
+        stop_pct=4.0,
+        target_r=[2.0, 4.0],
+        decay_days=1,
+        trade_type="swing",
+        exit_triggers=["跌破訊號日低點", "CCI跌破0軸", "回調超過5%"],
+        explanation=(
+            "三重共振後的健康縮量回調，是**比訊號當天更好的進場點**。\n\n"
+            "**為何更好？** 停損放在訊號日低點（通常只有 2–4%），"
+            "目標不變（10–20%），風險報酬比提升 2–3 倍。\n\n"
+            "**進場邏輯**：今日縮量（量 < 訊號日 80%）+ CCI > 0 + 站上 EMA20，"
+            "表示主力未出貨，只是短線浮額在洗盤。\n\n"
+            "**注意**：此訊號**有效期只有當天**。"
+            "如果當天未進場，明天可能就已經脫離最佳買點。"
+        ),
+    ),
+    "BREAKOUT_BUY": dict(
+        label="🟠 噴發買",
+        color="#ff9900",
+        entry_day=1,
+        entry_latest=3,
+        entry_time="D+1 開盤後 09:30–10:00",
+        holding="波段為主，3–10 個交易日",
+        stop_method="訊號日低點",
+        stop_pct=6.0,
+        target_r=[2.0, 3.0],
+        decay_days=5,
+        trade_type="swing",
+        exit_triggers=["跌破訊號日低點", "CCI跌破+100後再次下穿", "量能萎縮3日"],
+        explanation=(
+            "CCI 強力突破 +100 + 強放量，代表**主力資金大幅買入**。\n\n"
+            "**為何不在訊號日進？** 噴發當天追高，追的是最貴的價格，"
+            "前方套牢籌碼多，回吐風險大。\n\n"
+            "**最佳進法**：等次日開盤，觀察量能是否延續。若開盤量繼續放大、"
+            "突破前日高點 → 進場。若開盤跳空過高（超過 3%）→ 不追，等回調。\n\n"
+            "**有效期**：5 個交易日。超過仍未進場，主力動能可能已消耗。"
+        ),
+    ),
+    "STRONG_BUY": dict(
+        label="🟢 強買",
+        color="#00ff88",
+        entry_day=0,
+        entry_latest=2,
+        entry_time="D+0 收盤前 or D+1 開盤",
+        holding="3–7 個交易日",
+        stop_method="訊號日低點",
+        stop_pct=5.0,
+        target_r=[1.5, 2.5],
+        decay_days=3,
+        trade_type="swing",
+        exit_triggers=["跌破訊號日低點", "反彈至EMA20後量縮", "出現賣出訊號"],
+        explanation=(
+            "CCI 從 -100 以下突破 + 放量 + 止跌 K 棒（下影線/吞噬），"
+            "是**底部反彈的強確認**。\n\n"
+            "**進場邏輯**：止跌 K 棒已確認底部，訊號當天收盤前可小量試單（30%），"
+            "次日確認不破低再加碼（70%）。\n\n"
+            "**不同於三重共振**：強買通常在底部出現，EMA 排列可能還未對齊，"
+            "適合**波段反彈操作**，不適合長線。\n\n"
+            "**目標**：反彈至 EMA20 附近（約 5–10% 空間）後評估是否繼續持有。"
+        ),
+    ),
+    "DIV_BUY": dict(
+        label="🟢 底背離",
+        color="#00ff88",
+        entry_day=1,
+        entry_latest=3,
+        entry_time="D+1 確認當日不破低後進",
+        holding="5–15 個交易日",
+        stop_method="背離低點下方 1%",
+        stop_pct=6.0,
+        target_r=[2.0, 4.0],
+        decay_days=5,
+        trade_type="swing",
+        exit_triggers=["跌破背離低點", "CCI不再抬高（背離失效）", "股價創新低"],
+        explanation=(
+            "**底背離**：股價創新低，但 CCI 底部在抬高 → 賣壓在減弱，底部可能確立。\n\n"
+            "**進場邏輯**：背離當天先觀察，次日確認股價未再創新低、"
+            "量能略有回升，才進場。倉位從小到大，分 2–3 批。\n\n"
+            "**停損**：放在背離形成的最低點下方 1%。\n"
+            "若底部支撐被有效跌破，背離型態失效，必須立即出場。\n\n"
+            "**目標**：底部反彈通常有 15–25% 空間，是波段中勝率較高的型態。"
+        ),
+    ),
+    "BUY": dict(
+        label="🔵 買入",
+        color="#44ddff",
+        entry_day=0,
+        entry_latest=1,
+        entry_time="D+0 收盤前 / D+1 開盤",
+        holding="2–5 個交易日",
+        stop_method="固定 -5%",
+        stop_pct=5.0,
+        target_r=[1.0, 2.0],
+        decay_days=2,
+        trade_type="swing",
+        exit_triggers=["跌破-5%停損", "CCI重新跌破0軸", "次日無量"],
+        explanation=(
+            "CCI 突破 0 軸 + 放量，動能由負轉正的**早期訊號**。\n\n"
+            "**特性**：比三重共振更早，但共振指標尚未全部對齊，"
+            "勝率低於三重共振，建議**小倉試單**（總資金 5–8%）。\n\n"
+            "**策略**：若次日繼續放量上漲 → 可加碼。若次日縮量橫盤 → 觀察。"
+            "若次日放量下跌 → 訊號失效，依停損出場。\n\n"
+            "**有效期**：2 個交易日，短期確認機制。"
+        ),
+    ),
+}
+
+_LIFECYCLE_FILE = "/tmp/sentinel_lifecycle.json"
+
+
+def _load_lifecycle_store() -> dict:
+    """Always read fresh from disk — lifecycle data must be current."""
+    try:
+        if os.path.exists(_LIFECYCLE_FILE):
+            with open(_LIFECYCLE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"records": []}
+
+
+def _save_lifecycle(store: dict) -> None:
+    tmp = _LIFECYCLE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _LIFECYCLE_FILE)
+
+
+def lifecycle_add(record: dict) -> bool:
+    """
+    Add a new lifecycle record for a buy signal.
+    Deduplicates by (code, sig_key, date_fired).
+    Returns True if added, False if duplicate.
+    """
+    store = _load_lifecycle_store()
+    key = (record["code"], record["sig_key"], record["date_fired"])
+    existing = {(r["code"], r["sig_key"], r["date_fired"]) for r in store["records"]}
+    if key in existing:
+        return False
+    store["records"].append(record)
+    _save_lifecycle(store)
+    return True
+
+
+def lifecycle_build_record(code: str, name: str, sig_key: str,
+                            price: float, atr_stop: float,
+                            conf: int, trend: int) -> dict:
+    """
+    Build a complete lifecycle record for a new buy signal.
+    Includes entry window, stop prices, targets, explanation.
+    """
+    cfg  = SIGNAL_LIFECYCLE.get(sig_key, SIGNAL_LIFECYCLE["BUY"])
+    today = tw_now().date()
+
+    # Calculate trading days for entry window (skip weekends)
+    def add_trading_days(start_date, n_days):
+        d = start_date
+        added = 0
+        while added < n_days:
+            d = d + __import__('datetime').timedelta(days=1)
+            if d.weekday() < 5:   # Mon-Fri
+                added += 1
+        return d
+
+    entry_open  = (today if cfg["entry_day"] == 0
+                   else add_trading_days(today, cfg["entry_day"]))
+    entry_close = add_trading_days(today, cfg["entry_latest"]) \
+                  if cfg["entry_latest"] > 0 else today
+    expiry      = add_trading_days(today, cfg["decay_days"])
+
+    stop_fixed  = round(price * (1 - cfg["stop_pct"] / 100), 2)
+    stop_price  = min(float(atr_stop) if isinstance(atr_stop, (int, float))
+                      and atr_stop > 0 else stop_fixed, stop_fixed)
+    risk_per_sh = price - stop_price
+    target_1r   = round(price + risk_per_sh * cfg["target_r"][0], 2)
+    target_2r   = round(price + risk_per_sh * cfg["target_r"][1], 2)
+
+    return {
+        "id":           f"{code}_{sig_key}_{today}",
+        "code":         code,
+        "name":         name,
+        "sig_key":      sig_key,
+        "sig_label":    cfg["label"],
+        "color":        cfg["color"],
+        "date_fired":   str(today),
+        "price_fired":  price,
+        "conf":         conf,
+        "trend":        trend,
+        # Entry window
+        "entry_open":   str(entry_open),
+        "entry_close":  str(entry_close),
+        "entry_time":   cfg["entry_time"],
+        "entry_latest": cfg["entry_latest"],
+        # Risk management
+        "stop_price":   stop_price,
+        "stop_method":  cfg["stop_method"],
+        "target_1r":    target_1r,
+        "target_2r":    target_2r,
+        "risk_per_sh":  round(risk_per_sh, 2),
+        # Exit rules
+        "exit_triggers":cfg["exit_triggers"],
+        "expiry_date":  str(expiry),
+        "decay_days":   cfg["decay_days"],
+        "trade_type":   cfg["trade_type"],
+        "holding":      cfg["holding"],
+        "explanation":  cfg["explanation"],
+        # Status tracking
+        "status":       "active",    # active / entered / expired / stopped / target
+        "entered_price": None,
+        "entered_date":  None,
+        "exit_price":    None,
+        "exit_date":     None,
+        "exit_reason":   None,
+    }
+
+
+def lifecycle_update_statuses() -> int:
+    """
+    Scan all active records and auto-expire those past their expiry_date.
+    Returns count of records changed.
+    """
+    store   = _load_lifecycle_store()
+    today   = tw_now().date()
+    changed = 0
+    for r in store["records"]:
+        if r["status"] != "active":
+            continue
+        expiry = __import__('datetime').date.fromisoformat(r["expiry_date"])
+        if today > expiry:
+            r["status"]      = "expired"
+            r["exit_reason"] = f"訊號有效期 {r['decay_days']} 天已過，自動失效"
+            changed += 1
+    if changed:
+        _save_lifecycle(store)
+    return changed
+
+
+def lifecycle_get_active() -> list:
+    """Return all active (not expired/stopped/target) lifecycle records."""
+    return [r for r in _load_lifecycle_store()["records"]
+            if r["status"] == "active"]
+
+
+def lifecycle_get_all() -> list:
+    return _load_lifecycle_store()["records"]
+
+
+def lifecycle_mark_entered(record_id: str, price: float) -> None:
+    store = _load_lifecycle_store()
+    for r in store["records"]:
+        if r["id"] == record_id:
+            r["status"]        = "entered"
+            r["entered_price"] = price
+            r["entered_date"]  = str(tw_now().date())
+            break
+    _save_lifecycle(store)
+
+
+def lifecycle_mark_exit(record_id: str, price: float, reason: str) -> None:
+    store = _load_lifecycle_store()
+    for r in store["records"]:
+        if r["id"] == record_id:
+            r["status"]      = "stopped" if "停損" in reason else "target"
+            r["exit_price"]  = price
+            r["exit_date"]   = str(tw_now().date())
+            r["exit_reason"] = reason
+            break
+    _save_lifecycle(store)
+
+
+def lifecycle_days_remaining(record: dict) -> int:
+    """Return trading days remaining in the entry window. Negative = expired."""
+    try:
+        today  = tw_now().date()
+        expiry = __import__('datetime').date.fromisoformat(record["expiry_date"])
+        delta  = (expiry - today).days
+        return delta
+    except Exception:
+        return 0
+
+
+def lifecycle_urgency(record: dict) -> str:
+    """Return urgency label based on days remaining."""
+    days = lifecycle_days_remaining(record)
+    if days <= 0:   return "已失效"
+    if days == 1:   return "🔴 最後1天"
+    if days == 2:   return "🟠 剩2天"
+    return f"🟢 剩{days}天"
+
+
+def lifecycle_tg_reminder(active_records: list, token: str, chat_id: str) -> int:
+    """
+    Push Telegram reminders for active signals:
+    - Expiring tomorrow: 'Last chance' alert
+    - Newly added today: entry window open
+    Returns count of messages sent.
+    """
+    if not token or not chat_id:
+        return 0
+    today = str(tw_now().date())
+    msgs  = []
+    for r in active_records:
+        days = lifecycle_days_remaining(r)
+        if days == 1:
+            msgs.append(
+                f"⏰ 明日進場最後機會\n"
+                f"{r['sig_label']} {r['code']} {r['name']}\n"
+                f"進場窗口：{r['entry_open']} – {r['entry_close']}\n"
+                f"訊號價：{r['price_fired']:.2f}  停損：{r['stop_price']:.2f}\n"
+                f"目標1：{r['target_1r']:.2f}  目標2：{r['target_2r']:.2f}"
+            )
+        elif r["date_fired"] == today and days > 1:
+            msgs.append(
+                f"🆕 新訊號進場窗口開啟\n"
+                f"{r['sig_label']} {r['code']} {r['name']}\n"
+                f"建議進場：{r['entry_time']}\n"
+                f"停損：{r['stop_price']:.2f}  目標：{r['target_1r']:.2f} / {r['target_2r']:.2f}\n"
+                f"有效至：{r['expiry_date']}（剩 {days} 天）"
+            )
+    sent = 0
+    for msg in msgs:
+        ok, _ = _tg_send(token, chat_id, msg)
+        if ok:
+            sent += 1
+    return sent
+
+
+
     """
     Backtest buy signals. Entry is at the NEXT bar's open (simulated as next
     bar's close) to avoid look-ahead bias — you can only act after the signal
@@ -1478,16 +1930,17 @@ def batch_fetch_quotes(symbols: tuple) -> dict:
 # ══════════════════════════════════════════════
 
 MARKER_SHAPE = {
-    "HIGH_CONF_BUY": ("star",          "#ffd700", 16, "below"),
-    "BREAKOUT_BUY":  ("triangle-up",   "#ff9900", 14, "below"),
-    "STRONG_BUY":    ("triangle-up",   "#00ff88", 12, "below"),
-    "BUY":           ("triangle-up",   "#44ddff", 10, "below"),
-    "DIV_BUY":       ("diamond",       "#00ff88", 10, "below"),
-    "WATCH":         ("circle-open",   "#ffee44",  8, "below"),
-    "STRONG_SELL":   ("triangle-down", "#ff3355", 12, "above"),
-    "SELL":          ("triangle-down", "#ff8866", 10, "above"),
-    "DIV_SELL":      ("diamond",       "#ff3355", 10, "above"),
-    "FAKE_BREAKOUT": ("x",             "#cc44ff",  8, "above"),
+    "HIGH_CONF_BUY":      ("star",          "#ffd700", 16, "below"),
+    "HIGH_CONF_PULLBACK": ("diamond",       "#00e5ff", 14, "below"),  # 💎 cyan diamond
+    "BREAKOUT_BUY":       ("triangle-up",   "#ff9900", 14, "below"),
+    "STRONG_BUY":         ("triangle-up",   "#00ff88", 12, "below"),
+    "BUY":                ("triangle-up",   "#44ddff", 10, "below"),
+    "DIV_BUY":            ("diamond",       "#00ff88", 10, "below"),
+    "WATCH":              ("circle-open",   "#ffee44",  8, "below"),
+    "STRONG_SELL":        ("triangle-down", "#ff3355", 12, "above"),
+    "SELL":               ("triangle-down", "#ff8866", 10, "above"),
+    "DIV_SELL":           ("diamond",       "#ff3355", 10, "above"),
+    "FAKE_BREAKOUT":      ("x",             "#cc44ff",  8, "above"),
 }
 
 
@@ -2769,6 +3222,207 @@ def backtest_by_regime(
     }
 
 
+
+# ══════════════════════════════════════════════════════════════
+# OVERNIGHT  GAP  STRATEGY  ENGINE
+# 隔日沖選股策略：因素回測 + 評分 + 掃描器
+# Logic: enter near close (13:20), exit next-day open (09:05)
+# ══════════════════════════════════════════════════════════════
+
+def _overnight_factors(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute all overnight strategy factors for each bar.
+    Returns df with new columns ready for scoring and backtesting.
+    """
+    d = df.copy()
+    # ── Factor A: Close strength ──────────────────────────────
+    d["F_close_pos"]   = (d["Close"] - d["Low"]) / (d["High"] - d["Low"] + 1e-8)
+    d["F_close_near_high"] = d["F_close_pos"] >= 0.92   # close in top 8% of range
+    d["F_gain_pct"]    = d["Close"].pct_change() * 100
+    d["F_gain_3_7"]    = d["F_gain_pct"].between(2.5, 8.0)  # 2.5-8% sweet spot
+
+    # ── Factor B: Volume quality ──────────────────────────────
+    d["F_vol_ma20"]    = d["Volume"].rolling(20).mean()
+    d["F_vol_ratio"]   = d["Volume"] / (d["F_vol_ma20"] + 1)
+    d["F_vol_surge"]   = d["F_vol_ratio"] >= 1.8           # 1.8x+ volume
+    d["F_obv"]         = (d["Close"].diff().apply(lambda x: 1 if x > 0 else -1) * d["Volume"]).cumsum()
+    d["F_obv_new_high"]= d["F_obv"] >= d["F_obv"].rolling(10).max().shift(1)  # OBV new 10-day high
+
+    # ── Factor C: Technical structure ────────────────────────
+    d["F_ema20"]       = d["Close"].ewm(span=20, adjust=False).mean()
+    d["F_ema60"]       = d["Close"].ewm(span=60, adjust=False).mean()
+    d["F_ema200"]      = d["Close"].ewm(span=200, adjust=False).mean()
+    d["F_above_ema20"] = d["Close"] > d["F_ema20"]
+    d["F_trend_ok"]    = (d["Close"] > d["F_ema20"]) & (d["F_ema20"] > d["F_ema60"])
+    d["F_above_200"]   = d["Close"] > d["F_ema200"]       # above annual line
+    # Breakout: today close > max close of prior 20 days
+    d["F_breakout_20d"]= d["Close"] > d["Close"].shift(1).rolling(20).max()
+
+    # ── Factor D: Tail-end volume (proxy: vol in last 30 min) ─
+    # We don't have intraday data, so use today's volume/ema ratio × close position
+    d["F_tail_strength"] = d["F_vol_ratio"] * d["F_close_pos"]
+    d["F_tail_ok"]       = d["F_tail_strength"] >= 1.5
+
+    return d
+
+
+def overnight_factor_backtest(df: pd.DataFrame) -> dict:
+    """
+    Backtest each overnight factor independently AND in combination.
+    Entry: close of signal day.
+    Exit: open of next day.
+    Returns full analysis dict.
+    """
+    d = _overnight_factors(df)
+
+    # Need next-day open
+    d["next_open"]  = d["Open"].shift(-1)
+    d["next_open_ret"] = (d["next_open"] - d["Close"]) / d["Close"] * 100
+    d["next_open_win"] = d["next_open_ret"] > 0
+
+    valid = d.dropna(subset=["next_open_ret"])
+    if len(valid) < 30:
+        return {}
+
+    factors = {
+        "A1_收盤強度":   "F_close_near_high",
+        "A2_漲幅3-8%":   "F_gain_3_7",
+        "B1_量能放大":   "F_vol_surge",
+        "B2_OBV新高":    "F_obv_new_high",
+        "C1_均線多頭":   "F_trend_ok",
+        "C2_站上年線":   "F_above_200",
+        "C3_突破20日高": "F_breakout_20d",
+        "D1_尾盤強度":   "F_tail_ok",
+    }
+
+    results = {}
+    for name, col in factors.items():
+        if col not in valid.columns:
+            continue
+        sub = valid[valid[col] == True]
+        if len(sub) < 5:
+            continue
+        wr  = sub["next_open_win"].mean() * 100
+        avg = sub["next_open_ret"].mean()
+        med = sub["next_open_ret"].median()
+        std = sub["next_open_ret"].std()
+        sharpe = avg / std * (252 ** 0.5) if std > 0 else 0
+        results[name] = {
+            "樣本數": len(sub),
+            "勝率%":   round(wr, 1),
+            "平均報酬%": round(avg, 3),
+            "中位報酬%": round(med, 3),
+            "Sharpe":   round(sharpe, 2),
+        }
+
+    # ── Composite score backtest ──────────────────────────────
+    # Score each bar 0-8 (one point per factor)
+    score_cols = list(factors.values())
+    valid_s    = valid.copy()
+    for c in score_cols:
+        if c not in valid_s.columns:
+            valid_s[c] = False
+    valid_s["OVN_Score"] = valid_s[score_cols].astype(int).sum(axis=1)
+
+    combo_rows = []
+    for min_score in range(3, 8):
+        sub = valid_s[valid_s["OVN_Score"] >= min_score]
+        if len(sub) < 3:
+            continue
+        wr  = sub["next_open_win"].mean() * 100
+        avg = sub["next_open_ret"].mean()
+        combo_rows.append({
+            "評分門檻≥": min_score,
+            "符合天數":   len(sub),
+            "勝率%":      round(wr, 1),
+            "平均報酬%":  round(avg, 3),
+            "期望值%":    round(wr/100 * avg - (1 - wr/100) * abs(avg), 3),
+        })
+
+    # ── Find optimal score threshold ─────────────────────────
+    if combo_rows:
+        df_combo = pd.DataFrame(combo_rows)
+        best_idx = df_combo["期望值%"].idxmax()
+        best_threshold = int(df_combo.loc[best_idx, "評分門檻≥"])
+    else:
+        df_combo = pd.DataFrame()
+        best_threshold = 5
+
+    # ── Market regime filter: does market direction matter? ──
+    d2 = valid_s.copy()
+    d2["idx_ret"] = d2["Close"].pct_change() * 100   # proxy: stock itself
+    market_up = d2["idx_ret"] > 0
+    sub_mkt_up   = d2[market_up  & (d2["OVN_Score"] >= best_threshold)]
+    sub_mkt_down = d2[~market_up & (d2["OVN_Score"] >= best_threshold)]
+    mkt_filter = {
+        "大盤上漲日": {
+            "樣本": len(sub_mkt_up),
+            "勝率%": round(sub_mkt_up["next_open_win"].mean()*100, 1) if len(sub_mkt_up)>2 else 0,
+        },
+        "大盤下跌日": {
+            "樣本": len(sub_mkt_down),
+            "勝率%": round(sub_mkt_down["next_open_win"].mean()*100, 1) if len(sub_mkt_down)>2 else 0,
+        },
+    }
+
+    return {
+        "factor_results":   results,
+        "combo_df":         df_combo,
+        "best_threshold":   best_threshold,
+        "market_filter":    mkt_filter,
+        "detail":           valid_s,
+    }
+
+
+def overnight_score(df_row_factors: pd.Series) -> int:
+    """
+    Score a single bar (latest row) 0-8 for overnight suitability.
+    Higher = better candidate.
+    """
+    cols = ["F_close_near_high","F_gain_3_7","F_vol_surge","F_obv_new_high",
+            "F_trend_ok","F_above_200","F_breakout_20d","F_tail_ok"]
+    return int(sum(bool(df_row_factors.get(c, False)) for c in cols))
+
+
+def overnight_scan(watchlist: list, min_score: int = 5,
+                   data_period: str = "1y") -> list[dict]:
+    """
+    Scan watchlist for today's overnight candidates.
+    Returns sorted list of dicts with code, score, factors.
+    """
+    candidates = []
+    for code in watchlist:
+        try:
+            df, _ = fetch_data(code, data_period)
+            if df is None or len(df) < 60:
+                continue
+            df_f  = _overnight_factors(df)
+            latest = df_f.iloc[-1]
+            score  = overnight_score(latest)
+            if score < min_score:
+                continue
+            gain   = float(latest.get("F_gain_pct", 0) or 0)
+            vol_r  = float(latest.get("F_vol_ratio", 0) or 0)
+            c_pos  = float(latest.get("F_close_pos", 0) or 0)
+            candidates.append({
+                "代號":       code,
+                "名稱":       lookup_name(code),
+                "評分":       score,
+                "漲幅%":      round(gain, 2),
+                "量比":       round(vol_r, 2),
+                "收盤位置%": round(c_pos * 100, 1),
+                "站上年線":   bool(latest.get("F_above_200", False)),
+                "均線多頭":   bool(latest.get("F_trend_ok", False)),
+                "突破20高":   bool(latest.get("F_breakout_20d", False)),
+                "OBV新高":    bool(latest.get("F_obv_new_high", False)),
+                "_price":     float(df["Close"].iloc[-1]),
+                "_score":     score,
+            })
+        except Exception:
+            continue
+    return sorted(candidates, key=lambda x: -x["_score"])
+
+
 DEFAULT_WATCHLIST = [
     # 上市 (TSE .TW) ─────────────────────────────
     # 上市 (TSE .TW) ─────────────────────────────
@@ -3498,9 +4152,10 @@ def main():
     # ══════════════════════════════════════════
     # TABS
     # ══════════════════════════════════════════
-    tab_scan, tab_drill, tab_bt, tab_port, tab_sig_hist = st.tabs([
+    tab_scan, tab_drill, tab_bt, tab_port, tab_sig_hist, tab_lifecycle, tab_overnight = st.tabs([
         "📡  訊號掃描", "🔬  個股分析", "📊  回測 & 優化",
         "📒  買賣記錄", "📈  訊號歷史勝率",
+        "🗓  訊號管理", "🌙  隔日沖策略",
     ])
 
     # ─────────────────────────────────────────
@@ -3840,11 +4495,30 @@ def main():
                         "ret_5d":      None, "ret_10d":   None, "ret_20d":   None,
                         "status":      "pending",
                     })
+                    # ── Lifecycle record (new in v3.2) ────────────────
+                    lc_rec = lifecycle_build_record(
+                        code    = r["代號"],
+                        name    = r.get("_cn_name", r.get("名稱","")),
+                        sig_key = r["_sig_key"],
+                        price   = float(r.get("_price", 0) or 0),
+                        atr_stop= float(r.get("_atr_stop", 0) or 0),
+                        conf    = int(r.get("_conf", 0) or 0),
+                        trend   = int(r.get("趨勢", 0) or 0),
+                    )
+                    lifecycle_add(lc_rec)
 
             # ── Update outcomes for previously recorded signals ───────
             n_updated = sig_hist_update_outcomes(fetch_data)
             if n_updated:
                 st.toast(f"📈 已更新 {n_updated} 筆歷史訊號實際報酬", icon="📊")
+
+            # ── Lifecycle: auto-expire + Telegram reminders ──────────
+            n_expired = lifecycle_update_statuses()
+            if n_expired:
+                st.toast(f"⏰ {n_expired} 筆訊號已自動失效", icon="🔕")
+            lc_active = lifecycle_get_active()
+            if lc_active and tg_token_v and tg_chat_v:
+                lifecycle_tg_reminder(lc_active, tg_token_v, tg_chat_v)
 
             # ── Telegram push for NEW actionable signals ──────────────
             tg_token_v   = st.session_state.get("tg_token", "")
@@ -4063,6 +4737,7 @@ def main():
             <div class="signal-legend">
             <b>⭐ 最高品質：</b>
             ⭐ <b>三重共振</b> 趨勢↑ + 5+/7指標共振 + 動能加速（最高勝率）<br>
+            💎 <b>共振回調買</b> 三重共振後 1–3 日縮量回調，CCI>0 結構完整（風險報酬比更優）<br>
             <b>買入訊號：</b>
             🟠 <b>噴發買</b> CCI突破+100強放量　
             🟢 <b>強買</b> CCI突破-100放量止跌K　
@@ -4771,33 +5446,311 @@ def main():
         trades_all = port_get_trades()
 
         # ══════════════════════════════════════════════════════
-        # SECTION A — 新增交易記錄
+        # SECTION A — 新增交易記錄 + 智能倉位建議
         # ══════════════════════════════════════════════════════
-        with st.expander("➕ 新增交易", expanded=not trades_all):
+        with st.expander("➕ 新增交易 & 倉位顧問", expanded=not trades_all):
+
+            # ── Step 1: 交易類型 ─────────────────────────────
+            st.markdown("**① 選擇交易類型**")
+            trade_type_map = {
+                "🌙 隔日沖": "overnight",
+                "📈 波段交易": "swing",
+                "💼 長線持倉": "longterm",
+            }
+            trade_type_lbl = st.radio(
+                "交易類型",
+                list(trade_type_map.keys()),
+                horizontal=True,
+                label_visibility="collapsed",
+                key="pt_trade_type",
+            )
+            trade_type = trade_type_map[trade_type_lbl]
+
+            # Type explanations
+            type_info = {
+                "overnight": dict(
+                    title="🌙 隔日沖",
+                    desc="今日收盤前 13:20–13:30 進場，次日開盤 09:05–09:30 出場。",
+                    holding="持倉時間：**固定 18–20 小時**",
+                    entry_rule="**一次全進**：時間窗口短，不做分批",
+                    exit_rule="次日開盤：跌破進場價 **-2%** 立即止損；漲超 **+3%** 可部分留倉",
+                    add_rule="**不加碼**：隔日沖不追加倉位",
+                    risk_default=2.0,
+                    risk_options=[("積極 2%", 2.0), ("標準 1%", 1.0), ("保守 0.5%", 0.5)],
+                    color="#5a8fb0",
+                ),
+                "swing": dict(
+                    title="📈 波段交易",
+                    desc="跟著趨勢持有，從幾天到數週，依訊號反轉或目標價出場。",
+                    holding="持倉時間：**3 天到 4 週**（視趨勢強度）",
+                    entry_rule="**分批建倉**：第一批 40-50%，趨勢確認後加碼",
+                    exit_rule="**ATR 移動停損**：盈利超過 1R 後跟蹤停損；目標 2-3R 分批出",
+                    add_rule="**趨勢加碼**：股價再突破 + 量能確認後，加碼第二批 30%",
+                    risk_default=1.5,
+                    risk_options=[("積極 2%", 2.0), ("標準 1.5%", 1.5), ("保守 1%", 1.0)],
+                    color="#00ff88",
+                ),
+                "longterm": dict(
+                    title="💼 長線持倉",
+                    desc="基本面 + 趨勢雙重確認，月線以上週期，適合資金大的核心倉。",
+                    holding="持倉時間：**1 個月以上**（視基本面改變）",
+                    entry_rule="**分批建倉**：第一批 30%，每逢回調 5% 加碼一次",
+                    exit_rule="**跌破 EMA200 年線**視為出場訊號；目標 20%+ 分批減碼",
+                    add_rule="**逢低加碼**：股價回調至 EMA60 附近 + 量縮後，加碼 20-30%",
+                    risk_default=1.0,
+                    risk_options=[("標準 1%", 1.0), ("保守 0.5%", 0.5)],
+                    color="#f0a500",
+                ),
+            }
+            info = type_info[trade_type]
+
+            st.markdown(
+                f'<div style="background:#0d1a2d;border-left:3px solid {info["color"]};'
+                f'border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:12px">'
+                f'<div style="color:{info["color"]};font-weight:700;font-size:0.88rem">'
+                f'{info["title"]}</div>'
+                f'<div style="color:#8a9bb5;font-size:0.8rem;margin-top:4px">{info["desc"]}</div>'
+                f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:8px;font-size:0.75rem">'
+                f'<div><span style="color:#5a8fb0">⏱ 持倉：</span>'
+                f'<span style="color:#cdd9e8">{info["holding"]}</span></div>'
+                f'<div><span style="color:#5a8fb0">📥 進場：</span>'
+                f'<span style="color:#cdd9e8">{info["entry_rule"]}</span></div>'
+                f'<div><span style="color:#5a8fb0">📤 出場：</span>'
+                f'<span style="color:#cdd9e8">{info["exit_rule"]}</span></div>'
+                f'<div><span style="color:#5a8fb0">➕ 加碼：</span>'
+                f'<span style="color:#cdd9e8">{info["add_rule"]}</span></div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
+            # ── Step 2: 風險參數 ─────────────────────────────
+            st.markdown("**② 風險參數設定**")
+            rc1, rc2, rc3 = st.columns(3)
+
+            total_capital = rc1.number_input(
+                "可用總資金（元）",
+                min_value=10000, max_value=100_000_000,
+                value=int(st.session_state.get("pt_capital_mem", 500000)),
+                step=50000, key="pt_capital",
+                help=(
+                    "你這次可動用的總資金。\n"
+                    "系統用這個數字計算「每筆最大損失金額」，\n"
+                    "再換算成建議股數。不會影響任何實際交易。"
+                ),
+            )
+            st.session_state["pt_capital_mem"] = total_capital
+
+            risk_label = rc2.selectbox(
+                "每筆最大風險",
+                [lbl for lbl, _ in info["risk_options"]],
+                key="pt_risk_lbl",
+                help=(
+                    "**每筆最大風險** = 這筆交易最多虧多少佔總資金的比例。\n\n"
+                    f"• 積極 2%：每筆最多虧 {total_capital*0.02:,.0f} 元\n"
+                    f"• 標準 1%：每筆最多虧 {total_capital*0.01:,.0f} 元\n"
+                    f"• 保守 0.5%：每筆最多虧 {total_capital*0.005:,.0f} 元\n\n"
+                    "專業建議：單筆風險不超過總資金 2%，才能在 10 連虧後仍保留 80% 資金。"
+                ),
+            )
+            risk_pct = dict(info["risk_options"])[risk_label] / 100
+            max_loss_amt = total_capital * risk_pct
+
+            stop_pct_input = rc3.number_input(
+                "停損幅度 %",
+                min_value=0.5, max_value=15.0,
+                value={"overnight": 2.0, "swing": 7.0, "longterm": 10.0}[trade_type],
+                step=0.5, key="pt_stop_pct",
+                help=(
+                    "**停損幅度** = 進場後最多容忍跌多少% 才出場。\n\n"
+                    "• 隔日沖：2%（固定，開盤即止損）\n"
+                    "• 波段：5-8%（ATR 倍數或固定%）\n"
+                    "• 長線：8-12%（給更大的呼吸空間）\n\n"
+                    "停損越緊，建議股數越多（相同風險金額下），"
+                    "但也越容易被洗出，需根據個股波動調整。"
+                ),
+            )
+
+            # ── Step 3: 股票基本資訊 ────────────────────────
+            st.markdown("**③ 股票與進場資訊**")
             fa1, fa2, fa3 = st.columns([2, 2, 2])
             wl_opts = [c.replace(".TW","").replace(".TWO","")
                        for c in st.session_state.watchlist]
             t_code  = fa1.selectbox("股票代號", wl_opts,
                                     key="pt_code",
-                                    help="從自選股選擇")
+                                    help="從自選股選擇，或在下方手動輸入")
             t_cust  = fa2.text_input("或手動輸入代號",
                                       placeholder="2330 / 3661",
                                       key="pt_cust")
-            t_type  = fa3.selectbox("交易類型", ["買入", "賣出"], key="pt_type")
+            t_buy_sell = fa3.selectbox(
+                "買 / 賣",
+                ["買入", "賣出"],
+                key="pt_type",
+                help=(
+                    "**買入**：建立新倉位或加碼現有倉位。\n"
+                    "**賣出**：減碼或清倉現有持股。\n\n"
+                    "賣出時系統會自動核對現有持倉，"
+                    "避免賣超過持有數量。"
+                ),
+            )
 
-            fb1, fb2, fb3, fb4, fb5 = st.columns([2, 1.5, 1.5, 1.5, 1.5])
+            fb1, fb2, fb3 = st.columns(3)
             t_date  = fb1.date_input("交易日期",
                                       value=tw_now().date(), key="pt_date")
-            t_price = fb2.number_input("成交價", min_value=0.01,
-                                        value=100.0, step=0.01, key="pt_price")
-            t_shares = fb3.number_input("股數", min_value=1,
-                                         value=1000, step=100, key="pt_shares")
-            t_fee   = fb4.number_input("手續費 $", min_value=0.0,
-                                        value=round(t_price * t_shares * 0.001425 * 0.6, 0),
-                                        step=1.0, key="pt_fee",
-                                        help="預設 0.1425%×60折")
-            add_btn = fb5.button("✅ 確認新增", type="primary",
-                                  width='stretch', key="pt_add")
+            t_price = fb2.number_input(
+                "成交價（元）", min_value=0.01, value=100.0, step=0.01, key="pt_price",
+                help="實際成交價格，用於計算建議股數和損益。",
+            )
+
+            # ── Smart position size calculation ─────────────
+            code_for_calc = (t_cust.strip() or t_code).upper().replace(".TW","").replace(".TWO","")
+            stop_price    = round(float(t_price) * (1 - stop_pct_input / 100), 2)
+            risk_per_share = float(t_price) - stop_price
+            if risk_per_share > 0:
+                raw_shares   = max_loss_amt / risk_per_share
+                # Round down to nearest lot (1000 shares in Taiwan)
+                suggested_shares = max(1000, int(raw_shares // 1000) * 1000)
+                suggested_cost   = suggested_shares * float(t_price)
+                capital_pct      = suggested_cost / total_capital * 100
+                # Cap at 25% single-stock limit
+                max_single_shares = int(total_capital * 0.25 / float(t_price) // 1000) * 1000
+                if suggested_shares > max_single_shares:
+                    suggested_shares = max_single_shares
+                    cap_note = "（已依單股上限 25% 調整）"
+                else:
+                    cap_note = ""
+            else:
+                suggested_shares = 1000
+                capital_pct = 0
+                cap_note = ""
+
+            # Batch sizing for swing/longterm
+            if trade_type == "swing":
+                batch1 = max(1000, int(suggested_shares * 0.45 // 1000) * 1000)
+                batch2 = max(1000, int(suggested_shares * 0.30 // 1000) * 1000)
+                batch3 = suggested_shares - batch1 - batch2
+                batch3 = max(0, int(batch3 // 1000) * 1000)
+            elif trade_type == "longterm":
+                batch1 = max(1000, int(suggested_shares * 0.30 // 1000) * 1000)
+                batch2 = max(1000, int(suggested_shares * 0.35 // 1000) * 1000)
+                batch3 = suggested_shares - batch1 - batch2
+                batch3 = max(0, int(batch3 // 1000) * 1000)
+            else:  # overnight — all in
+                batch1 = suggested_shares
+                batch2 = batch3 = 0
+
+            # ── Position size display ───────────────────────
+            st.markdown(
+                f'<div style="background:#0a1e10;border:1px solid #1a4a20;'
+                f'border-radius:8px;padding:12px 16px;margin:8px 0 12px 0">'
+                f'<div style="color:#00ff88;font-weight:700;font-size:0.88rem;margin-bottom:8px">'
+                f'📐 建議倉位計算 {cap_note}</div>'
+                f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;'
+                f'font-size:0.78rem">'
+
+                # Risk info
+                f'<div style="background:#0d1a2d;padding:8px 10px;border-radius:6px">'
+                f'<div style="color:#5a8fb0;font-size:0.65rem;text-transform:uppercase">每筆最大風險</div>'
+                f'<div style="color:#ff6666;font-weight:700;margin-top:3px">'
+                f'{max_loss_amt:,.0f} 元</div>'
+                f'<div style="color:#37474f;font-size:0.65rem">總資金 × {risk_pct*100:.1f}%</div>'
+                f'</div>'
+
+                # Stop price
+                f'<div style="background:#0d1a2d;padding:8px 10px;border-radius:6px">'
+                f'<div style="color:#5a8fb0;font-size:0.65rem;text-transform:uppercase">停損價位</div>'
+                f'<div style="color:#ff3355;font-weight:700;margin-top:3px">'
+                f'{stop_price:.2f} 元</div>'
+                f'<div style="color:#37474f;font-size:0.65rem">-{stop_pct_input:.1f}% 出場</div>'
+                f'</div>'
+
+                # Suggested total
+                f'<div style="background:#0d1a2d;padding:8px 10px;border-radius:6px">'
+                f'<div style="color:#5a8fb0;font-size:0.65rem;text-transform:uppercase">建議總股數</div>'
+                f'<div style="color:#00ff88;font-weight:700;margin-top:3px">'
+                f'{suggested_shares:,} 股</div>'
+                f'<div style="color:#37474f;font-size:0.65rem">'
+                f'佔資金 {suggested_cost/total_capital*100:.1f}%</div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Batch plan
+            if trade_type != "overnight":
+                batch_color = {"swing": "#2196f3", "longterm": "#f0a500"}[trade_type]
+                batch_labels = {
+                    "swing":    [("第一批 進場時",    batch1, "今日訊號確認，立即進場"),
+                                 ("第二批 趨勢確認後", batch2, "股價再突破 + 量能放大後加碼"),
+                                 ("第三批 強勢追加",   batch3, "趨勢加速、評分上升時補倉")],
+                    "longterm": [("第一批 初始建倉",   batch1, "訊號出現，試探性進場"),
+                                 ("第二批 回調加碼",   batch2, "回調至 EMA60 + 量縮時加碼"),
+                                 ("第三批 強勢補倉",   batch3, "突破前高 + 法人買超確認")],
+                }
+                st.markdown(
+                    f'<div style="background:#0a0e1a;border:1px solid {batch_color}40;'
+                    f'border-radius:8px;padding:10px 14px;margin-bottom:10px">'
+                    f'<div style="color:{batch_color};font-size:0.78rem;font-weight:700;'
+                    f'margin-bottom:8px">分批進場計劃</div>'
+                    + "".join([
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                        f'margin-bottom:6px;font-size:0.75rem">'
+                        f'<span style="color:#e8f4fd;font-weight:600">{lbl}</span>'
+                        f'<span style="color:{batch_color};font-family:monospace">'
+                        f'{shares:,} 股 = {shares*float(t_price):,.0f} 元</span>'
+                        f'</div>'
+                        f'<div style="color:#37474f;font-size:0.68rem;margin-bottom:8px;'
+                        f'padding-left:8px">↳ {cond}</div>'
+                        for lbl, shares, cond in batch_labels[trade_type]
+                        if shares > 0
+                    ])
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div style="background:#0a0e1a;border:1px solid #5a8fb040;'
+                    f'border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:0.75rem">'
+                    f'<span style="color:#5a8fb0">⚡ 隔日沖一次全進：</span>'
+                    f'<span style="color:#e8f4fd"> {suggested_shares:,} 股，'
+                    f'成本 {suggested_shares*float(t_price):,.0f} 元</span>'
+                    f'<div style="color:#37474f;margin-top:4px">'
+                    f'↳ 次日開盤 09:05 觀察，跌破 {stop_price:.2f} 立即市價賣出</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            # ── Actual trade input ──────────────────────────
+            st.markdown("**④ 確認本次進場股數**")
+            fc1, fc2, fc3 = st.columns(3)
+            # Default to batch1 suggestion
+            t_shares = fc1.number_input(
+                "本次股數",
+                min_value=1, value=batch1 if batch1 > 0 else suggested_shares,
+                step=1000, key="pt_shares",
+                help=(
+                    f"系統建議：本次進場 {batch1:,} 股\n"
+                    f"（基於每筆最大風險 {max_loss_amt:,.0f} 元、"
+                    f"停損幅度 {stop_pct_input:.1f}% 計算）\n\n"
+                    "你可以直接修改為任意股數，建議值僅供參考。"
+                ),
+            )
+            t_fee = fc2.number_input(
+                "手續費 $", min_value=0.0,
+                value=round(float(t_price) * t_shares * 0.001425 * 0.6, 0),
+                step=1.0, key="pt_fee",
+                help="預設 0.1425% × 60折（一般券商優惠折扣）",
+            )
+            add_btn = fc3.button(
+                "✅ 確認新增", type="primary", width='stretch', key="pt_add",
+            )
+
+            # ── Trade note / strategy tag ───────────────────
+            trade_note = st.text_input(
+                "交易備註（選填）",
+                placeholder=f"例：{trade_type_lbl} 第一批進場，均線多頭確認",
+                key="pt_note",
+                help="記錄進場理由，方便日後回顧。",
+            )
 
             if add_btn:
                 if float(t_price) <= 0:
@@ -4808,28 +5761,37 @@ def main():
                     code_final = (t_cust.strip() or t_code).upper().replace(".TW","").replace(".TWO","")
                     cn, _ = fetch_name(code_final)
                     new_trade = {
-                        "id":     port_next_id(),
-                        "type":   t_type,
-                        "code":   code_final,
-                        "name":   cn or code_final,
-                        "date":   str(t_date),
-                        "price":  float(t_price),
-                        "shares": int(t_shares),
-                        "fee":    float(t_fee),
+                        "id":         port_next_id(),
+                        "type":       t_buy_sell,
+                        "code":       code_final,
+                        "name":       cn or code_final,
+                        "date":       str(t_date),
+                        "price":      float(t_price),
+                        "shares":     int(t_shares),
+                        "fee":        float(t_fee),
+                        "trade_type": trade_type,     # overnight/swing/longterm
+                        "stop_price": stop_price,
+                        "note":       trade_note,
+                        "risk_pct":   risk_pct * 100,
                     }
-                if t_type == "賣出":
+                if t_buy_sell == "賣出":
                     pos_now = get_open_positions(trades_all)
                     held    = pos_now.get(code_final, {}).get("shares", 0)
                     if t_shares > held:
                         st.error(f"⚠️ 持倉只有 {held} 股，無法賣出 {t_shares} 股")
                     else:
                         port_add_trade(new_trade)
-                        st.session_state["_port_msg"] = f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}　（已自動儲存）"
+                        st.session_state["_port_msg"] = (
+                            f"✅ 已記錄 {t_buy_sell} {code_final} × {t_shares:,} 股 @ {t_price}  "
+                            f"｜ {trade_type_lbl}  停損 {stop_price:.2f}"
+                        )
                         st.rerun()
                 else:
                     port_add_trade(new_trade)
-                    st.session_state["_port_msg"] = f"✅ 已記錄 {t_type} {code_final} × {t_shares} 股 @ {t_price}　（已自動儲存）"
-                    # Auto-sync to Google Sheets if configured
+                    st.session_state["_port_msg"] = (
+                        f"✅ 已記錄 {t_buy_sell} {code_final} × {t_shares:,} 股 @ {t_price}  "
+                        f"｜ {trade_type_lbl}  停損 {stop_price:.2f}"
+                    )
                     _gs_id  = st.session_state.get("gs_sheet_id", "")
                     _gs_tok = st.session_state.get("gs_api_token", "")
                     if _gs_id and _gs_tok:
@@ -5376,6 +6338,671 @@ def main():
                 },
             )
             st.caption(f"共 {len(df_show)} 筆 | 等待中的記錄在下次掃描時自動更新")
+
+
+    # ─────────────────────────────────────────────────────────
+    # TAB 6.5  🗓 訊號管理 — 進退場生命週期
+    # ─────────────────────────────────────────────────────────
+    with tab_lifecycle:
+        st.markdown("#### 🗓 訊號生命週期管理")
+        st.caption(
+            "每個訊號從觸發到出場都有固定的進場窗口、停損設定與退場條件。"
+            "此頁追蹤所有活躍訊號的狀態，並提供詳細的操作說明。"
+        )
+
+        # ── Auto-refresh status ──────────────────────────────
+        n_exp = lifecycle_update_statuses()
+        if n_exp:
+            st.info(f"⏰ 已自動標記 {n_exp} 筆過期訊號")
+
+        all_lc = lifecycle_get_all()
+        if not all_lc:
+            st.info("尚無訊號記錄。執行訊號掃描後，買入訊號會自動加入此清單。")
+        else:
+            # ── Filter tabs ──────────────────────────────────
+            lc_filter = st.radio(
+                "顯示",
+                ["🟢 活躍中", "📋 全部", "✅ 已進場", "❌ 已失效"],
+                horizontal=True, label_visibility="collapsed",
+                key="lc_filter",
+            )
+            filter_map = {
+                "🟢 活躍中": ["active"],
+                "📋 全部":   ["active","entered","expired","stopped","target"],
+                "✅ 已進場": ["entered"],
+                "❌ 已失效": ["expired","stopped","target"],
+            }
+            show_recs = [r for r in all_lc
+                         if r["status"] in filter_map[lc_filter]]
+            show_recs.sort(key=lambda r: r["date_fired"], reverse=True)
+
+            if not show_recs:
+                st.info("此分類暫無記錄")
+            else:
+                st.markdown(f"共 **{len(show_recs)}** 筆")
+
+                # ── Summary table ─────────────────────────────
+                tbl_rows = []
+                for r in show_recs:
+                    days_r = lifecycle_days_remaining(r)
+                    urgency = lifecycle_urgency(r)
+                    status_label = {
+                        "active":  "🟢 進場窗口開啟",
+                        "entered": "📥 已進場",
+                        "expired": "⌛ 已失效",
+                        "stopped": "🛑 已停損",
+                        "target":  "🎯 已達目標",
+                    }.get(r["status"], r["status"])
+                    tbl_rows.append({
+                        "代號":     r["code"],
+                        "名稱":     r["name"],
+                        "訊號":     r["sig_label"],
+                        "訊號日":   r["date_fired"],
+                        "訊號價":   r["price_fired"],
+                        "停損價":   r["stop_price"],
+                        "目標1":    r["target_1r"],
+                        "目標2":    r["target_2r"],
+                        "進場至":   r["entry_close"],
+                        "期限":     urgency,
+                        "狀態":     status_label,
+                    })
+                df_lc = pd.DataFrame(tbl_rows)
+                st.dataframe(
+                    df_lc, width='stretch', hide_index=True,
+                    column_config={
+                        "訊號價": st.column_config.NumberColumn(format="%.2f"),
+                        "停損價": st.column_config.NumberColumn(format="%.2f",
+                                    help="依 ATR 或固定% 計算，取較緊的一側"),
+                        "目標1":  st.column_config.NumberColumn(format="%.2f",
+                                    help="1R 目標：風險報酬比 1.5–2倍"),
+                        "目標2":  st.column_config.NumberColumn(format="%.2f",
+                                    help="2R 目標：風險報酬比 2.5–4倍"),
+                    }
+                )
+
+                st.markdown("---")
+                st.markdown("##### 📖 各訊號詳細說明")
+                st.caption("展開查看每個訊號的進退場完整邏輯與說明")
+
+                # ── Detail cards for each active record ───────
+                for r in show_recs:
+                    cfg   = SIGNAL_LIFECYCLE.get(r["sig_key"], SIGNAL_LIFECYCLE["BUY"])
+                    days_r = lifecycle_days_remaining(r)
+                    urgency = lifecycle_urgency(r)
+                    pnl_str = ""
+                    if r.get("entered_price"):
+                        cur_q   = fetch_quote(r["code"])
+                        cur_px  = cur_q.get("last_price", r["entered_price"])
+                        pnl_pct = (cur_px - r["entered_price"]) / r["entered_price"] * 100
+                        pnl_c   = "#00ff88" if pnl_pct >= 0 else "#ff3355"
+                        pnl_str = (f'<span style="color:{pnl_c};font-weight:700">'
+                                   f'{pnl_pct:+.2f}%</span>')
+
+                    with st.expander(
+                        f"{r['sig_label']}  {r['code']} {r['name']}  "
+                        f"@{r['price_fired']:.2f}  {urgency}",
+                        expanded=(r["status"] == "active" and days_r <= 2),
+                    ):
+                        # Header card
+                        st.markdown(
+                            f'<div style="background:#0d1a2d;border-left:4px solid {r["color"]};'
+                            f'border-radius:0 8px 8px 0;padding:12px 16px;margin-bottom:12px">'
+                            # Row 1: code + signal + urgency
+                            f'<div style="display:flex;justify-content:space-between;'
+                            f'flex-wrap:wrap;gap:6px;margin-bottom:8px">'
+                            f'<span style="font-family:monospace;font-size:1rem;'
+                            f'font-weight:700;color:#e8f4fd">{r["code"]} {r["name"]}</span>'
+                            f'<span style="font-size:0.8rem;color:{r["color"]};'
+                            f'border:1px solid {r["color"]}60;padding:2px 10px;'
+                            f'border-radius:10px">{urgency}</span></div>'
+                            # Row 2: key metrics grid
+                            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);'
+                            f'gap:8px;font-size:0.75rem">'
+                            f'<div style="background:#0a0e1a;padding:6px 8px;border-radius:6px">'
+                            f'<div style="color:#5a8fb0;font-size:0.62rem">訊號日</div>'
+                            f'<div style="color:#e8f4fd;font-weight:700">{r["date_fired"]}</div></div>'
+                            f'<div style="background:#0a0e1a;padding:6px 8px;border-radius:6px">'
+                            f'<div style="color:#5a8fb0;font-size:0.62rem">訊號價</div>'
+                            f'<div style="color:#e8f4fd;font-weight:700">{r["price_fired"]:.2f}</div></div>'
+                            f'<div style="background:#0a0e1a;padding:6px 8px;border-radius:6px;'
+                            f'border:1px solid rgba(255,51,85,0.3)">'
+                            f'<div style="color:#5a8fb0;font-size:0.62rem">停損價</div>'
+                            f'<div style="color:#ff3355;font-weight:700">{r["stop_price"]:.2f}</div></div>'
+                            f'<div style="background:#0a0e1a;padding:6px 8px;border-radius:6px;'
+                            f'border:1px solid rgba(0,255,136,0.3)">'
+                            f'<div style="color:#5a8fb0;font-size:0.62rem">目標1/2</div>'
+                            f'<div style="color:#00ff88;font-weight:700">'
+                            f'{r["target_1r"]:.2f} / {r["target_2r"]:.2f}</div></div>'
+                            f'</div></div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # Entry window
+                        st.markdown(
+                            f'<div style="background:#0a1520;border:1px solid #1a3a50;'
+                            f'border-radius:8px;padding:10px 14px;margin-bottom:10px">'
+                            f'<div style="color:#5a8fb0;font-size:0.72rem;'
+                            f'text-transform:uppercase;margin-bottom:6px">進場窗口</div>'
+                            f'<div style="font-size:0.82rem;color:#e8f4fd">'
+                            f'⏰ <b>{r["entry_time"]}</b></div>'
+                            f'<div style="font-size:0.78rem;color:#8a9bb5;margin-top:4px">'
+                            f'最晚進場：<b style="color:#ffd700">{r["entry_close"]}</b>　'
+                            f'有效期：訊號後 {r["decay_days"]} 個交易日</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # Explanation (markdown)
+                        st.markdown(
+                            f'<div style="background:#080d18;border:1px solid #1a2d44;'
+                            f'border-radius:8px;padding:12px 14px;margin-bottom:10px;'
+                            f'font-size:0.82rem;color:#8a9bb5;line-height:1.7">'
+                            f'{cfg["explanation"].replace(chr(10), "<br>").replace("**", "<b>", 1).replace("**", "</b>", 1)}'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # Exit triggers
+                        trigger_html = "　".join(
+                            f'<span style="background:#1a0a10;color:#ff6677;'
+                            f'padding:2px 8px;border-radius:4px;font-size:0.72rem">{t}</span>'
+                            for t in r["exit_triggers"]
+                        )
+                        st.markdown(
+                            f'<div style="margin-bottom:10px">'
+                            f'<div style="font-size:0.72rem;color:#5a8fb0;margin-bottom:6px">'
+                            f'退場觸發條件</div>{trigger_html}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # Action buttons
+                        bc1, bc2, bc3 = st.columns(3)
+                        rec_id = r["id"]
+                        if r["status"] == "active":
+                            ep = bc1.number_input(
+                                "進場價", min_value=0.01,
+                                value=float(r["price_fired"]),
+                                step=0.01, key=f"lc_ep_{rec_id}",
+                                label_visibility="collapsed",
+                            )
+                            if bc2.button("📥 標記已進場", key=f"lc_enter_{rec_id}",
+                                          width='stretch'):
+                                lifecycle_mark_entered(rec_id, ep)
+                                st.success(f"✓ 已記錄進場 @ {ep:.2f}")
+                                st.rerun()
+                            if bc3.button("🗑 忽略此訊號", key=f"lc_ignore_{rec_id}",
+                                          width='stretch'):
+                                lifecycle_mark_exit(rec_id, 0, "手動忽略")
+                                st.rerun()
+                        elif r["status"] == "entered":
+                            xp = bc1.number_input(
+                                "出場價", min_value=0.01,
+                                value=float(r.get("entered_price", r["price_fired"])),
+                                step=0.01, key=f"lc_xp_{rec_id}",
+                                label_visibility="collapsed",
+                            )
+                            xr = bc2.selectbox("原因",
+                                ["達目標1","達目標2","停損","手動出場","訊號反轉"],
+                                key=f"lc_xr_{rec_id}", label_visibility="collapsed")
+                            if bc3.button("📤 標記已出場", key=f"lc_exit_{rec_id}",
+                                          width='stretch'):
+                                lifecycle_mark_exit(rec_id, xp, xr)
+                                st.success(f"✓ 已記錄出場 @ {xp:.2f}，原因：{xr}")
+                                st.rerun()
+                        else:
+                            # Show exit summary
+                            if r.get("exit_price"):
+                                entry  = r.get("entered_price") or r["price_fired"]
+                                ret_p  = (r["exit_price"] - entry) / entry * 100
+                                ret_c  = "#00ff88" if ret_p >= 0 else "#ff3355"
+                                st.markdown(
+                                    f'<div style="font-size:0.8rem;color:#5a8fb0">'
+                                    f'出場 @ <b style="color:#e8f4fd">{r["exit_price"]:.2f}</b>　'
+                                    f'報酬 <b style="color:{ret_c}">{ret_p:+.2f}%</b>　'
+                                    f'原因：{r.get("exit_reason","─")}</div>',
+                                    unsafe_allow_html=True,
+                                )
+
+                st.markdown("---")
+
+                # ── Telegram reminder push ─────────────────────
+                tg_t = st.session_state.get("tg_token","")
+                tg_c = st.session_state.get("tg_chat_id","")
+                if tg_t and tg_c:
+                    active_count = sum(1 for r in show_recs if r["status"]=="active")
+                    if st.button(f"📲 推播 {active_count} 筆活躍訊號提醒",
+                                 key="lc_tg", width='stretch'):
+                        n_sent = lifecycle_tg_reminder(
+                            [r for r in show_recs if r["status"]=="active"],
+                            tg_t, tg_c
+                        )
+                        st.success(f"✅ 已推播 {n_sent} 則提醒") if n_sent \
+                            else st.info("無需推播（今日無到期或新增訊號）")
+                else:
+                    st.caption("💡 在側欄設定 Telegram 以啟用訊號期限提醒推播")
+
+                # ── Clear expired ──────────────────────────────
+                with st.expander("🗑 清理失效記錄"):
+                    expired_count = sum(1 for r in all_lc
+                                        if r["status"] in ("expired","stopped","target"))
+                    st.caption(f"目前有 {expired_count} 筆已失效/出場記錄")
+                    if st.button("清除所有已失效記錄", key="lc_clear",
+                                 width='stretch'):
+                        store = _load_lifecycle_store()
+                        store["records"] = [r for r in store["records"]
+                                            if r["status"] not in ("expired","stopped","target")]
+                        _save_lifecycle(store)
+                        st.success("✓ 已清除")
+                        st.rerun()
+
+    # ─────────────────────────────────────────
+    # TAB 7  🌙 隔日沖策略
+    # ─────────────────────────────────────────
+    with tab_overnight:
+        st.markdown("#### 🌙 隔日沖策略 — 因素回測 + 今日候選")
+        st.caption(
+            "逆向思考：先量化每個因素對次日開盤勝率的真實貢獻，"
+            "再用最優評分組合篩選今日候選股。"
+            "進場時間：13:20–13:30，出場時間：次日 09:05–09:30。"
+        )
+
+        # ── 子功能選擇 ─────────────────────────────────────────
+        ovn_mode = st.radio(
+            "功能",
+            ["📊 單股因素回測", "🎯 今日候選掃描", "📖 策略說明"],
+            horizontal=True, label_visibility="collapsed",
+            key="ovn_mode",
+        )
+
+        # ══════════════════════════════════════
+        # MODE 1: 單股因素回測
+        # ══════════════════════════════════════
+        if ovn_mode == "📊 單股因素回測":
+            st.markdown("##### 📊 單股因素回測")
+            st.caption("選擇股票，系統分析歷史上各因素對次日開盤報酬的實際貢獻。")
+
+            col_s1, col_s2, col_s3 = st.columns([2, 2, 1])
+            ovn_sym  = col_s1.selectbox(
+                "股票", [r[4:].split("(")[0].strip() if "(" in r else r
+                        for r in params.get("watchlist", watchlist)],
+                format_func=lambda x: f"{x}  {lookup_name(x)}",
+                key="ovn_sym",
+            )
+            ovn_period = col_s2.radio("回測區間", ["1y","2y","3y"], horizontal=True,
+                                       index=1, key="ovn_prd")
+            run_ovn = col_s3.button("🔬 分析", type="primary", width='stretch', key="ovn_run")
+
+            if run_ovn:
+                with st.spinner(f"下載 {ovn_sym} 歷史資料並回測…"):
+                    df_ovn, _ = fetch_data(ovn_sym, ovn_prd := ovn_period)
+                if df_ovn is None or len(df_ovn) < 60:
+                    st.error("資料不足，請選擇更長的區間或換一支股票")
+                else:
+                    result = overnight_factor_backtest(df_ovn)
+                    if not result:
+                        st.error("回測樣本不足")
+                    else:
+                        # ── 各因素勝率表 ─────────────────────
+                        st.markdown("##### 各因素獨立勝率")
+                        st.caption("每個因素獨立成立時，次日開盤報酬的統計")
+                        df_factors = pd.DataFrame(result["factor_results"]).T.reset_index()
+                        df_factors.columns = ["因素", "樣本數", "勝率%", "平均報酬%", "中位報酬%", "Sharpe"]
+                        df_factors = df_factors.sort_values("勝率%", ascending=False).reset_index(drop=True)
+
+                        def color_wr(val):
+                            if isinstance(val, float):
+                                if val >= 65: return "color: #00ff88; font-weight: 700"
+                                if val >= 55: return "color: #f0a500"
+                                return "color: #ff3355"
+                            return ""
+
+                        st.dataframe(
+                            df_factors, width='stretch', hide_index=True,
+                            column_config={
+                                "勝率%":     st.column_config.ProgressColumn(
+                                    min_value=40, max_value=80, format="%.1f%%"),
+                                "平均報酬%": st.column_config.NumberColumn(format="%+.3f%%"),
+                                "中位報酬%": st.column_config.NumberColumn(format="%+.3f%%"),
+                                "Sharpe":    st.column_config.NumberColumn(format="%.2f"),
+                            }
+                        )
+
+                        # ── 組合評分分析 ─────────────────────
+                        st.markdown("---")
+                        st.markdown("##### 組合評分 vs 勝率")
+                        st.caption("同時滿足 N 個因素時的勝率 — 找到最佳門檻")
+
+                        if not result["combo_df"].empty:
+                            cdf = result["combo_df"]
+                            best_t = result["best_threshold"]
+
+                            # Bar chart
+                            import plotly.graph_objects as go
+                            bar_colors = ["#00ff88" if int(r["評分門檻≥"]) == best_t
+                                          else "#2196f3" for _, r in cdf.iterrows()]
+                            fig_combo = go.Figure(go.Bar(
+                                x=[f"≥{int(r['評分門檻≥'])}分" for _, r in cdf.iterrows()],
+                                y=cdf["勝率%"].tolist(),
+                                marker_color=bar_colors,
+                                text=[f"{v:.1f}%" for v in cdf["勝率%"]],
+                                textposition="outside",
+                                customdata=cdf[["符合天數","平均報酬%","期望值%"]].values,
+                                hovertemplate=(
+                                    "門檻：%{x}<br>"
+                                    "勝率：%{y:.1f}%<br>"
+                                    "符合天數：%{customdata[0]}<br>"
+                                    "平均報酬：%{customdata[1]:.3f}%<br>"
+                                    "期望值：%{customdata[2]:.3f}%"
+                                    "<extra></extra>"
+                                ),
+                            ))
+                            fig_combo.add_hline(y=60, line_dash="dot",
+                                                line_color="#f0a500", line_width=1,
+                                                annotation_text="60%基準線")
+                            fig_combo.update_layout(
+                                template="plotly_dark", height=280,
+                                paper_bgcolor="#0a0e1a", plot_bgcolor="#0d1226",
+                                margin=dict(l=40, r=20, t=30, b=30),
+                                font=dict(size=10, color="#8a9bb5"),
+                                yaxis=dict(title="勝率%", range=[40, 85]),
+                                xaxis=dict(title="評分門檻"),
+                                title=dict(text=f"最佳門檻：≥{best_t}分（綠色柱）",
+                                           font=dict(size=11), x=0.01),
+                            )
+                            st.plotly_chart(fig_combo, width='stretch')
+                            st.dataframe(cdf, width='stretch', hide_index=True,
+                                column_config={
+                                    "勝率%":     st.column_config.ProgressColumn(
+                                        min_value=40, max_value=80, format="%.1f%%"),
+                                    "平均報酬%": st.column_config.NumberColumn(format="%+.3f%%"),
+                                    "期望值%":   st.column_config.NumberColumn(format="%+.3f%%"),
+                                })
+
+                        # ── 大盤環境分析 ─────────────────────
+                        st.markdown("---")
+                        st.markdown("##### 大盤環境 vs 勝率")
+                        st.caption("大盤上漲日 vs 下跌日，最優評分組合的表現差異")
+                        mf = result["market_filter"]
+                        mf_col1, mf_col2 = st.columns(2)
+                        up_wr   = mf["大盤上漲日"]["勝率%"]
+                        down_wr = mf["大盤下跌日"]["勝率%"]
+                        mf_col1.metric("大盤上漲日勝率",  f"{up_wr:.1f}%",
+                                        f"樣本 {mf['大盤上漲日']['樣本']} 天")
+                        mf_col2.metric("大盤下跌日勝率",  f"{down_wr:.1f}%",
+                                        f"樣本 {mf['大盤下跌日']['樣本']} 天",
+                                        delta_color="inverse")
+                        if up_wr - down_wr >= 10:
+                            st.info(
+                                f"💡 大盤方向對勝率影響顯著（差 {up_wr-down_wr:.1f}%），"
+                                "建議僅在大盤上漲日操作隔日沖。"
+                            )
+
+                        # ── 次日報酬分布圖 ───────────────────
+                        st.markdown("---")
+                        st.markdown("##### 次日開盤報酬分布（≥最佳門檻）")
+                        detail = result["detail"]
+                        best_sub = detail[detail["OVN_Score"] >= result["best_threshold"]]
+                        if len(best_sub) >= 5:
+                            ret_vals = best_sub["next_open_ret"].dropna().tolist()
+                            fig_hist = go.Figure(go.Histogram(
+                                x=ret_vals, nbinsx=30,
+                                marker_color=[
+                                    "#00ff88" if v > 0 else "#ff3355" for v in ret_vals
+                                ],
+                                opacity=0.8,
+                            ))
+                            fig_hist.add_vline(x=0, line_dash="solid",
+                                               line_color="#ffffff", line_width=1)
+                            wins = sum(1 for v in ret_vals if v > 0)
+                            fig_hist.update_layout(
+                                template="plotly_dark", height=220,
+                                paper_bgcolor="#0a0e1a", plot_bgcolor="#0d1226",
+                                margin=dict(l=40, r=20, t=30, b=30),
+                                font=dict(size=10, color="#8a9bb5"),
+                                title=dict(
+                                    text=(f"勝率 {wins/len(ret_vals)*100:.1f}%  "
+                                          f"平均 {sum(ret_vals)/len(ret_vals):+.3f}%  "
+                                          f"樣本 {len(ret_vals)}"),
+                                    font=dict(size=11), x=0.01),
+                                xaxis=dict(title="次日開盤報酬%"),
+                                bargap=0.1,
+                            )
+                            st.plotly_chart(fig_hist, width='stretch')
+
+                        # ── Conclusion ───────────────────────
+                        st.markdown("---")
+                        st.markdown("##### 💡 本股策略建議")
+                        fr = result["factor_results"]
+                        if fr:
+                            best_factors = sorted(fr.items(),
+                                                   key=lambda x: x[1]["勝率%"], reverse=True)[:3]
+                            st.success(
+                                f"**最有效因素**：" +
+                                "、".join(f"**{k}**（勝率 {v['勝率%']:.1f}%）"
+                                          for k, v in best_factors) +
+                                f"\n\n建議進場門檻：評分 **≥{result['best_threshold']}** 分，"
+                                f"大盤上漲日優先。"
+                            )
+
+        # ══════════════════════════════════════
+        # MODE 2: 今日候選掃描
+        # ══════════════════════════════════════
+        elif ovn_mode == "🎯 今日候選掃描":
+            st.markdown("##### 🎯 今日隔日沖候選")
+            st.caption(
+                "掃描自選股清單，找出今日符合隔日沖條件的股票。"
+                "建議在 13:00–13:20 執行掃描，收盤前 13:20–13:30 進場。"
+            )
+
+            ovn_c1, ovn_c2, ovn_c3 = st.columns(3)
+            ovn_min  = ovn_c1.slider("最低評分門檻", 3, 7, 5, key="ovn_min")
+            ovn_mkt  = ovn_c2.radio("大盤今日",
+                                     ["不限", "上漲日才掃"],
+                                     horizontal=True, key="ovn_mkt")
+            run_scan = ovn_c3.button("🌙 執行掃描", type="primary",
+                                      width='stretch', key="ovn_scan")
+
+            if run_scan:
+                # Market regime check
+                if ovn_mkt == "上漲日才掃":
+                    mkt_q = fetch_quote("0050")  # proxy for market
+                    if mkt_q.get("ok") and mkt_q.get("change_pct", 0) < 0:
+                        st.warning(
+                            "⚠️ 大盤今日下跌（0050 跌幅 "
+                            f"{mkt_q.get('change_pct',0):.2f}%），"
+                            "回測顯示大盤下跌日隔日沖勝率明顯降低，建議今日不操作。"
+                        )
+                        st.stop()
+
+                prog_ovn = st.progress(0, text="掃描候選股…")
+                wl_ovn = wl if wl else DEFAULT_WATCHLIST[:30]
+                candidates = []
+                for ii, code in enumerate(wl_ovn):
+                    prog_ovn.progress((ii+1)/len(wl_ovn),
+                                      text=f"分析 {code} ({ii+1}/{len(wl_ovn)})…")
+                    try:
+                        df_c, _ = fetch_data(code, "1y")
+                        if df_c is None or len(df_c) < 60:
+                            continue
+                        df_f = _overnight_factors(df_c)
+                        latest_f = df_f.iloc[-1]
+                        sc = overnight_score(latest_f)
+                        if sc < ovn_min:
+                            continue
+                        price = float(df_c["Close"].iloc[-1])
+                        q = fetch_quote(code)
+                        chg_p = q.get("change_pct", float(latest_f.get("F_gain_pct", 0)))
+                        candidates.append({
+                            "代號":       code,
+                            "名稱":       lookup_name(code),
+                            "評分 /8":    sc,
+                            "現價":       round(price, 2),
+                            "今日漲%":    round(float(latest_f.get("F_gain_pct", chg_p)), 2),
+                            "量比":       round(float(latest_f.get("F_vol_ratio", 0)), 2),
+                            "收盤位置%": round(float(latest_f.get("F_close_pos", 0))*100, 1),
+                            "站上年線":   "✅" if latest_f.get("F_above_200") else "─",
+                            "均線多頭":   "✅" if latest_f.get("F_trend_ok")  else "─",
+                            "突破20高":   "✅" if latest_f.get("F_breakout_20d") else "─",
+                            "OBV新高":    "✅" if latest_f.get("F_obv_new_high") else "─",
+                            "_sc": sc,
+                        })
+                    except Exception:
+                        continue
+                prog_ovn.empty()
+
+                if not candidates:
+                    st.info(f"今日無符合評分 ≥{ovn_min} 的候選股")
+                else:
+                    candidates.sort(key=lambda x: -x["_sc"])
+                    st.success(f"✅ 找到 **{len(candidates)}** 支候選股")
+
+                    df_cand = pd.DataFrame([
+                        {k: v for k, v in c.items() if not k.startswith("_")}
+                        for c in candidates
+                    ])
+                    st.dataframe(
+                        df_cand, width='stretch', hide_index=True,
+                        column_config={
+                            "評分 /8":   st.column_config.ProgressColumn(
+                                min_value=0, max_value=8, format="%d/8"),
+                            "今日漲%":   st.column_config.NumberColumn(format="%+.2f%%"),
+                            "量比":      st.column_config.NumberColumn(format="%.2fx"),
+                        }
+                    )
+
+                    # Cards for top 3
+                    st.markdown("---")
+                    st.markdown("##### 🥇 今日前三候選")
+                    top3 = candidates[:3]
+                    t3cols = st.columns(len(top3))
+                    for ci, c in enumerate(top3):
+                        clr = "#ffd700" if c["_sc"] >= 7 else "#00ff88"
+                        with t3cols[ci]:
+                            st.markdown(f"""
+<div style="background:#0d1a2d;border:2px solid {clr};border-radius:10px;
+  padding:14px;margin-bottom:8px">
+  <div style="font-family:'Space Mono',monospace;font-size:1rem;
+    font-weight:700;color:#e8f4fd">{c['代號']}
+    <span style="color:{clr};font-size:0.8rem;margin-left:6px">
+      ★{c['評分 /8']}/8</span>
+  </div>
+  <div style="color:#8a9bb5;font-size:0.78rem;margin-bottom:8px">{c['名稱']}</div>
+  <div style="font-size:1.2rem;font-weight:700;color:#e8414e">
+    {c['現價']:.2f}
+    <span style="font-size:0.8rem;color:#e8414e">{c['今日漲%']:+.2f}%</span>
+  </div>
+  <div style="font-size:0.72rem;color:#5a8fb0;margin-top:6px">
+    量比 {c['量比']:.2f}x &nbsp;|&nbsp; 收盤位置 {c['收盤位置%']:.0f}%
+  </div>
+  <div style="font-size:0.70rem;color:#37474f;margin-top:4px">
+    {c['站上年線']} 年線 &nbsp;
+    {c['均線多頭']} 均線 &nbsp;
+    {c['突破20高']} 突破 &nbsp;
+    {c['OBV新高']} OBV
+  </div>
+</div>""", unsafe_allow_html=True)
+
+                    # ── Telegram Push ────────────────────────
+                    tg_tok_v = st.session_state.get("tg_token", "")
+                    tg_cid_v = st.session_state.get("tg_chat_id", "")
+
+                    # Auto-push if Telegram is configured
+                    if tg_tok_v and tg_cid_v and candidates:
+                        msg = (
+                            f"🌙 隔日沖候選 {tw_now().strftime('%m/%d %H:%M')}\n"
+                            f"共 {len(candidates)} 支，前5如下：\n\n"
+                        )
+                        for c in candidates[:5]:
+                            stop_px = round(c["_price"] * 0.98, 2)
+                            factors = []
+                            if c["站上年線"] == "✅": factors.append("年線")
+                            if c["均線多頭"] == "✅": factors.append("均線")
+                            if c["突破20高"] == "✅": factors.append("突破")
+                            if c["OBV新高"]  == "✅": factors.append("OBV")
+                            msg += (
+                                f"★{c['_sc']}/8  {c['代號']} {c['名稱']}\n"
+                                f"  現價 {c['_price']:.2f}  漲{c['今日漲%']:+.2f}%"
+                                f"  量比{c['量比']:.1f}x\n"
+                                f"  停損 {stop_px}  因素:{'/'.join(factors) or '─'}\n"
+                            )
+                        msg += "\n⏰ 進場 13:20–13:30\n📤 出場 次日 09:05–09:30"
+                        auto_ok, auto_err = _tg_send(tg_tok_v, tg_cid_v, msg)
+                        if auto_ok:
+                            st.toast("📲 已自動推播到 Telegram", icon="✅")
+                        else:
+                            st.warning(f"📲 自動推播失敗：{auto_err}")
+
+                    # Manual re-push button
+                    push_col, _ = st.columns([1, 2])
+                    if push_col.button("📲 重新推播到 Telegram", key="ovn_tg",
+                                       width='stretch'):
+                        if not tg_tok_v or not tg_cid_v:
+                            st.warning("請先在側欄設定 Telegram Token 和 Chat ID")
+                        else:
+                            msg2 = (
+                                f"🌙 隔日沖候選（補推）{tw_now().strftime('%m/%d %H:%M')}\n\n"
+                            )
+                            for c in candidates[:5]:
+                                stop_px = round(c["_price"] * 0.98, 2)
+                                msg2 += (
+                                    f"★{c['_sc']}/8  {c['代號']} {c['名稱']}\n"
+                                    f"  現價 {c['_price']:.2f}  漲{c['今日漲%']:+.2f}%"
+                                    f"  量比{c['量比']:.1f}x  停損{stop_px}\n"
+                                )
+                            msg2 += "\n⏰ 進場 13:20–13:30 | 出場 次日 09:05"
+                            ok2, err2 = _tg_send(tg_tok_v, tg_cid_v, msg2)
+                            st.success("✅ 已推播") if ok2 else st.error(f"❌ {err2}")
+
+                    # Export
+                    with st.expander("📤 匯出候選清單"):
+                        st.download_button(
+                            "下載 Excel",
+                            data=to_excel(df_cand),
+                            file_name=f"overnight_{tw_now().strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            width='stretch',
+                        )
+
+        # ══════════════════════════════════════
+        # MODE 3: 策略說明
+        # ══════════════════════════════════════
+        else:
+            st.markdown("""
+##### 🌙 隔日沖策略說明
+
+**核心邏輯**
+今日強勢收盤 → 次日慣性延續高開 → 開盤即出鎖定利潤
+
+**進出場規則**
+| 項目 | 規則 |
+|------|------|
+| 進場時間 | 13:20–13:30（接近收盤） |
+| 出場時間 | 次日 09:05–09:30（開盤後） |
+| 停損 | 次日開盤跌破進場價 -2% 立即出 |
+| 停利 | 次日開盤漲超 3% 可部分留倉 |
+
+**8 大評分因素**
+| 因素 | 說明 |
+|------|------|
+| A1 收盤強度 | 收盤在日高 92% 以上（買盤未退） |
+| A2 漲幅甜區 | 今日漲 2.5–8%（不含漲停） |
+| B1 量能放大 | 成交量 ≥ 均量 1.8x |
+| B2 OBV 新高 | 10 日 OBV 新高（籌碼淨流入） |
+| C1 均線多頭 | EMA20 > EMA60，站穩趨勢 |
+| C2 站上年線 | 股價 > EMA200（不逆勢） |
+| C3 突破 20 日高 | 今日突破近 20 交易日最高收盤 |
+| D1 尾盤強度 | 量比 × 收盤位置 ≥ 1.5（尾盤買力強） |
+
+**風險管理**
+- 單股最多投入資金 **20%**
+- 最多同時持有 **3–5 檔**
+- 大盤下跌日（0050 跌幅 > 0%）勝率明顯下降，建議**停止操作**
+- 財報公佈週、重大事件前後謹慎
+
+**回測方法論**
+使用「📊 單股因素回測」功能，對每支股票獨立分析各因素的實際次日勝率，
+系統自動找出該股的最佳評分門檻，避免過度擬合。
+""")
 
 
 if __name__ == "__main__":
