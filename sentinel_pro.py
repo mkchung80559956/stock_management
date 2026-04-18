@@ -2038,7 +2038,7 @@ def fetch_quote(symbol: str) -> dict:
     return {}
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=90)   # 方案D：90秒快取報價，減少重複 HTTP 請求
 def batch_fetch_quotes(symbols: tuple) -> dict:
     """
     Fetch live quotes for ALL symbols in one yf.download() call.
@@ -2091,7 +2091,7 @@ def batch_fetch_quotes(symbols: tuple) -> dict:
 
 
 
-@st.cache_data(ttl=180)
+@st.cache_data(ttl=1800)   # 方案D：30分鐘快取 — 減少重複下載，自選股模式尤其快
 def batch_fetch_ohlcv(symbols: tuple, period: str = "1y") -> dict:
     """
     Download OHLCV for ALL symbols in ONE yf.download() call.
@@ -3071,6 +3071,63 @@ def gs_overwrite_trades(sheet_id: str, api_key: str, trades: list) -> tuple[bool
 
 # ══════════════════════════════════════════════
 # SIGNAL  HISTORY  TRACKER
+
+# ══════════════════════════════════════════════════════════════
+# 方案 A — SCAN CACHE：掃描結果持久化，斷線重連自動還原
+# 掃描完成 → 寫 /tmp  →  斷線重連 → 讀 /tmp → 無需重掃
+# ══════════════════════════════════════════════════════════════
+_SCAN_CACHE_FILE = "/tmp/sentinel_scan_cache.json"
+_SCAN_CACHE_TTL  = 90   # 分鐘 — 90分鐘內重連直接還原
+
+
+def scan_cache_save(rows: list, timestamp: str, scan_mode: str = "") -> None:
+    """掃描完成後持久化到 /tmp，斷線重連時用於還原。"""
+    try:
+        payload = {
+            "rows":      rows,
+            "timestamp": timestamp,
+            "scan_mode": scan_mode,
+            "saved_at":  tw_now().isoformat(),
+        }
+        tmp = _SCAN_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, default=str)
+        os.replace(tmp, _SCAN_CACHE_FILE)
+    except Exception:
+        pass   # 不影響主流程
+
+
+def scan_cache_load() -> dict | None:
+    """
+    載入快取。若快取不存在、超過 TTL 或損壞則回傳 None。
+    TTL 預設 90 分鐘（一個盤中交易時段）。
+    """
+    try:
+        if not os.path.exists(_SCAN_CACHE_FILE):
+            return None
+        with open(_SCAN_CACHE_FILE, encoding="utf-8") as f:
+            payload = json.load(f)
+        # Parse saved_at — handle both tz-aware and naive
+        saved_str = payload.get("saved_at", "")
+        try:
+            saved_at = datetime.fromisoformat(saved_str)
+            if saved_at.tzinfo is None:
+                saved_at = saved_at.replace(tzinfo=pytz.timezone("Asia/Taipei"))
+        except Exception:
+            return None
+        age_min = (tw_now() - saved_at).total_seconds() / 60
+        if age_min > _SCAN_CACHE_TTL:
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def scan_cache_clear() -> None:
+    try: os.remove(_SCAN_CACHE_FILE)
+    except: pass
+
+
 # Stores real signals as they fire, tracks actual
 # 5/10/20-day returns to build a live win-rate DB.
 # ══════════════════════════════════════════════
@@ -4337,6 +4394,12 @@ def main():
         st.session_state.watchlist = DEFAULT_WATCHLIST.copy()
     if "scan_rows" not in st.session_state:
         st.session_state.scan_rows = []
+        # ── 方案A：斷線重連時自動還原上次掃描結果 ──
+        _cached = scan_cache_load()
+        if _cached and _cached.get("rows"):
+            st.session_state.scan_rows      = _cached["rows"]
+            st.session_state.scan_timestamp = _cached.get("timestamp", "")
+            st.session_state["_scan_restored"] = True   # flag for UI banner
     if "auto_refresh" not in st.session_state:
         st.session_state.auto_refresh = False
     if "prev_sig_keys" not in st.session_state:
@@ -4803,7 +4866,27 @@ def main():
             unsafe_allow_html=True,
         )
 
-        # ── Auto-refresh trigger (only during market hours) ──
+        # ── 方案A：斷線還原提示橫幅 ──────────────────────────────
+        if st.session_state.get("_scan_restored"):
+            _cached_meta = scan_cache_load()
+            _mode_lbl = _cached_meta.get("scan_mode", "") if _cached_meta else ""
+            rb1, rb2 = st.columns([3, 1])
+            rb1.markdown(
+                f'<div style="background:#0a1e10;border:1px solid #1a4a20;'
+                f'border-radius:6px;padding:7px 12px;font-size:0.78rem">'
+                f'🔄 <b style="color:#00ff88">已自動還原</b>'
+                f'<span style="color:#5a8fb0"> 上次掃描結果（{scan_time}）'
+                f'{" · "+_mode_lbl if _mode_lbl else ""}'
+                f' — 點「掃描」取得最新資料</span></div>',
+                unsafe_allow_html=True,
+            )
+            if rb2.button("🗑 清除快取", key="clear_scan_cache", width='stretch'):
+                scan_cache_clear()
+                st.session_state.scan_rows = []
+                st.session_state["_scan_restored"] = False
+                st.rerun()
+
+
         should_auto_scan = (
             auto_refresh
             and market_open
@@ -4905,12 +4988,26 @@ def main():
             except Exception:
                 quote_cache = {}
 
-            # ▶ Batch-fetch ALL OHLCV in ONE yf.download() call (Method B)
-            # Replaces per-stock fetch_data() loop → 3–5× faster
-            # Falls back to individual fetch_data() if batch fails
+            # ── 方案D：依模式顯示預估時間 ───────────────────────
+            _n_stocks  = len(wl)
+            _est_fresh = max(15, _n_stocks * 0.5)   # ~0.5s per stock worst case
+            _scan_mode_now = st.session_state.get("scan_mode","🔖 自選股（快速）")
+            _est_label = (
+                "約 10–20 秒" if _scan_mode_now == "🔖 自選股（快速）" else
+                "約 30–60 秒" if _n_stocks <= 100 else
+                "約 60–90 秒"
+            )
+            # Check if OHLCV data is already cached (ttl=1800 — within 30 min)
+            _ohlcv_cached = bool(batch_fetch_ohlcv.cache_info().currsize
+                                  if hasattr(batch_fetch_ohlcv, 'cache_info') else False)
+            _spinner_msg = (
+                f"掃描中（{_est_label}）— 歷史資料已快取，速度較快 ⚡"
+                if _ohlcv_cached else
+                f"下載歷史資料 + 掃描中（{_est_label}）…"
+            )
             ohlcv_cache: dict = {}
             try:
-                with st.spinner("批量下載歷史資料中…"):
+                with st.spinner(_spinner_msg):
                     ohlcv_cache = batch_fetch_ohlcv(tuple(wl), data_period)
             except Exception:
                 ohlcv_cache = {}
@@ -5125,6 +5222,13 @@ def main():
             st.session_state.scan_rows      = rows
             st.session_state.scan_failed    = failed
             st.session_state.scan_timestamp = tw_now().strftime("%Y-%m-%d %H:%M")
+            st.session_state["_scan_restored"] = False
+
+            # ── 方案A：持久化掃描結果到 /tmp ──────────────────────
+            scan_cache_save(
+                rows, st.session_state.scan_timestamp,
+                st.session_state.get("scan_mode", "🔖 自選股（快速）")
+            )
 
             # ── Record NEW buy signals into history DB ────────────────
             _TRACK_SIGS = BUY_SIGNALS  # track all buy signals
