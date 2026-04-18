@@ -1236,9 +1236,8 @@ def lifecycle_tg_reminder(active_records: list, token: str, chat_id: str) -> int
             )
     sent = 0
     for msg in msgs:
-        ok, _ = _tg_send(token, chat_id, msg)
-        if ok:
-            sent += 1
+        n = tg_broadcast(msg)
+        sent += n
     return sent
 
 
@@ -2885,10 +2884,79 @@ def _tg_send(token: str, chat_id: str, text: str) -> tuple[bool, str]:
         return False, err
 
 
+def tg_get_recipients() -> tuple[str, list[str]]:
+    """
+    讀取所有收件人 chat_id。
+    優先順序：
+      1. Streamlit Secrets → [telegram] chat_id_1 / chat_id_2 / chat_id_3
+      2. Streamlit Secrets → [telegram] chat_id（單一，向下相容）
+      3. st.session_state → tg_chat_id（側欄手動輸入，僅主帳號）
+    Returns (token, [chat_id_1, chat_id_2, ...])
+    """
+    try:
+        _sec = st.secrets.get("telegram", {})
+    except Exception:
+        _sec = {}
+
+    token = (
+        _sec.get("token", "") or
+        st.session_state.get("tg_token", "")
+    )
+
+    # Collect all chat_ids from secrets
+    cids: list[str] = []
+    for k in ("chat_id_1", "chat_id_2", "chat_id_3",
+              "chat_id_4", "chat_id_5"):
+        v = str(_sec.get(k, "") or "").strip()
+        if v:
+            cids.append(v)
+
+    # Fallback: single chat_id key in secrets
+    if not cids:
+        v = str(_sec.get("chat_id", "") or "").strip()
+        if v:
+            cids.append(v)
+
+    # Last resort: session state (manual sidebar input)
+    if not cids:
+        v = str(st.session_state.get("tg_chat_id", "") or "").strip()
+        if v:
+            cids.append(v)
+
+    # Deduplicate while preserving order
+    seen = set(); unique = []
+    for c in cids:
+        if c and c not in seen:
+            seen.add(c); unique.append(c)
+
+    return token, unique
+
+
+def tg_broadcast(text: str) -> int:
+    """
+    推播訊息給所有設定的收件人。
+    Returns count of successful sends.
+    """
+    token, cids = tg_get_recipients()
+    if not token or not cids:
+        return 0
+    sent = 0
+    for cid in cids:
+        ok, _ = _tg_send(token, cid, text)
+        if ok:
+            sent += 1
+    return sent
+
+
 def send_signal_alert(token: str, chat_id: str,
                       new_buy_rows: list, new_sell_rows: list) -> int:
-    """Send Telegram alerts for newly-detected actionable signals."""
-    if not token or not chat_id:
+    """
+    Send Telegram alerts for newly-detected actionable signals.
+    Broadcasts to ALL recipients via tg_broadcast().
+    token/chat_id params kept for API compatibility but tg_broadcast
+    auto-reads all recipients from secrets.
+    """
+    if not token:
         return 0
     msgs_sent = 0
 
@@ -2916,9 +2984,8 @@ def send_signal_alert(token: str, chat_id: str,
             f"📝 {detail}\n"
             f"🕐 {ts}"
         )
-        ok, _ = _tg_send(token, chat_id, msg)
-        if ok:
-            msgs_sent += 1
+        n = tg_broadcast(msg)
+        msgs_sent += n
 
     for r in new_sell_rows[:4]:
         sig_lbl = SIGNAL_LABEL.get(r["_sig_key"], r["_sig_key"])
@@ -2930,9 +2997,8 @@ def send_signal_alert(token: str, chat_id: str,
             f"💰 現價：{r.get('最新價','─')}　漲跌：{chg:+.2f}%\n"
             f"🕐 {tw_now().strftime('%H:%M')}"
         )
-        ok, _ = _tg_send(token, chat_id, msg)
-        if ok:
-            msgs_sent += 1
+        n = tg_broadcast(msg)
+        msgs_sent += n
 
     return msgs_sent
 
@@ -4575,22 +4641,65 @@ def main():
             _tg_sec = {}
             try: _tg_sec = st.secrets.get("telegram", {})
             except Exception: pass
-            tg_token   = st.text_input("Bot Token",
+
+            tg_token = st.text_input("Bot Token",
                 value=_tg_sec.get("token", ""),
                 placeholder="1234567890:AAF...",
                 type="password", key="tg_token",
-                help="從 @BotFather 取得。可永久儲存：Streamlit Cloud → Settings → Secrets → [telegram]\\ntoken = '你的TOKEN'")
-            tg_chat_id = st.text_input("Chat ID",
-                value=_tg_sec.get("chat_id", ""),
+                help=(
+                    "從 @BotFather 取得。\n\n"
+                    "永久儲存方式（Streamlit Cloud）：\n"
+                    "Settings → Secrets → 填入：\n"
+                    "[telegram]\n"
+                    "token = '你的TOKEN'\n"
+                    "chat_id_1 = '第一人ID'\n"
+                    "chat_id_2 = '第二人ID'\n"
+                    "chat_id_3 = '第三人ID'"
+                ))
+
+            # ── 多人推播設定 ─────────────────────────────────
+            st.markdown(
+                '<div style="font-size:0.72rem;color:#5a8fb0;margin:6px 0 3px 0">'
+                '收件人 Chat ID（最多5人）</div>',
+                unsafe_allow_html=True
+            )
+            tg_chat_id = st.text_input("收件人1（主帳號）",
+                value=_tg_sec.get("chat_id_1", "") or _tg_sec.get("chat_id", ""),
                 placeholder="123456789",
                 key="tg_chat_id",
-                help="先向 Bot 傳一條訊息，再點下方連結查詢")
+                label_visibility="visible",
+                help=(
+                    "先向 Bot 傳一條訊息，再點下方連結查詢 Chat ID。\n\n"
+                    "💡 在 Streamlit Secrets 設定多人（推薦）：\n"
+                    "chat_id_1 = '第一人'\n"
+                    "chat_id_2 = '第二人'\n"
+                    "chat_id_3 = '第三人'"
+                ))
+            tg_chat_id2 = st.text_input("收件人2",
+                value=_tg_sec.get("chat_id_2", ""),
+                placeholder="987654321（選填）",
+                key="tg_chat_id_2",
+                label_visibility="visible")
+            tg_chat_id3 = st.text_input("收件人3",
+                value=_tg_sec.get("chat_id_3", ""),
+                placeholder="555666777（選填）",
+                key="tg_chat_id_3",
+                label_visibility="visible")
+
+            # Show active recipients count
+            _tk_now, _cids_now = tg_get_recipients()
+            if _tk_now and _cids_now:
+                st.success(f"✅ 已設定 {len(_cids_now)} 位收件人")
+            elif _tk_now:
+                st.warning("⚠️ Token 已填，但尚未設定收件人 Chat ID")
+
             if tg_token and len(tg_token) > 20:
                 st.markdown(
-                    f"[🔍 查詢我的 Chat ID]"
+                    f"[🔍 查詢 Chat ID]"
                     f"(https://api.telegram.org/bot{tg_token}/getUpdates)"
-                    f" ← 先向 Bot 傳任意一條訊息再點此"
+                    f" ← 先向 Bot 傳任意訊息再點此"
                 )
+
             tg_min_conf = st.slider("最低共振門檻（推播條件）",
                 min_value=3, max_value=7, value=5, key="tg_min_conf",
                 help=(
@@ -4622,17 +4731,20 @@ def main():
                 )
             )
             if st.button("🧪 測試推播", key="tg_test", width='stretch'):
-                if not tg_token or not tg_chat_id:
-                    st.warning("⚠️ 請先填入 Bot Token 和 Chat ID")
+                _tk, _cids = tg_get_recipients()
+                if not _tk or not _cids:
+                    st.warning("⚠️ 請先在 Secrets 或下方填入 Bot Token 和 Chat ID")
                 else:
-                    ok, err = _tg_send(tg_token, tg_chat_id,
-                        f"✅ <b>Sentinel Pro 推播測試</b>\n"
-                        f"連線成功！當掃描到符合條件的訊號時將自動通知你。\n"
-                        f"設定：共振 ≥ {tg_min_conf}/7")
-                    if ok:
-                        st.success("✅ 測試訊息已成功發送！")
+                    _test_msg = (
+                        f"✅ Sentinel Pro 推播測試\n"
+                        f"連線成功！共 {len(_cids)} 位收件人。\n"
+                        f"設定：共振 ≥ {tg_min_conf}/7"
+                    )
+                    _n = tg_broadcast(_test_msg)
+                    if _n:
+                        st.success(f"✅ 已發送到 {_n}/{len(_cids)} 位收件人")
                     else:
-                        st.error(f"❌ 發送失敗：{err}")
+                        st.error("❌ 發送失敗，請確認 Token 和 Chat ID 是否正確")
                         st.caption(
                             "常見原因：\n"
                             "1. Token 錯誤 — 確認從 @BotFather 取得的完整 Token\n"
@@ -4707,7 +4819,7 @@ def main():
                                    f"{code_a}  現價 {px_a:.2f}\n"
                                    f"{'目標 '+str(tgt_a) if tgt_hit else '停損 '+str(stp_a)}\n"
                                    f"{tw_now().strftime('%H:%M')}")
-                            _tg_send(_tg_t, _tg_c, msg)
+                            tg_broadcast(msg)
                             st.session_state[_alert_key] = True
                             st.toast(f"📲 推播 {code_a} 警報", icon="🎯" if tgt_hit else "🛑")
 
@@ -7971,7 +8083,8 @@ def main():
                                 f"  停損 {stop_px}  因素:{'/'.join(factors) or '─'}\n"
                             )
                         msg += "\n⏰ 進場 13:20–13:30\n📤 出場 次日 09:05–09:30"
-                        auto_ok, auto_err = _tg_send(tg_tok_v, tg_cid_v, msg)
+                        n_sent_ov = tg_broadcast(msg)
+                        auto_ok, auto_err = (n_sent_ov > 0), ("" if n_sent_ov else "推播失敗")
                         if auto_ok:
                             st.toast("📲 已自動推播到 Telegram", icon="✅")
                         else:
@@ -7995,7 +8108,8 @@ def main():
                                     f"  量比{c['量比']:.1f}x  停損{stop_px}\n"
                                 )
                             msg2 += "\n⏰ 進場 13:20–13:30 | 出場 次日 09:05"
-                            ok2, err2 = _tg_send(tg_tok_v, tg_cid_v, msg2)
+                            n2 = tg_broadcast(msg2)
+                            ok2, err2 = (n2 > 0), ("" if n2 else "推播失敗")
                             st.success("✅ 已推播") if ok2 else st.error(f"❌ {err2}")
 
                     # Export
