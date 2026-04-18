@@ -7539,6 +7539,108 @@ def main():
                             unsafe_allow_html=True,
                         )
 
+                        # ── 現況確認：即時抓取當前指標 ──────────────────
+                        try:
+                            df_now, _ = fetch_data(r["code"], "3mo")
+                            if df_now is not None and len(df_now) >= 20:
+                                df_now_sig = generate_signals(df_now, params)
+                                cur_row    = df_now_sig.iloc[-1]
+                                sig_row_idx = None
+                                # Find the signal bar in history
+                                for si in range(len(df_now_sig)-1, max(len(df_now_sig)-15, 0)-1, -1):
+                                    bar_date = str(df_now_sig.index[si].date())
+                                    if bar_date == r["date_fired"]:
+                                        sig_row_idx = si
+                                        break
+
+                                cur_cci   = float(cur_row.get("CCI", 0) or 0)
+                                cur_price = float(cur_row["Close"])
+                                cur_ema20 = float(cur_row.get("EMA2", cur_price) or cur_price)
+                                cur_vol_r = float(cur_row.get("Vol_Ratio", 1) or 1)
+                                sig_cci   = float(df_now_sig.iloc[sig_row_idx].get("CCI", 0)) \
+                                            if sig_row_idx is not None else None
+
+                                # Check each exit trigger condition
+                                trigger_checks = {
+                                    "CCI跌破0軸":        cur_cci < 0,
+                                    "CCI跌破-100":       cur_cci < -100,
+                                    "CCI跌破+100後下穿": cur_cci < 100 and (sig_cci or 0) >= 100,
+                                    "跌破EMA20":         cur_price < cur_ema20,
+                                    "跌破停損":          cur_price <= r["stop_price"],
+                                    "量縮3日":           cur_vol_r < 0.6,
+                                }
+
+                                # Which triggers are currently firing
+                                fired    = [k for k, v in trigger_checks.items() if v
+                                            and k in " ".join(r.get("exit_triggers", []))]
+                                ok_flags = [k for k, v in trigger_checks.items() if not v
+                                            and k in " ".join(r.get("exit_triggers", []))]
+
+                                # Overall status
+                                if cur_price <= r["stop_price"]:
+                                    now_status = "🛑 已觸停損"
+                                    now_color  = "#ff3355"
+                                    now_bg     = "rgba(255,51,85,0.08)"
+                                elif fired:
+                                    now_status = "⚠️ 退場條件觸發"
+                                    now_color  = "#ffd600"
+                                    now_bg     = "rgba(255,214,0,0.06)"
+                                else:
+                                    now_status = "✅ 結構完整，持有中"
+                                    now_color  = "#00ff88"
+                                    now_bg     = "rgba(0,255,136,0.05)"
+
+                                # CCI direction arrow
+                                cci_arrow = "↑" if cur_cci > (sig_cci or 0) else "↓"
+                                cci_color = "#00ff88" if cur_cci > 0 else "#ff3355"
+
+                                st.markdown(
+                                    f'<div style="background:{now_bg};border:1px solid {now_color}40;'
+                                    f'border-left:3px solid {now_color};border-radius:8px;'
+                                    f'padding:10px 14px;margin-bottom:10px">'
+                                    f'<div style="display:flex;justify-content:space-between;'
+                                    f'align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:4px">'
+                                    f'<span style="font-size:0.78rem;font-weight:700;color:{now_color}">'
+                                    f'📡 現況確認</span>'
+                                    f'<span style="font-size:0.72rem;color:{now_color};'
+                                    f'border:1px solid {now_color}60;padding:1px 8px;'
+                                    f'border-radius:8px">{now_status}</span></div>'
+                                    # Current indicators
+                                    f'<div style="display:grid;grid-template-columns:repeat(4,1fr);'
+                                    f'gap:6px;margin-bottom:8px">'
+                                    f'<div style="background:#0a0e1a;padding:6px 8px;border-radius:5px">'
+                                    f'<div style="font-size:0.6rem;color:#5a8fb0">訊號日CCI</div>'
+                                    f'<div style="font-size:0.8rem;font-weight:700;color:#e8f4fd;margin-top:2px">'
+                                    f'{sig_cci:.1f if sig_cci is not None else "─"}</div></div>'
+                                    f'<div style="background:#0a0e1a;padding:6px 8px;border-radius:5px;'
+                                    f'border:1px solid {cci_color}40">'
+                                    f'<div style="font-size:0.6rem;color:#5a8fb0">現在CCI {cci_arrow}</div>'
+                                    f'<div style="font-size:0.8rem;font-weight:700;color:{cci_color};margin-top:2px">'
+                                    f'{cur_cci:.1f}</div></div>'
+                                    f'<div style="background:#0a0e1a;padding:6px 8px;border-radius:5px">'
+                                    f'<div style="font-size:0.6rem;color:#5a8fb0">現價</div>'
+                                    f'<div style="font-size:0.8rem;font-weight:700;color:#e8f4fd;margin-top:2px">'
+                                    f'{cur_price:.2f}</div></div>'
+                                    f'<div style="background:#0a0e1a;padding:6px 8px;border-radius:5px">'
+                                    f'<div style="font-size:0.6rem;color:#5a8fb0">EMA20</div>'
+                                    f'<div style="font-size:0.8rem;font-weight:700;'
+                                    f'color:{"#00ff88" if cur_price >= cur_ema20 else "#ff3355"};margin-top:2px">'
+                                    f'{cur_ema20:.2f}</div></div>'
+                                    f'</div>'
+                                    # Fired triggers
+                                    + (
+                                        f'<div style="font-size:0.7rem;color:#ff6677;margin-top:4px">'
+                                        f'⚠️ 已觸發退場條件：{"　".join(fired)}</div>'
+                                        if fired else
+                                        f'<div style="font-size:0.7rem;color:#00ff88;margin-top:4px">'
+                                        f'✓ 退場條件未觸發，結構完整</div>'
+                                    )
+                                    + '</div>',
+                                    unsafe_allow_html=True,
+                                )
+                        except Exception:
+                            pass   # 現況確認失敗不影響其他顯示
+
                         # Entry window
                         st.markdown(
                             f'<div style="background:#0a1520;border:1px solid #1a3a50;'
