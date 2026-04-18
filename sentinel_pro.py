@@ -3700,6 +3700,63 @@ def overnight_scan(watchlist: list, min_score: int = 5,
     return sorted(candidates, key=lambda x: -x["_score"])
 
 
+
+# ══════════════════════════════════════════════════════════════
+# 📱 WATCHLIST  GROUP  &  NOTE  ENGINE
+# 替代 watchlist_pro.py — 分組管理 + 備忘標籤系統
+# ══════════════════════════════════════════════════════════════
+
+PRESET_GROUPS = ["未分組", "半導體", "金融", "電子", "傳產", "ETF", "觀察中", "隔日沖候選"]
+
+_WL_GROUP_FILE = "/tmp/sentinel_wl_groups.json"  # {code: group}
+_WL_NOTE_FILE  = "/tmp/sentinel_wl_notes.json"   # {code: {note, tags, entry, watch_date}}
+
+
+def _wl_groups() -> dict:
+    """Always read fresh — avoids stale cache losing group labels."""
+    try:
+        if os.path.exists(_WL_GROUP_FILE):
+            return json.load(open(_WL_GROUP_FILE))
+    except Exception:
+        pass
+    return {}
+
+
+def _wl_notes() -> dict:
+    try:
+        if os.path.exists(_WL_NOTE_FILE):
+            return json.load(open(_WL_NOTE_FILE))
+    except Exception:
+        pass
+    return {}
+
+
+def wl_get_group(code: str) -> str:
+    bare = code.upper().replace(".TW", "").replace(".TWO", "")
+    return _wl_groups().get(bare, "未分組")
+
+
+def wl_set_group(code: str, group: str) -> None:
+    bare = code.upper().replace(".TW", "").replace(".TWO", "")
+    d = _wl_groups(); d[bare] = group
+    tmp = _WL_GROUP_FILE + ".tmp"
+    with open(tmp, "w") as f: json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, _WL_GROUP_FILE)
+
+
+def wl_note_get(code: str) -> dict:
+    bare = code.upper().replace(".TW", "").replace(".TWO", "")
+    return _wl_notes().get(bare, {})
+
+
+def wl_note_set(code: str, data: dict) -> None:
+    bare = code.upper().replace(".TW", "").replace(".TWO", "")
+    d = _wl_notes(); d[bare] = data
+    tmp = _WL_NOTE_FILE + ".tmp"
+    with open(tmp, "w") as f: json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, _WL_NOTE_FILE)
+
+
 DEFAULT_WATCHLIST = [
     # ── 上市 TSE 前100大（市值排序）────────────────────────
     "2330",  # 台積電
@@ -4659,10 +4716,10 @@ def main():
     # ══════════════════════════════════════════
     # TABS
     # ══════════════════════════════════════════
-    tab_scan, tab_drill, tab_bt, tab_port, tab_sig_hist, tab_lifecycle, tab_overnight = st.tabs([
+    tab_scan, tab_drill, tab_bt, tab_port, tab_sig_hist, tab_lifecycle, tab_overnight, tab_wl = st.tabs([
         "📡  訊號掃描", "🔬  個股分析", "📊  回測 & 優化",
         "📒  買賣記錄", "📈  訊號歷史勝率",
-        "🗓  訊號管理", "🌙  隔日沖策略",
+        "🗓  訊號管理", "🌙  隔日沖策略", "📱  自選股",
     ])
 
     # ─────────────────────────────────────────
@@ -7888,6 +7945,195 @@ def main():
 使用「📊 單股因素回測」功能，對每支股票獨立分析各因素的實際次日勝率，
 系統自動找出該股的最佳評分門檻，避免過度擬合。
 """)
+
+
+
+    # ─────────────────────────────────────────────────────────
+    # TAB  📱  自選股 — 卡片視圖 + 分組 + 備忘  (替代 Watchlist Pro)
+    # ─────────────────────────────────────────────────────────
+    with tab_wl:
+        st.markdown("#### 📱 自選股管理")
+        st.caption("卡片視圖 · 分組管理 · 備忘標籤 — 手機友好介面")
+
+        wl_codes = st.session_state.watchlist
+        if not wl_codes:
+            st.info("自選股清單為空，請在左側側欄新增股票。")
+        else:
+            # ── 控制列 ──────────────────────────────────────
+            wl_c1, wl_c2, wl_c3 = st.columns(3)
+            all_groups = sorted(set(wl_get_group(c) for c in wl_codes))
+            grp_filter = wl_c1.selectbox(
+                "分組", ["全部"] + all_groups,
+                label_visibility="collapsed", key="wl_grp_filter"
+            )
+            wl_sort = wl_c2.radio(
+                "排序", ["自選股順序", "分組", "漲幅↓", "跌幅↓"],
+                horizontal=True, label_visibility="collapsed", key="wl_sort"
+            )
+            wl_view = wl_c3.radio(
+                "視圖", ["🃏 卡片", "📋 列表"],
+                horizontal=True, label_visibility="collapsed", key="wl_view"
+            )
+
+            # Filter by group
+            filtered = [c for c in wl_codes
+                        if grp_filter == "全部" or wl_get_group(c) == grp_filter]
+
+            # Fetch quotes
+            with st.spinner("載入報價…"):
+                q_cache = batch_fetch_quotes(tuple(
+                    c.replace(".TW","").replace(".TWO","") for c in filtered
+                ))
+
+            # Sort
+            def _chg(c): return q_cache.get(c.replace(".TW","").replace(".TWO",""), {}).get("change_pct", 0)
+            if wl_sort == "分組":       filtered = sorted(filtered, key=wl_get_group)
+            elif wl_sort == "漲幅↓":   filtered = sorted(filtered, key=lambda c: -_chg(c))
+            elif wl_sort == "跌幅↓":   filtered = sorted(filtered, key=_chg)
+
+            # ── Summary metrics ──────────────────────────────
+            valid_q = [q_cache.get(c.replace(".TW","").replace(".TWO",""),{}) for c in filtered]
+            up   = sum(1 for q in valid_q if q.get("change_pct",0) > 0)
+            dn   = sum(1 for q in valid_q if q.get("change_pct",0) < 0)
+            m1,m2,m3,m4 = st.columns(4)
+            m1.metric("總計", len(filtered))
+            m2.metric("上漲 🔴", up)
+            m3.metric("下跌 🟢", dn)
+            m4.metric("平盤", len(filtered)-up-dn)
+            st.markdown("---")
+
+            # ── CARD VIEW ────────────────────────────────────
+            if wl_view == "🃏 卡片":
+                for i in range(0, len(filtered), 2):
+                    chunk = filtered[i:i+2]
+                    cols  = st.columns(2)
+                    for ci, code in enumerate(chunk):
+                        bare  = code.upper().replace(".TW","").replace(".TWO","")
+                        q     = q_cache.get(bare, {})
+                        n     = wl_note_get(bare)
+                        px    = q.get("price",  q.get("change_pct",0) and 0) or 0
+                        # Prefer price key
+                        if "price" in q: px = q["price"]
+                        chg   = q.get("change_pct", 0)
+                        grp   = wl_get_group(bare)
+                        name  = lookup_name(bare)[0] or bare
+
+                        if not q:                           clr, border = "#5a8fb0", "#1a2d44"
+                        elif chg > 0:                       clr, border = "#e8414e", "#e8414e40"
+                        elif chg < 0:                       clr, border = "#22cc66", "#22cc6640"
+                        else:                               clr, border = "#5a8fb0", "#1a2d44"
+
+                        tags_str = " ".join(f"#{t}" for t in n.get("tags", []))
+                        note_str = n.get("note","")[:40]
+
+                        with cols[ci]:
+                            st.markdown(f"""
+<div style="background:#0d1a2d;border:1px solid {border};border-left:3px solid {clr};
+  border-radius:10px;padding:13px 15px;margin-bottom:10px">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
+    <span style="font-family:monospace;font-weight:700;color:#e8f4fd;font-size:0.9rem">{bare}</span>
+    <span style="font-size:0.62rem;color:#5a8fb0;background:#0a0e1a;
+      padding:2px 7px;border-radius:4px;border:1px solid #1a2d44">{grp}</span>
+  </div>
+  <div style="font-size:0.75rem;color:#5a8fb0;margin-bottom:8px">{name}</div>
+  <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px">
+    <span style="font-family:monospace;font-size:1.2rem;font-weight:700;color:{clr}">
+      {f"{px:.2f}" if px else "─"}</span>
+    <span style="font-size:0.8rem;color:{clr}">{f"{chg:+.2f}%" if q else "─"}</span>
+  </div>
+  {f'<div style="font-size:0.68rem;color:#3d5470;margin-top:4px">{tags_str}</div>' if tags_str else ""}
+  {f'<div style="font-size:0.68rem;color:#3d5470;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{note_str}</div>' if note_str else ""}
+</div>""", unsafe_allow_html=True)
+
+            # ── LIST VIEW ─────────────────────────────────────
+            else:
+                list_rows = []
+                for code in filtered:
+                    bare = code.upper().replace(".TW","").replace(".TWO","")
+                    q    = q_cache.get(bare, {})
+                    n    = wl_note_get(bare)
+                    px   = q.get("price", 0)
+                    chg  = q.get("change_pct", 0)
+                    list_rows.append({
+                        "代號": bare,
+                        "名稱": lookup_name(bare)[0] or bare,
+                        "分組": wl_get_group(bare),
+                        "現價": round(px,2) if px else None,
+                        "漲跌%": round(chg,2) if q else None,
+                        "標籤": " ".join(n.get("tags",[])),
+                        "備忘": n.get("note","")[:30],
+                    })
+                if list_rows:
+                    st.dataframe(
+                        pd.DataFrame(list_rows), width='stretch', hide_index=True,
+                        column_config={
+                            "漲跌%": st.column_config.NumberColumn(format="%+.2f%%"),
+                            "現價":  st.column_config.NumberColumn(format="%.2f"),
+                        }
+                    )
+
+            # ── 分組管理 ─────────────────────────────────────
+            st.markdown("---")
+            with st.expander("🗂 分組管理"):
+                gc1, gc2, gc3 = st.columns(3)
+                sel_code  = gc1.selectbox("股票", wl_codes,
+                    format_func=lambda x: f"{x.replace('.TW','').replace('.TWO','')}  {lookup_name(x.replace('.TW','').replace('.TWO',''))[0] or ''}",
+                    label_visibility="collapsed", key="wl_gc_code")
+                sel_grp   = gc2.selectbox("分組", PRESET_GROUPS,
+                    label_visibility="collapsed", key="wl_gc_grp")
+                if gc3.button("更新", width='stretch', key="wl_gc_save"):
+                    bare_sel = sel_code.upper().replace(".TW","").replace(".TWO","")
+                    wl_set_group(bare_sel, sel_grp)
+                    st.success(f"✓ {bare_sel} → {sel_grp}"); st.rerun()
+
+            # ── 備忘 + 標籤 ───────────────────────────────────
+            with st.expander("📝 備忘 & 標籤"):
+                nb_code = st.selectbox("選股",
+                    wl_codes,
+                    format_func=lambda x: f"{x.replace('.TW','').replace('.TWO','')}  {lookup_name(x.replace('.TW','').replace('.TWO',''))[0] or ''}",
+                    label_visibility="collapsed", key="wl_nb_code")
+                bare_nb = nb_code.upper().replace(".TW","").replace(".TWO","")
+                ex_note = wl_note_get(bare_nb)
+                with st.form("wl_note_form"):
+                    nb_text = st.text_area("備忘 / 進場理由",
+                        value=ex_note.get("note",""), height=80,
+                        placeholder="記錄關注原因、進場邏輯、觀察重點…")
+                    nb_c1, nb_c2 = st.columns(2)
+                    nb_entry = nb_c1.number_input("進場均價",
+                        min_value=0.0, value=float(ex_note.get("entry",0) or 0), step=0.5)
+                    nb_date  = nb_c2.text_input("關注日期",
+                        value=ex_note.get("watch_date", tw_now().strftime("%Y-%m-%d")))
+                    nb_tags = st.multiselect("標籤",
+                        ["技術突破","籌碼轉強","法人買超","業績成長",
+                         "低估值","高殖利率","週期底部","隔日沖","題材","其他"],
+                        default=ex_note.get("tags", []))
+                    if st.form_submit_button("💾 儲存", type="primary"):
+                        wl_note_set(bare_nb, {
+                            **ex_note,
+                            "note": nb_text, "entry": nb_entry,
+                            "watch_date": nb_date, "tags": nb_tags,
+                            "updated": tw_now().strftime("%Y-%m-%d %H:%M"),
+                        })
+                        st.success("✓ 已儲存")
+
+            # ── 所有備忘一覽 ──────────────────────────────────
+            with st.expander("📋 所有備忘一覽"):
+                note_rows = [
+                    {"代號": c.upper().replace(".TW","").replace(".TWO",""),
+                     "名稱": lookup_name(c.upper().replace(".TW","").replace(".TWO",""))[0] or c,
+                     "備忘": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("note","")[:40],
+                     "標籤": " ".join(wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("tags",[])),
+                     "均價": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("entry",""),
+                     "日期": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("watch_date",""),
+                    }
+                    for c in wl_codes
+                    if wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("note")
+                    or wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("tags")
+                ]
+                if note_rows:
+                    st.dataframe(pd.DataFrame(note_rows), width='stretch', hide_index=True)
+                else:
+                    st.info("尚無備忘記錄")
 
 
 if __name__ == "__main__":
