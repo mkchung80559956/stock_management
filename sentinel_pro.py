@@ -4472,9 +4472,17 @@ def main():
     if "prev_sig_keys" not in st.session_state:
         st.session_state.prev_sig_keys = {}
     if "signal_fired_at" not in st.session_state:
-        st.session_state.signal_fired_at = {}   # {代號: "YYYY-MM-DD HH:MM"}
-    # Portfolio trades now managed via port_get_trades() / port_add_trade()
-    # No session_state needed — cache_resource + /tmp file handle persistence
+        st.session_state.signal_fired_at = {}
+    # A. 掃描→個股分析 跳轉用
+    if "drill_jump_code" not in st.session_state:
+        st.session_state.drill_jump_code = ""
+    # B. 個股分析→買賣記錄 快速記錄進場
+    if "quick_entry_code" not in st.session_state:
+        st.session_state.quick_entry_code = ""
+    if "quick_entry_price" not in st.session_state:
+        st.session_state.quick_entry_price = 0.0
+    if "quick_entry_stop" not in st.session_state:
+        st.session_state.quick_entry_stop = 0.0
 
     # ══════════════════════════════════════════
     # SIDEBAR
@@ -5511,7 +5519,7 @@ def main():
                             with cols[ci]:
                                 st.markdown(f"""
                                 <div style="background:#0d1a2d;border:1.5px solid {border};
-                                    border-radius:10px;padding:12px 14px;margin-bottom:8px">
+                                    border-radius:10px;padding:12px 14px;margin-bottom:4px">
                                 <div style="display:flex;justify-content:space-between;
                                     align-items:baseline;margin-bottom:4px">
                                 <span style="font-size:1.05rem;font-weight:700;
@@ -5534,6 +5542,14 @@ def main():
                                 {r['_detail'][:45]}</div>
                                 {time_label}
                                 </div>""", unsafe_allow_html=True)
+                                # A. 一鍵跳轉到個股分析
+                                if st.button(
+                                    f"🔬 分析 {r['代號']}",
+                                    key=f"jump_{r['代號']}_{sig_key}",
+                                    width='stretch', use_container_width=True,
+                                ):
+                                    st.session_state.drill_jump_code = r['代號']
+                                    st.rerun()
 
                 # Sell signal cards
                 if today_sell:
@@ -5676,16 +5692,66 @@ def main():
 
     # ─────────────────────────────────────────
     # TAB 2  個股分析
+    # ── C. 大盤環境常駐指示器（所有 Tab 共用）──────────────────────────────
+    try:
+        _tw50_q = batch_fetch_quotes(("0050",))
+        _tw50   = _tw50_q.get("0050", {})
+        _idx_px  = _tw50.get("price", 0)
+        _idx_chg = _tw50.get("change_pct", 0)
+        if _idx_px:
+            _idx_c = "#e8414e" if _idx_chg >= 0 else "#22cc66"
+            _env   = "✅ 適合操作" if _idx_chg >= 0.3 else \
+                     "⚠️ 謹慎操作" if _idx_chg >= -0.3 else "🔴 不建議買入"
+            _env_c = "#00ff88" if _idx_chg >= 0.3 else \
+                     "#ffd600" if _idx_chg >= -0.3 else "#ff3355"
+            st.markdown(
+                f'<div style="background:#0a1020;border:1px solid #1a2d44;'
+                f'border-radius:6px;padding:5px 14px;margin-bottom:8px;'
+                f'display:flex;align-items:center;gap:14px;flex-wrap:wrap;font-size:0.75rem">'
+                f'<span style="color:#5a8fb0">📊 大盤環境</span>'
+                f'<span style="color:#e8f4fd;font-weight:700">0050</span>'
+                f'<span style="color:{_idx_c};font-family:monospace;font-weight:700">'
+                f'{_idx_px:.2f}　{_idx_chg:+.2f}%</span>'
+                f'<span style="color:{_env_c};font-weight:700">{_env}</span>'
+                f'<span style="color:#37474f;font-size:0.68rem">（以台灣50作為大盤環境參考）</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    except Exception:
+        pass
+
     # ─────────────────────────────────────────
     with tab_drill:
         st.markdown("#### 🔬 個股深度分析")
+
+        # A. 若從掃描卡片跳轉過來，自動填入並載入
+        _jump = st.session_state.get("drill_jump_code", "")
+        if _jump:
+            st.info(f"⬅️ 從掃描結果跳轉：**{_jump}**")
+
         c1, c2, c3 = st.columns([3, 2, 1])
+        _default_wl_idx = 0
+        if _jump:
+            _wl_bare = [c.upper().replace(".TW","").replace(".TWO","")
+                        for c in st.session_state.watchlist]
+            if _jump in _wl_bare:
+                _default_wl_idx = _wl_bare.index(_jump)
         sel_from_wl = c1.selectbox(
             "從自選股選擇", st.session_state.watchlist,
+            index=_default_wl_idx,
             format_func=lambda x: x if x.upper().endswith((".TW", ".TWO")) else f"{x}.TW",
         )
-        custom_code = c2.text_input("或直接輸入代號", placeholder="e.g. 0050 / 3661.TWO")
+        custom_code = c2.text_input("或直接輸入代號",
+                                    value=_jump if _jump and _jump not in [
+                                        c.upper().replace(".TW","").replace(".TWO","")
+                                        for c in st.session_state.watchlist] else "",
+                                    placeholder="e.g. 0050 / 3661.TWO")
         load_btn    = c3.button("📊 載入", type="primary", width='stretch')
+
+        # Auto-trigger load when jumped from scan
+        if _jump and not load_btn:
+            load_btn = True
+            st.session_state.drill_jump_code = ""   # clear after use
 
         # Timeframe selector
         tf_opts  = {"1個月": "1mo", "3個月": "3mo", "6個月": "6mo",
@@ -5947,7 +6013,40 @@ def main():
                     )
                     st.markdown(card_html, unsafe_allow_html=True)
 
-                    # ── Signal timeline (last 10 events) ──
+                    # B. 一鍵記錄進場 ─────────────────────────────────
+                    if is_buy and still_valid:
+                        qe_col1, qe_col2, qe_col3 = st.columns([2, 2, 1])
+                        qe_price = qe_col1.number_input(
+                            "進場價",
+                            value=float(latest_ev["close"]),
+                            step=0.5, min_value=0.01,
+                            key=f"qe_price_{bare_t}",
+                            label_visibility="visible",
+                        )
+                        qe_stop = qe_col2.number_input(
+                            "停損價",
+                            value=float(latest_ev["stop"]),
+                            step=0.5, min_value=0.01,
+                            key=f"qe_stop_{bare_t}",
+                            label_visibility="visible",
+                        )
+                        if qe_col3.button(
+                            "📒 記錄進場",
+                            key=f"qe_btn_{bare_t}",
+                            type="primary",
+                            width='stretch',
+                        ):
+                            # Pre-fill portfolio tab
+                            st.session_state.quick_entry_code  = bare_t
+                            st.session_state.quick_entry_price = qe_price
+                            st.session_state.quick_entry_stop  = qe_stop
+                            st.session_state["_qe_ready"]      = True
+                            st.toast(
+                                f"✅ 已預填 {bare_t} 進場資料，切換到「📒 買賣記錄」Tab 確認",
+                                icon="📒",
+                            )
+
+
                     if len(sig_events) > 1:
                         st.markdown(
                             '<div style="font-size:0.68rem;color:#5a8fb0;'
@@ -6633,14 +6732,39 @@ def main():
             )
 
             # ── Step 3: 股票基本資訊 ────────────────────────
+            # B. 若從個股分析一鍵跳轉，顯示橫幅並預填資料
+            _qe_ready = st.session_state.get("_qe_ready", False)
+            _qe_code  = st.session_state.get("quick_entry_code", "")
+            _qe_price = st.session_state.get("quick_entry_price", 0.0)
+            _qe_stop  = st.session_state.get("quick_entry_stop", 0.0)
+            if _qe_ready and _qe_code:
+                st.info(
+                    f"📊 從個股分析帶入：**{_qe_code}**　"
+                    f"進場價 {_qe_price:.2f}　停損 {_qe_stop:.2f}　"
+                    "→ 資料已預填，確認後點「確認新增」"
+                )
+                if st.button("✖ 清除預填", key="qe_clear", width='stretch'):
+                    st.session_state["_qe_ready"]       = False
+                    st.session_state.quick_entry_code   = ""
+                    st.session_state.quick_entry_price  = 0.0
+                    st.session_state.quick_entry_stop   = 0.0
+                    st.rerun()
+
             st.markdown("**③ 股票與進場資訊**")
             fa1, fa2, fa3 = st.columns([2, 2, 2])
             wl_opts = [c.replace(".TW","").replace(".TWO","")
                        for c in st.session_state.watchlist]
+            # Pre-select quick-entry code if available
+            _qe_idx = 0
+            if _qe_ready and _qe_code and _qe_code in wl_opts:
+                _qe_idx = wl_opts.index(_qe_code)
             t_code  = fa1.selectbox("股票代號", wl_opts,
+                                    index=_qe_idx,
                                     key="pt_code",
                                     help="從自選股選擇，或在下方手動輸入")
             t_cust  = fa2.text_input("或手動輸入代號",
+                                      value=_qe_code if (_qe_ready and _qe_code
+                                                         and _qe_code not in wl_opts) else "",
                                       placeholder="2330 / 3661",
                                       key="pt_cust")
             t_buy_sell = fa3.selectbox(
@@ -6658,8 +6782,11 @@ def main():
             fb1, fb2, fb3 = st.columns(3)
             t_date  = fb1.date_input("交易日期",
                                       value=tw_now().date(), key="pt_date")
+            _price_default = float(_qe_price) if (_qe_ready and _qe_price > 0) else 100.0
             t_price = fb2.number_input(
-                "成交價（元）", min_value=0.01, value=100.0, step=0.01, key="pt_price",
+                "成交價（元）", min_value=0.01,
+                value=_price_default,
+                step=0.01, key="pt_price",
                 help="實際成交價格，用於計算建議股數和損益。",
             )
 
