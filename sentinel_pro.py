@@ -4572,6 +4572,8 @@ def main():
     # A. 掃描→個股分析 跳轉用
     if "drill_jump_code" not in st.session_state:
         st.session_state.drill_jump_code = ""
+    if "drill_active_code" not in st.session_state:
+        st.session_state.drill_active_code = ""
     # B. 個股分析→買賣記錄 快速記錄進場
     if "quick_entry_code" not in st.session_state:
         st.session_state.quick_entry_code = ""
@@ -5980,22 +5982,26 @@ def main():
         # A. 若從掃描卡片跳轉過來，自動填入並載入
         _jump = st.session_state.get("drill_jump_code", "")
         if _jump:
+            # Save to a separate key so clearing drill_jump_code doesn't lose it
+            st.session_state["drill_active_code"] = _jump
             st.info(f"⬅️ 從掃描結果跳轉：**{_jump}**")
+        _active_code = st.session_state.get("drill_active_code", "")
 
         c1, c2, c3 = st.columns([3, 2, 1])
         _default_wl_idx = 0
-        if _jump:
+        _lookup_code = _active_code or _jump
+        if _lookup_code:
             _wl_bare = [c.upper().replace(".TW","").replace(".TWO","")
                         for c in st.session_state.watchlist]
-            if _jump in _wl_bare:
-                _default_wl_idx = _wl_bare.index(_jump)
+            if _lookup_code in _wl_bare:
+                _default_wl_idx = _wl_bare.index(_lookup_code)
         sel_from_wl = c1.selectbox(
             "從自選股選擇", st.session_state.watchlist,
             index=_default_wl_idx,
             format_func=lambda x: x if x.upper().endswith((".TW", ".TWO")) else f"{x}.TW",
         )
         custom_code = c2.text_input("或直接輸入代號",
-                                    value=_jump if _jump and _jump not in [
+                                    value=_active_code if _active_code and _active_code not in [
                                         c.upper().replace(".TW","").replace(".TWO","")
                                         for c in st.session_state.watchlist] else "",
                                     placeholder="e.g. 0050 / 3661.TWO")
@@ -6004,17 +6010,17 @@ def main():
         # Auto-trigger load when jumped from scan
         if _jump and not load_btn:
             load_btn = True
-            st.session_state.drill_jump_code = ""   # clear after use
+            st.session_state.drill_jump_code = ""   # clear jump flag after use
 
-        # Timeframe selector
-        tf_opts  = {"1個月": "1mo", "3個月": "3mo", "6個月": "6mo",
-                    "1年": "1y", "2年": "2y"}
-        tf_label = st.radio("分析區間", list(tf_opts.keys()),
-                            horizontal=True, index=2,
-                            label_visibility="collapsed")
-        drill_period = tf_opts[tf_label]
+        # Resolve target — prefer active_code from jump over selectbox default
+        if _active_code and not custom_code.strip():
+            target = _active_code
+        else:
+            target = custom_code.strip() or sel_from_wl
 
-        target = custom_code.strip() or sel_from_wl
+        # Clear active_code once user manually changes selection
+        if load_btn and not _jump:
+            st.session_state["drill_active_code"] = ""
 
         if load_btn:
             with st.spinner(f"載入 {target} …"):
