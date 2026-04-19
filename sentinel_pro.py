@@ -2272,6 +2272,51 @@ def fetch_fundamentals(code: str) -> dict:
     return result
 
 
+
+
+@st.cache_data(ttl=3600)
+def fetch_institutional(code: str) -> dict:
+    """
+    Fetch institutional holding data for Taiwan stocks via yfinance.
+    Returns dict with available institutional ownership info.
+    Falls back to volume-based proxy if direct data unavailable.
+    """
+    bare = code.upper().replace(".TWO","").replace(".TW","")
+    sym  = bare + (".TWO" if code.upper().endswith(".TWO") else ".TW")
+    result = {
+        "inst_hold_pct":    None,   # % held by institutions
+        "insider_hold_pct": None,   # % held by insiders
+        "foreign_hold_pct": None,   # % held by foreign investors
+        "short_ratio":      None,   # short interest ratio
+        "float_shares":     None,   # floating shares
+        "avg_vol_30d":      None,
+    }
+    try:
+        t    = yf.Ticker(sym)
+        info = t.info or {}
+        result["inst_hold_pct"]    = info.get("heldPercentInstitutions")
+        result["insider_hold_pct"] = info.get("heldPercentInsiders")
+        result["short_ratio"]      = info.get("shortRatio")
+        result["float_shares"]     = info.get("floatShares")
+        result["avg_vol_30d"]      = info.get("averageVolume") or info.get("averageVolume10days")
+
+        # Taiwan-specific: check major_holders if available
+        try:
+            holders = t.major_holders
+            if holders is not None and not holders.empty:
+                for _, row in holders.iterrows():
+                    val = str(row.iloc[0]) if len(row) > 0 else ""
+                    lbl = str(row.iloc[1]) if len(row) > 1 else ""
+                    if "institution" in lbl.lower() and result["inst_hold_pct"] is None:
+                        try: result["inst_hold_pct"] = float(val.strip("%")) / 100
+                        except: pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return result
+
+
 def build_chart(df: pd.DataFrame, symbol: str, p: dict,
                 sr: dict | None = None,
                 stop_price: float | None = None,
@@ -4899,10 +4944,15 @@ def main():
     # ══════════════════════════════════════════
     # TABS
     # ══════════════════════════════════════════
-    tab_scan, tab_drill, tab_bt, tab_port, tab_sig_hist, tab_lifecycle, tab_overnight, tab_wl = st.tabs([
-        "📡  訊號掃描", "🔬  個股分析", "📊  回測 & 優化",
-        "📒  買賣記錄", "📈  訊號歷史勝率",
-        "🗓  訊號管理", "🌙  隔日沖策略", "📱  自選股",
+    tab_scan, tab_bt, tab_drill, tab_overnight, tab_lifecycle, tab_port, tab_sig_hist, tab_wl = st.tabs([
+        "📡  訊號掃描",
+        "📊  回測 & 優化",
+        "🔬  個股分析",
+        "🌙  隔日沖策略",
+        "🗓  訊號管理",
+        "📒  買賣記錄",
+        "📈  訊號歷史勝率",
+        "📱  自選股",
     ])
 
     # ─────────────────────────────────────────
@@ -5822,6 +5872,70 @@ def main():
                 f5.metric("52W高",        f"{w52h:.2f}", f"{pct_from_high:+.1f}%")
                 f6.metric("Beta",         _fmt_f(fund.get("beta")))
 
+                # ── E. 法人籌碼摘要 ──────────────────────────────────
+                try:
+                    inst = fetch_institutional(target)
+                    _any_inst = any(v is not None for v in [
+                        inst["inst_hold_pct"], inst["insider_hold_pct"],
+                        inst["short_ratio"], inst["float_shares"]
+                    ])
+                    if _any_inst:
+                        def _pct(v): return f"{v*100:.1f}%" if v is not None else "─"
+                        def _fmt_sr(v): return f"{v:.1f}日" if v is not None else "─"
+                        def _fmt_fs(v):
+                            if v is None: return "─"
+                            if v >= 1e8: return f"{v/1e8:.1f}億股"
+                            if v >= 1e4: return f"{v/1e4:.1f}萬股"
+                            return f"{v:,.0f}股"
+
+                        # Volume trend proxy (5 vs 20 day avg)
+                        _vol5  = float(df_sig["Volume"].tail(5).mean())
+                        _vol20 = float(df_sig["Volume"].tail(20).mean())
+                        _vol_trend = "放大↑" if _vol5 > _vol20 * 1.2 else \
+                                     "萎縮↓" if _vol5 < _vol20 * 0.8 else "平穩"
+                        _vol_c = "#00ff88" if "放大" in _vol_trend else \
+                                 "#ff3355" if "萎縮" in _vol_trend else "#5a8fb0"
+
+                        # OBV trend
+                        _obv_now  = float(df_sig["OBV"].iloc[-1] if "OBV" in df_sig else 0)
+                        _obv_5ago = float(df_sig["OBV"].iloc[-5] if "OBV" in df_sig and len(df_sig)>=5 else _obv_now)
+                        _obv_trend = "上升↑" if _obv_now > _obv_5ago * 1.01 else \
+                                     "下降↓" if _obv_now < _obv_5ago * 0.99 else "平穩"
+                        _obv_c = "#00ff88" if "上升" in _obv_trend else \
+                                 "#ff3355" if "下降" in _obv_trend else "#5a8fb0"
+
+                        inst_cells = [
+                            ("機構持股", _pct(inst["inst_hold_pct"]),
+                             "#00ff88" if (inst["inst_hold_pct"] or 0) > 0.2 else "#e8f4fd"),
+                            ("內部人持股", _pct(inst["insider_hold_pct"]), "#e8f4fd"),
+                            ("放空比率", _fmt_sr(inst["short_ratio"]),
+                             "#ff3355" if (inst["short_ratio"] or 0) > 5 else "#e8f4fd"),
+                            ("流通股數", _fmt_fs(inst["float_shares"]), "#e8f4fd"),
+                            ("量能趨勢", _vol_trend, _vol_c),
+                            ("OBV趨勢", _obv_trend, _obv_c),
+                        ]
+                        inst_html = (
+                            '<div style="background:#0a0e1a;border:1px solid #1a2d44;'
+                            'border-radius:8px;padding:10px 14px;margin:6px 0 10px 0">'
+                            '<div style="font-size:0.68rem;color:#5a8fb0;'
+                            'text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px">'
+                            '📊 法人籌碼 & 量能</div>'
+                            '<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px">'
+                        )
+                        for lbl, val, col in inst_cells:
+                            inst_html += (
+                                f'<div style="background:#080c18;padding:6px 8px;'
+                                f'border-radius:6px;text-align:center">'
+                                f'<div style="font-size:0.6rem;color:#5a8fb0">{lbl}</div>'
+                                f'<div style="font-size:0.8rem;font-weight:700;'
+                                f'color:{col};margin-top:3px">{val}</div>'
+                                f'</div>'
+                            )
+                        inst_html += '</div></div>'
+                        st.markdown(inst_html, unsafe_allow_html=True)
+                except Exception:
+                    pass
+
                 # ── Signal metrics ──
                 scan_sig, scan_detail = get_scan_signal(df_sig, lookback=5)
                 r1c1, r1c2, r1c3, r1c4 = st.columns(4)
@@ -6339,6 +6453,100 @@ def main():
                             st.plotly_chart(mfig, width='stretch')
                         except Exception:
                             pass
+
+                    # ── ④b 市場環境對比 ─────────────────────────────
+                    st.markdown("##### 🌦 市場環境對比")
+                    st.caption("依大盤漲跌日分類，了解此股在不同環境下的表現差異")
+                    try:
+                        if not completed.empty and len(completed) >= 6:
+                            env_df = completed.copy()
+                            env_df["進場日_dt"] = pd.to_datetime(env_df["進場日"])
+
+                            # Classify each trade by 0050 direction on entry day
+                            df_0050, _ = fetch_data("0050", bt_period)
+                            if df_0050 is not None:
+                                df_0050["pct"] = df_0050["Close"].pct_change() * 100
+                                env_df["大盤方向"] = env_df["進場日_dt"].apply(
+                                    lambda d: (
+                                        "📈 大盤上漲" if df_0050["pct"].get(d, 0) >= 0.3
+                                        else "📉 大盤下跌" if df_0050["pct"].get(d, 0) <= -0.3
+                                        else "➡️ 大盤平盤"
+                                    )
+                                )
+                                env_grp = (env_df.groupby("大盤方向")
+                                           .agg(次數=("報酬%","count"),
+                                                勝率=("結果", lambda x: round((x=="WIN").mean()*100,1)),
+                                                平均報酬=("報酬%","mean"),
+                                                期望值=("報酬%", lambda x: round(x.mean(),2)))
+                                           .reset_index())
+                                env_grp["平均報酬"] = env_grp["平均報酬"].round(2)
+
+                                # Color-code rows
+                                def _env_badge(env):
+                                    if "上漲" in env: return "background:#0d3a1a"
+                                    if "下跌" in env: return "background:#3a0d10"
+                                    return "background:#1a2030"
+
+                                env_html = (
+                                    '<div style="display:grid;grid-template-columns:repeat(3,1fr);'
+                                    'gap:8px;margin-bottom:10px">'
+                                )
+                                for _, er in env_grp.iterrows():
+                                    wr_c = "#00ff88" if er["勝率"] >= 55 else \
+                                           "#ffd600" if er["勝率"] >= 45 else "#ff3355"
+                                    ret_c = "#00ff88" if er["平均報酬"] > 0 else "#ff3355"
+                                    env_html += (
+                                        f'<div style="{_env_badge(er["大盤方向"])};'
+                                        f'border-radius:8px;padding:10px 12px;'
+                                        f'border:1px solid #1a2d44">'
+                                        f'<div style="font-size:0.78rem;font-weight:700;'
+                                        f'color:#e8f4fd;margin-bottom:6px">{er["大盤方向"]}</div>'
+                                        f'<div style="display:grid;grid-template-columns:1fr 1fr;'
+                                        f'gap:4px;font-size:0.72rem">'
+                                        f'<div><span style="color:#5a8fb0">次數 </span>'
+                                        f'<span style="color:#e8f4fd">{int(er["次數"])}</span></div>'
+                                        f'<div><span style="color:#5a8fb0">勝率 </span>'
+                                        f'<span style="color:{wr_c};font-weight:700">'
+                                        f'{er["勝率"]:.1f}%</span></div>'
+                                        f'<div><span style="color:#5a8fb0">平均 </span>'
+                                        f'<span style="color:{ret_c};font-weight:700">'
+                                        f'{er["平均報酬"]:+.2f}%</span></div>'
+                                        f'<div><span style="color:#5a8fb0">期望 </span>'
+                                        f'<span style="color:{ret_c}">'
+                                        f'{er["期望值"]:+.2f}%</span></div>'
+                                        f'</div></div>'
+                                    )
+                                env_html += '</div>'
+
+                                # Key insight
+                                up_rows = env_grp[env_grp["大盤方向"].str.contains("上漲")]
+                                dn_rows = env_grp[env_grp["大盤方向"].str.contains("下跌")]
+                                if not up_rows.empty and not dn_rows.empty:
+                                    gap = float(up_rows["勝率"].values[0]) - float(dn_rows["勝率"].values[0])
+                                    if abs(gap) >= 10:
+                                        insight = (
+                                            f'⚡ 大盤方向影響顯著：上漲日勝率比下跌日高 {gap:+.1f}%，'
+                                            '建議只在大盤上漲日進場'
+                                            if gap >= 10 else
+                                            f'⚡ 大盤下跌日勝率反而更高 {-gap:+.1f}%，此股具反向特性'
+                                        )
+                                        env_html += (
+                                            f'<div style="font-size:0.72rem;color:#ffd600;'
+                                            f'background:#1a1500;border-radius:6px;'
+                                            f'padding:6px 10px">{insight}</div>'
+                                        )
+                                    else:
+                                        env_html += (
+                                            '<div style="font-size:0.72rem;color:#5a8fb0;'
+                                            'padding:4px 0">大盤方向影響較小，可較不受限於大盤方向</div>'
+                                        )
+                                st.markdown(env_html, unsafe_allow_html=True)
+                            else:
+                                st.caption("無法取得 0050 資料進行環境對比")
+                        else:
+                            st.caption("交易次數不足（需 ≥ 6 次）進行環境對比")
+                    except Exception:
+                        st.caption("市場環境對比暫時無法計算")
 
                     # ── ⑤ 完整交易明細 ──────────────────────────────
                     with st.expander("📋 完整交易明細"):
@@ -7533,7 +7741,7 @@ def main():
     # TAB 6.5  🗓 訊號管理 — 進退場生命週期
     # ─────────────────────────────────────────────────────────
     with tab_lifecycle:
-        st.markdown("#### 🗓 訊號生命週期管理")
+        st.markdown("#### 🗓 訊號管理")
         st.caption(
             "每個訊號從觸發到出場都有固定的進場窗口、停損設定與退場條件。"
             "此頁追蹤所有活躍訊號的狀態，並提供詳細的操作說明。"
@@ -7545,6 +7753,92 @@ def main():
             st.info(f"⏰ 已自動標記 {n_exp} 筆過期訊號")
 
         all_lc = lifecycle_get_all()
+
+        # ── F. 組合總攬 ──────────────────────────────────────
+        active_lc = [r for r in all_lc if r["status"] == "active"]
+        entered_lc = [r for r in all_lc if r["status"] == "entered"]
+        if active_lc or entered_lc:
+            total_capital = st.session_state.get("pt_capital_mem", 500000)
+
+            # Compute total risk exposure
+            total_risk_amt = 0
+            groups = {}   # sector grouping by first char of signal key → approximate
+            for r in active_lc + entered_lc:
+                # Risk = (entry_price - stop_price) × assumed 1000 shares
+                ep = r.get("entered_price") or r["price_fired"]
+                sp = r["stop_price"]
+                risk_1lot = max(0, (ep - sp) * 1000)
+                total_risk_amt += risk_1lot
+
+            risk_pct_total = total_risk_amt / total_capital * 100 if total_capital else 0
+
+            # Signal type distribution
+            sig_dist = {}
+            for r in active_lc:
+                lbl = r["sig_label"]
+                sig_dist[lbl] = sig_dist.get(lbl, 0) + 1
+
+            ov_color = "#ff3355" if risk_pct_total > 10 else \
+                       "#ffd600" if risk_pct_total > 5 else "#00ff88"
+
+            ov_html = (
+                '<div style="background:#0a0e1a;border:1px solid #1a2d44;'
+                'border-radius:10px;padding:14px 16px;margin-bottom:14px">'
+                '<div style="font-size:0.72rem;color:#5a8fb0;'
+                'text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px">'
+                '🗂 組合總攬</div>'
+                '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px">'
+                # Active signals
+                f'<div style="background:#080c18;padding:8px 10px;border-radius:8px;text-align:center">'
+                f'<div style="font-size:0.62rem;color:#5a8fb0">活躍訊號</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:#e8f4fd;margin-top:4px">'
+                f'{len(active_lc)}</div></div>'
+                # Entered positions
+                f'<div style="background:#080c18;padding:8px 10px;border-radius:8px;text-align:center">'
+                f'<div style="font-size:0.62rem;color:#5a8fb0">已進場</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:#ffd700;margin-top:4px">'
+                f'{len(entered_lc)}</div></div>'
+                # Total risk
+                f'<div style="background:#080c18;padding:8px 10px;border-radius:8px;'
+                f'text-align:center;border:1px solid {ov_color}40">'
+                f'<div style="font-size:0.62rem;color:#5a8fb0">預估總風險</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:{ov_color};margin-top:4px">'
+                f'{risk_pct_total:.1f}%</div></div>'
+                # Expiring soon
+                + (lambda exp_soon: (
+                    f'<div style="background:#080c18;padding:8px 10px;border-radius:8px;'
+                    f'text-align:center;border:1px solid {"#ff3355" if exp_soon else "#1a2d44"}40">'
+                    f'<div style="font-size:0.62rem;color:#5a8fb0">明日到期</div>'
+                    f'<div style="font-size:1.1rem;font-weight:700;'
+                    f'color:{"#ff3355" if exp_soon else "#5a8fb0"};margin-top:4px">'
+                    f'{exp_soon}</div></div>'
+                ))(sum(1 for r in active_lc if lifecycle_days_remaining(r) <= 1))
+                + '</div>'
+            )
+            # Risk bar
+            bar_w = min(100, risk_pct_total * 10)
+            ov_html += (
+                f'<div style="font-size:0.68rem;color:#5a8fb0;margin-bottom:4px">'
+                f'風險敞口（每筆按1張估算）：{total_risk_amt:,.0f} 元 / 總資金 {total_capital:,.0f} 元</div>'
+                f'<div style="background:#1a2d44;border-radius:3px;height:4px;margin-bottom:8px">'
+                f'<div style="background:{ov_color};width:{bar_w:.0f}%;height:4px;border-radius:3px"></div></div>'
+            )
+            if risk_pct_total > 10:
+                ov_html += (
+                    '<div style="font-size:0.72rem;color:#ff3355">⚠️ 總風險超過 10%，建議控制新增訊號數量</div>'
+                )
+            # Signal distribution
+            if sig_dist:
+                dist_tags = "　".join(
+                    f'<span style="background:#0d1a2d;color:#5a8fb0;'
+                    f'padding:2px 8px;border-radius:4px;font-size:0.7rem">'
+                    f'{k} ×{v}</span>'
+                    for k, v in sig_dist.items()
+                )
+                ov_html += f'<div style="margin-top:8px">{dist_tags}</div>'
+            ov_html += '</div>'
+            st.markdown(ov_html, unsafe_allow_html=True)
+
         if not all_lc:
             st.info("尚無訊號記錄。執行訊號掃描後，買入訊號會自動加入此清單。")
         else:
@@ -8584,4 +8878,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as _sentinel_err:
+        import traceback as _tb
+        _err_detail = _tb.format_exc()[-600:]   # last 600 chars of traceback
+        try:
+            tg_broadcast(
+                f"⚠️ Sentinel Pro 異常\n"
+                f"{tw_now().strftime('%m/%d %H:%M')}\n\n"
+                f"{type(_sentinel_err).__name__}: {str(_sentinel_err)[:200]}\n\n"
+                f"{_err_detail}"
+            )
+        except Exception:
+            pass
+        raise   # still show error in Streamlit UI
