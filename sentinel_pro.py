@@ -4492,7 +4492,58 @@ def _pro_strategy(sig_k, trend_s, conf_s, accel_s,
     )
 
 
+def _check_password() -> bool:
+    """
+    開頁密碼保護。
+    在 Streamlit Secrets 設定：[app] password = "你的密碼"
+    未設定密碼 = 不保護（向下相容）。
+    """
+    try:
+        _pwd = st.secrets.get("app", {}).get("password", "")
+    except Exception:
+        _pwd = ""
+
+    if not _pwd:
+        return True   # 未設定密碼，直接通過
+
+    if st.session_state.get("_authenticated"):
+        return True
+
+    # ── 登入畫面 ────────────────────────────────────────
+    st.markdown("""
+    <div style="max-width:380px;margin:80px auto 0 auto;text-align:center">
+    <div style="font-size:2rem;font-weight:800;color:#00d4ff;margin-bottom:6px">
+    🛡️ Sentinel Pro</div>
+    <div style="font-size:0.85rem;color:#5a8fb0;margin-bottom:30px">
+    台股專業掃描系統 · 請輸入密碼</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        with st.form("login_form", clear_on_submit=True):
+            entered = st.text_input(
+                "密碼", type="password",
+                placeholder="輸入存取密碼…",
+                label_visibility="collapsed",
+            )
+            submitted = st.form_submit_button("登入", type="primary",
+                                               use_container_width=True)
+            if submitted:
+                if entered == _pwd:
+                    st.session_state["_authenticated"] = True
+                    st.rerun()
+                else:
+                    st.error("密碼錯誤，請重試")
+    st.stop()
+    return False
+
+
 def main():
+    # ── 3. 開頁密碼保護 ─────────────────────────────────
+    if not _check_password():
+        return
+
     # ── Header ──────────────────────────────────
     st.markdown(f"""
     <div class="sentinel-header">
@@ -4881,6 +4932,66 @@ def main():
                     st.session_state.price_alerts = {}
                     st.rerun()
 
+        # ── H. 週報推播 ──────────────────────────────────────────
+        with st.expander("📋 週報 / 績效摘要推播", expanded=False):
+            st.caption("一鍵將本週訊號統計、勝率、買賣記錄摘要推播到 Telegram")
+            _wr_c1, _wr_c2 = st.columns(2)
+            _wr_period = _wr_c1.radio("統計週期",
+                ["本週", "本月", "近30天"], horizontal=True,
+                key="wr_period", label_visibility="collapsed")
+            if _wr_c2.button("📲 推播週報", key="wr_push", width='stretch',
+                              type="primary"):
+                try:
+                    _tg_tk, _tg_cids = tg_get_recipients()
+                    if not _tg_tk or not _tg_cids:
+                        st.warning("請先設定 Telegram Token 和 Chat ID")
+                    else:
+                        # Gather signal history
+                        _all_hist = sig_hist_get_all()
+                        _today    = tw_now().date()
+                        _cutoff   = {
+                            "本週":  _today - __import__('datetime').timedelta(days=7),
+                            "本月":  _today.replace(day=1),
+                            "近30天": _today - __import__('datetime').timedelta(days=30),
+                        }[_wr_period]
+                        _period_recs = [
+                            r for r in _all_hist
+                            if r.get("date_fired","") >= str(_cutoff)
+                        ]
+                        _total   = len(_period_recs)
+                        _with_ret = [r for r in _period_recs if r.get("ret_5d") is not None]
+                        _wins    = sum(1 for r in _with_ret if r.get("ret_5d",0) > 0)
+                        _avg_ret = round(sum(r.get("ret_5d",0) for r in _with_ret) /
+                                         len(_with_ret), 2) if _with_ret else 0
+                        # Portfolio summary
+                        _trades  = port_get_trades()
+                        _pos     = get_open_positions(_trades)
+                        _open_n  = len(_pos)
+                        _open_codes = ", ".join(list(_pos.keys())[:6])
+
+                        _report = (
+                            f"📋 Sentinel Pro {_wr_period}報\n"
+                            f"{str(_cutoff)} — {str(_today)}\n\n"
+                            f"📡 訊號統計\n"
+                            f"  觸發訊號：{_total} 個\n"
+                            f"  已驗證：{len(_with_ret)} 個\n"
+                            f"  勝率：{_wins}/{len(_with_ret)} = "
+                            f"{_wins/len(_with_ret)*100:.1f}%\n"
+                            f"  平均5日報酬：{_avg_ret:+.2f}%\n\n"
+                            f"📒 持倉狀況\n"
+                            f"  現有持倉：{_open_n} 支\n"
+                            f"  持股：{_open_codes or '─'}\n\n"
+                            f"🗓 活躍訊號：{len(lifecycle_get_active())} 個\n"
+                            f"生成時間：{tw_now().strftime('%m/%d %H:%M')}"
+                        )
+                        _sent = tg_broadcast(_report)
+                        if _sent:
+                            st.success(f"✅ 週報已推播到 {_sent} 位收件人")
+                        else:
+                            st.error("推播失敗，請確認 Telegram 設定")
+                except Exception as e:
+                    st.error(f"週報生成失敗：{e}")
+
         # ── Google Sheets 儲存設定 ─────────────────────────
         with st.expander("📊 Google Sheets 交易記錄雲端同步", expanded=False):
             st.caption("將買賣記錄永久儲存到 Google Sheets，重啟後自動還原")
@@ -5179,9 +5290,70 @@ def main():
             ohlcv_cache: dict = {}
             try:
                 with st.spinner(_spinner_msg):
+                    # 1. 等待期間顯示訊號說明卡
+                    _wait_card = st.empty()
+                    _wait_card.markdown("""
+<div style="background:#0a0e1a;border:1px solid #1a2d44;border-radius:12px;padding:18px 20px;margin:8px 0">
+<div style="font-size:0.8rem;font-weight:700;color:#00d4ff;margin-bottom:14px">
+📖 訊號策略說明 — 掃描進行中，請稍候…</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:0.75rem">
+
+<div style="background:#0d1a2d;border-left:3px solid #ffd700;padding:10px 12px;border-radius:0 8px 8px 0">
+<div style="color:#ffd700;font-weight:700;margin-bottom:4px">⭐ 三重共振</div>
+<div style="color:#8a9bb5;line-height:1.6">
+趨勢↑ + 5+/7 共振 + 動能加速三條件同時成立。<br>
+最高勝率訊號（60–75%）。<br>
+建議：訊號日收盤前 13:20 進場，或等次日縮量回調。</div>
+</div>
+
+<div style="background:#0d1a2d;border-left:3px solid #00e5ff;padding:10px 12px;border-radius:0 8px 8px 0">
+<div style="color:#00e5ff;font-weight:700;margin-bottom:4px">💎 共振回調買</div>
+<div style="color:#8a9bb5;line-height:1.6">
+三重共振後 1–3 天縮量回調，CCI 仍 &gt;0。<br>
+停損比訊號日更近，風險報酬比更優。<br>
+建議：當天任意時間，停損放訊號日低點。</div>
+</div>
+
+<div style="background:#0d1a2d;border-left:3px solid #ff9900;padding:10px 12px;border-radius:0 8px 8px 0">
+<div style="color:#ff9900;font-weight:700;margin-bottom:4px">🟠 噴發買</div>
+<div style="color:#8a9bb5;line-height:1.6">
+CCI 強力突破 +100 + 放量。<br>
+訊號日不追高，等次日確認量能延續再進。<br>
+建議：次日開盤後觀察，未跳空才進。</div>
+</div>
+
+<div style="background:#0d1a2d;border-left:3px solid #00ff88;padding:10px 12px;border-radius:0 8px 8px 0">
+<div style="color:#00ff88;font-weight:700;margin-bottom:4px">🟢 強買 / 底背離</div>
+<div style="color:#8a9bb5;line-height:1.6">
+底部翻轉確認。強買 = CCI 從 -100 以下突破。<br>
+底背離 = 股價創低但 CCI 底部抬高。<br>
+建議：小量試單，次日不破低再加碼。</div>
+</div>
+
+<div style="background:#0d1a2d;border-left:3px solid #ff3355;padding:10px 12px;border-radius:0 8px 8px 0">
+<div style="color:#ff3355;font-weight:700;margin-bottom:4px">🔴 強賣 / 頂背離</div>
+<div style="color:#8a9bb5;line-height:1.6">
+強賣 = CCI 跌破 +100 + 放量頭部。<br>
+頂背離 = 股價創高但 CCI 頂部下移。<br>
+建議：現有持倉考慮減碼，設移動停損保護。</div>
+</div>
+
+<div style="background:#0d1a2d;border-left:3px solid #5a8fb0;padding:10px 12px;border-radius:0 8px 8px 0">
+<div style="color:#5a8fb0;font-weight:700;margin-bottom:4px">核心過濾條件</div>
+<div style="color:#8a9bb5;line-height:1.6">
+EMA200 年線：跌破年線封鎖所有買入。<br>
+壓力區：現價距壓力 ≤3% 發出⚠️警告。<br>
+共振門檻：建議只看共振 ≥5/7 的訊號。</div>
+</div>
+
+</div>
+</div>""", unsafe_allow_html=True)
                     ohlcv_cache = batch_fetch_ohlcv(tuple(wl), data_period)
+                    _wait_card.empty()   # 下載完成後清除說明卡
             except Exception:
                 ohlcv_cache = {}
+                try: _wait_card.empty()
+                except: pass
 
             prog = st.progress(0, text="掃描中…")
 
@@ -5443,16 +5615,16 @@ def main():
                 st.toast(f"⏰ {n_expired} 筆訊號已自動失效", icon="🔕")
             lc_active = lifecycle_get_active()
 
-            # ── Telegram push for NEW actionable signals ──────────────
+            # ── Telegram push — 改為手動確認 ─────────────────────
             tg_token_v   = st.session_state.get("tg_token", "")
             tg_chat_v    = st.session_state.get("tg_chat_id", "")
             tg_sigs_v    = set(st.session_state.get("tg_sigs",
                                 list(BUY_SIGNALS | SELL_SIGNALS)))
             tg_min_conf_v= int(st.session_state.get("tg_min_conf", 5))
-            # Lifecycle reminders now that tg vars are defined
-            if lc_active and tg_token_v and tg_chat_v:
+            # Lifecycle reminders (auto — just reminders, not signal alerts)
+            if lc_active and tg_token_v:
                 lifecycle_tg_reminder(lc_active, tg_token_v, tg_chat_v)
-            if tg_token_v and tg_chat_v:
+            if tg_token_v:
                 scan_ts = tw_now().strftime("%H:%M")
                 new_buy  = [r for r in rows
                             if r.get("_is_new") and r["_sig_key"] in tg_sigs_v
@@ -5463,9 +5635,11 @@ def main():
                             and r["_sig_key"] in ("STRONG_SELL","DIV_SELL")]
                 for r in new_buy + new_sell:
                     r["_ts"] = scan_ts
-                sent = send_signal_alert(tg_token_v, tg_chat_v, new_buy, new_sell)
-                if sent:
-                    st.toast(f"📲 已推播 {sent} 則訊號到 Telegram", icon="✅")
+                # Store pending signals — show manual push button in UI
+                if new_buy or new_sell:
+                    st.session_state["_tg_pending_buy"]  = new_buy
+                    st.session_state["_tg_pending_sell"] = new_sell
+                    st.session_state["_tg_pending_ts"]   = scan_ts
             # next auto-refresh is triggered when user returns to the page
             # and secs_left <= 0 fires the should_auto_scan flag above.
 
@@ -5509,6 +5683,37 @@ def main():
                     st.rerun()     # rerun triggers should_auto_scan → run_scan = True
 
         if rows:
+            # ── 2. 手動推播 Telegram 按鈕 ─────────────────────────────
+            _pending_buy  = st.session_state.get("_tg_pending_buy",  [])
+            _pending_sell = st.session_state.get("_tg_pending_sell", [])
+            _pending_ts   = st.session_state.get("_tg_pending_ts",   "")
+            _tg_tok       = st.session_state.get("tg_token", "")
+            if _tg_tok and (_pending_buy or _pending_sell):
+                n_total = len(_pending_buy) + len(_pending_sell)
+                pb1, pb2, pb3 = st.columns([3, 1, 1])
+                pb1.markdown(
+                    f'<div style="background:#0a1520;border:1px solid #1a3050;'
+                    f'border-radius:6px;padding:7px 12px;font-size:0.78rem">'
+                    f'📬 <b style="color:#ffd700">{n_total} 則新訊號</b>'
+                    f'<span style="color:#5a8fb0"> 待推播（{_pending_ts}）— '
+                    f'{len(_pending_buy)} 買入 / {len(_pending_sell)} 賣出</span></div>',
+                    unsafe_allow_html=True,
+                )
+                if pb2.button("📲 推播", type="primary", key="tg_manual_push",
+                              width='stretch'):
+                    _sent = send_signal_alert(
+                        _tg_tok, st.session_state.get("tg_chat_id",""),
+                        _pending_buy, _pending_sell
+                    )
+                    st.session_state["_tg_pending_buy"]  = []
+                    st.session_state["_tg_pending_sell"] = []
+                    st.toast(f"📲 已推播 {_sent} 則訊號", icon="✅")
+                    st.rerun()
+                if pb3.button("✖ 略過", key="tg_skip", width='stretch'):
+                    st.session_state["_tg_pending_buy"]  = []
+                    st.session_state["_tg_pending_sell"] = []
+                    st.rerun()
+
             # ══════════════════════════════════════════════════════
             # 近期訊號高亮面板 — 有明確買賣訊號的股票 (近5日內)
             # ══════════════════════════════════════════════════════
@@ -6001,6 +6206,43 @@ def main():
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
+                # ── I. 多週期確認（MTF）────────────────────────────
+                try:
+                    with st.spinner("載入週K線確認…"):
+                        w_sig_drill, w_det_drill = get_weekly_signal(
+                            target, params,
+                            _p_ver=hash((params.get("cci_period",39),
+                                         params.get("vol_multiplier",1.5)))
+                        )
+                    mtf_ok_d, mtf_lbl_d = mtf_confirm(scan_sig, w_sig_drill)
+                    w_color = "#00ff88" if mtf_ok_d else "#ffd600" if w_sig_drill == "NEUTRAL" else "#ff3355"
+                    w_icon  = "✅" if mtf_ok_d else "⚠️" if w_sig_drill == "NEUTRAL" else "❌"
+                    w_bg    = "rgba(0,255,136,0.05)" if mtf_ok_d else \
+                              "rgba(255,214,0,0.05)" if w_sig_drill == "NEUTRAL" else \
+                              "rgba(255,51,85,0.05)"
+                    mtf_verdict = (
+                        "日週同向，多時框共振，訊號品質佳" if mtf_ok_d and scan_sig in BUY_SIGNALS else
+                        "日週同向，空頭確認" if mtf_ok_d and scan_sig in SELL_SIGNALS else
+                        "週線中性，日線訊號謹慎操作" if w_sig_drill == "NEUTRAL" else
+                        "日週分歧：週線反向，降低倉位或等待"
+                    )
+                    st.markdown(
+                        f'<div style="background:{w_bg};border:1px solid {w_color}30;'
+                        f'border-left:3px solid {w_color};border-radius:8px;'
+                        f'padding:8px 14px;margin:4px 0 10px 0;'
+                        f'display:flex;align-items:center;gap:10px;flex-wrap:wrap;'
+                        f'font-size:0.78rem">'
+                        f'<span style="color:{w_color};font-weight:700">{w_icon} 週K確認</span>'
+                        f'<span style="color:#e8f4fd">'
+                        f'週線訊號：{SIGNAL_LABEL.get(w_sig_drill, w_sig_drill)}</span>'
+                        f'<span style="color:{w_color}">{mtf_verdict}</span>'
+                        f'<span style="color:#37474f;font-size:0.68rem">{w_det_drill[:40]}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                except Exception:
+                    pass
 
                 # ── Signal Timeline Panel ─────────────────────────
                 # Scan last 30 bars for all buy/sell signals → timeline
