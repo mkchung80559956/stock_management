@@ -5290,62 +5290,64 @@ def main():
             ohlcv_cache: dict = {}
             # 1. 顯示訊號說明卡（掃描完成前一直顯示）
             _wait_card = st.empty()
-            _wait_card.markdown("""
-<div style="background:#0a0e1a;border:1px solid #1a2d44;border-radius:12px;padding:18px 20px;margin:8px 0">
-<div style="font-size:0.8rem;font-weight:700;color:#00d4ff;margin-bottom:14px">
-📖 訊號策略說明 — 掃描進行中，請稍候…</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:0.75rem">
+            _wait_card.markdown(
+                '<div style="background:#0a0e1a;border:1px solid #1a2d44;'
+                'border-radius:12px;padding:16px 18px;margin:8px 0">'
+                '<div style="font-size:0.82rem;font-weight:700;color:#00d4ff;'
+                'margin-bottom:12px">📖 訊號策略說明 — 掃描進行中，請稍候…</div>'
 
-<div style="background:#0d1a2d;border-left:3px solid #ffd700;padding:10px 12px;border-radius:0 8px 8px 0">
-<div style="color:#ffd700;font-weight:700;margin-bottom:4px">⭐ 三重共振</div>
-<div style="color:#8a9bb5;line-height:1.6">
-趨勢↑ + 5+/7 共振 + 動能加速三條件同時成立。<br>
-最高勝率訊號（60–75%）。<br>
-建議：訊號日收盤前 13:20 進場，或等次日縮量回調。</div>
-</div>
+                '<div style="margin-bottom:10px;background:#0d1a2d;border-left:3px solid #ffd700;'
+                'padding:8px 12px;border-radius:0 6px 6px 0">'
+                '<div style="color:#ffd700;font-weight:700;font-size:0.78rem;margin-bottom:3px">'
+                '⭐ 三重共振</div>'
+                '<div style="color:#8a9bb5;font-size:0.73rem;line-height:1.6">'
+                '趨勢↑ + 5+/7 共振 + 動能加速三條件同時成立。最高勝率（60–75%）。'
+                '建議：訊號日收盤前 13:20 進場，或等次日縮量回調。</div></div>'
 
-<div style="background:#0d1a2d;border-left:3px solid #00e5ff;padding:10px 12px;border-radius:0 8px 8px 0">
-<div style="color:#00e5ff;font-weight:700;margin-bottom:4px">💎 共振回調買</div>
-<div style="color:#8a9bb5;line-height:1.6">
-三重共振後 1–3 天縮量回調，CCI 仍 &gt;0。<br>
-停損比訊號日更近，風險報酬比更優。<br>
-建議：當天任意時間，停損放訊號日低點。</div>
-</div>
+                '<div style="margin-bottom:10px;background:#0d1a2d;border-left:3px solid #00e5ff;'
+                'padding:8px 12px;border-radius:0 6px 6px 0">'
+                '<div style="color:#00e5ff;font-weight:700;font-size:0.78rem;margin-bottom:3px">'
+                '💎 共振回調買</div>'
+                '<div style="color:#8a9bb5;font-size:0.73rem;line-height:1.6">'
+                '三重共振後 1–3 天縮量回調，CCI 仍 &gt;0，停損更近、風險報酬更優。'
+                '建議：當天任意時間，停損放訊號日低點。</div></div>'
 
-<div style="background:#0d1a2d;border-left:3px solid #ff9900;padding:10px 12px;border-radius:0 8px 8px 0">
-<div style="color:#ff9900;font-weight:700;margin-bottom:4px">🟠 噴發買</div>
-<div style="color:#8a9bb5;line-height:1.6">
-CCI 強力突破 +100 + 放量。<br>
-訊號日不追高，等次日確認量能延續再進。<br>
-建議：次日開盤後觀察，未跳空才進。</div>
-</div>
+                '<div style="margin-bottom:10px;background:#0d1a2d;border-left:3px solid #ff9900;'
+                'padding:8px 12px;border-radius:0 6px 6px 0">'
+                '<div style="color:#ff9900;font-weight:700;font-size:0.78rem;margin-bottom:3px">'
+                '🟠 噴發買</div>'
+                '<div style="color:#8a9bb5;font-size:0.73rem;line-height:1.6">'
+                'CCI 強力突破 +100 + 放量。訊號日不追高，等次日確認量能延續再進。'
+                '建議：次日開盤後觀察，未跳空才進場。</div></div>'
 
-<div style="background:#0d1a2d;border-left:3px solid #00ff88;padding:10px 12px;border-radius:0 8px 8px 0">
-<div style="color:#00ff88;font-weight:700;margin-bottom:4px">🟢 強買 / 底背離</div>
-<div style="color:#8a9bb5;line-height:1.6">
-底部翻轉確認。強買 = CCI 從 -100 以下突破。<br>
-底背離 = 股價創低但 CCI 底部抬高。<br>
-建議：小量試單，次日不破低再加碼。</div>
-</div>
+                '<div style="margin-bottom:10px;background:#0d1a2d;border-left:3px solid #00ff88;'
+                'padding:8px 12px;border-radius:0 6px 6px 0">'
+                '<div style="color:#00ff88;font-weight:700;font-size:0.78rem;margin-bottom:3px">'
+                '🟢 強買 / 底背離</div>'
+                '<div style="color:#8a9bb5;font-size:0.73rem;line-height:1.6">'
+                '底部翻轉：強買 = CCI 從 -100 突破；底背離 = 股價創低但 CCI 底部抬高。'
+                '建議：小量試單，次日不破低再加碼。</div></div>'
 
-<div style="background:#0d1a2d;border-left:3px solid #ff3355;padding:10px 12px;border-radius:0 8px 8px 0">
-<div style="color:#ff3355;font-weight:700;margin-bottom:4px">🔴 強賣 / 頂背離</div>
-<div style="color:#8a9bb5;line-height:1.6">
-強賣 = CCI 跌破 +100 + 放量頭部。<br>
-頂背離 = 股價創高但 CCI 頂部下移。<br>
-建議：現有持倉考慮減碼，設移動停損保護。</div>
-</div>
+                '<div style="margin-bottom:10px;background:#0d1a2d;border-left:3px solid #ff3355;'
+                'padding:8px 12px;border-radius:0 6px 6px 0">'
+                '<div style="color:#ff3355;font-weight:700;font-size:0.78rem;margin-bottom:3px">'
+                '🔴 強賣 / 頂背離</div>'
+                '<div style="color:#8a9bb5;font-size:0.73rem;line-height:1.6">'
+                '強賣 = CCI 跌破 +100 + 放量頭部；頂背離 = 股價創高但 CCI 頂部下移。'
+                '建議：考慮減碼，設移動停損保護獲利。</div></div>'
 
-<div style="background:#0d1a2d;border-left:3px solid #5a8fb0;padding:10px 12px;border-radius:0 8px 8px 0">
-<div style="color:#5a8fb0;font-weight:700;margin-bottom:4px">核心過濾條件</div>
-<div style="color:#8a9bb5;line-height:1.6">
-EMA200 年線：跌破年線封鎖所有買入。<br>
-壓力區：現價距壓力 ≤3% 發出⚠️警告。<br>
-共振門檻：建議只看共振 ≥5/7 的訊號。</div>
-</div>
+                '<div style="background:#0d1a2d;border-left:3px solid #5a8fb0;'
+                'padding:8px 12px;border-radius:0 6px 6px 0">'
+                '<div style="color:#5a8fb0;font-weight:700;font-size:0.78rem;margin-bottom:3px">'
+                '🔍 核心過濾條件</div>'
+                '<div style="color:#8a9bb5;font-size:0.73rem;line-height:1.6">'
+                'EMA200 年線：跌破封鎖所有買入訊號。'
+                '壓力區：現價距壓力 ≤3% 發出 ⚠️ 警告。'
+                '共振門檻：建議只看共振 ≥5/7 的訊號。</div></div>'
 
-</div>
-</div>""", unsafe_allow_html=True)
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
             try:
                 with st.spinner(_spinner_msg):
@@ -5620,9 +5622,7 @@ EMA200 年線：跌破年線封鎖所有買入。<br>
             tg_sigs_v    = set(st.session_state.get("tg_sigs",
                                 list(BUY_SIGNALS | SELL_SIGNALS)))
             tg_min_conf_v= int(st.session_state.get("tg_min_conf", 5))
-            # Lifecycle reminders only (不推訊號)
-            if lc_active and tg_token_v:
-                lifecycle_tg_reminder(lc_active, tg_token_v, tg_chat_v)
+            # Lifecycle reminders 移至訊號管理 Tab 手動決定，不在掃描時自動推
             if tg_token_v:
                 scan_ts = tw_now().strftime("%H:%M")
                 new_buy  = [r for r in rows
