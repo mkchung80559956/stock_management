@@ -6022,6 +6022,14 @@ def main():
         if load_btn and not _jump:
             st.session_state["drill_active_code"] = ""
 
+        # Timeframe selector
+        tf_opts  = {"1個月": "1mo", "3個月": "3mo", "6個月": "6mo",
+                    "1年": "1y", "2年": "2y"}
+        tf_label = st.radio("分析區間", list(tf_opts.keys()),
+                            horizontal=True, index=2,
+                            label_visibility="collapsed")
+        drill_period = tf_opts[tf_label]
+
         if load_btn:
             with st.spinner(f"載入 {target} …"):
                 df_raw, err = fetch_data(target, drill_period)
