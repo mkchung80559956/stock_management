@@ -5288,11 +5288,9 @@ def main():
                 f"下載歷史資料 + 掃描中（{_est_label}）…"
             )
             ohlcv_cache: dict = {}
-            try:
-                with st.spinner(_spinner_msg):
-                    # 1. 等待期間顯示訊號說明卡
-                    _wait_card = st.empty()
-                    _wait_card.markdown("""
+            # 1. 顯示訊號說明卡（掃描完成前一直顯示）
+            _wait_card = st.empty()
+            _wait_card.markdown("""
 <div style="background:#0a0e1a;border:1px solid #1a2d44;border-radius:12px;padding:18px 20px;margin:8px 0">
 <div style="font-size:0.8rem;font-weight:700;color:#00d4ff;margin-bottom:14px">
 📖 訊號策略說明 — 掃描進行中，請稍候…</div>
@@ -5348,12 +5346,12 @@ EMA200 年線：跌破年線封鎖所有買入。<br>
 
 </div>
 </div>""", unsafe_allow_html=True)
+
+            try:
+                with st.spinner(_spinner_msg):
                     ohlcv_cache = batch_fetch_ohlcv(tuple(wl), data_period)
-                    _wait_card.empty()   # 下載完成後清除說明卡
             except Exception:
                 ohlcv_cache = {}
-                try: _wait_card.empty()
-                except: pass
 
             prog = st.progress(0, text="掃描中…")
 
@@ -5510,6 +5508,7 @@ EMA200 年線：跌破年線封鎖所有買入。<br>
                 })
 
             prog.empty()
+            _wait_card.empty()   # 全部掃描完成後才清除說明卡
             # ── Track signal change timestamps ─────────────────────────
             # signal_fired_at: {code: {"sig_key": str, "fired_at": str}}
             # Persists to /tmp so it survives page refresh within same container
@@ -5615,13 +5614,13 @@ EMA200 年線：跌破年線封鎖所有買入。<br>
                 st.toast(f"⏰ {n_expired} 筆訊號已自動失效", icon="🔕")
             lc_active = lifecycle_get_active()
 
-            # ── Telegram push — 改為手動確認 ─────────────────────
+            # ── Telegram — 不自動推播，只存待推清單供手動決定 ──────
             tg_token_v   = st.session_state.get("tg_token", "")
             tg_chat_v    = st.session_state.get("tg_chat_id", "")
             tg_sigs_v    = set(st.session_state.get("tg_sigs",
                                 list(BUY_SIGNALS | SELL_SIGNALS)))
             tg_min_conf_v= int(st.session_state.get("tg_min_conf", 5))
-            # Lifecycle reminders (auto — just reminders, not signal alerts)
+            # Lifecycle reminders only (不推訊號)
             if lc_active and tg_token_v:
                 lifecycle_tg_reminder(lc_active, tg_token_v, tg_chat_v)
             if tg_token_v:
@@ -5635,11 +5634,9 @@ EMA200 年線：跌破年線封鎖所有買入。<br>
                             and r["_sig_key"] in ("STRONG_SELL","DIV_SELL")]
                 for r in new_buy + new_sell:
                     r["_ts"] = scan_ts
-                # Store pending signals — show manual push button in UI
-                if new_buy or new_sell:
-                    st.session_state["_tg_pending_buy"]  = new_buy
-                    st.session_state["_tg_pending_sell"] = new_sell
-                    st.session_state["_tg_pending_ts"]   = scan_ts
+                st.session_state["_tg_pending_buy"]  = new_buy
+                st.session_state["_tg_pending_sell"] = new_sell
+                st.session_state["_tg_pending_ts"]   = scan_ts
             # next auto-refresh is triggered when user returns to the page
             # and secs_left <= 0 fires the should_auto_scan flag above.
 
@@ -5694,9 +5691,10 @@ EMA200 年線：跌破年線封鎖所有買入。<br>
                 pb1.markdown(
                     f'<div style="background:#0a1520;border:1px solid #1a3050;'
                     f'border-radius:6px;padding:7px 12px;font-size:0.78rem">'
-                    f'📬 <b style="color:#ffd700">{n_total} 則新訊號</b>'
-                    f'<span style="color:#5a8fb0"> 待推播（{_pending_ts}）— '
-                    f'{len(_pending_buy)} 買入 / {len(_pending_sell)} 賣出</span></div>',
+                    f'📬 <b style="color:#ffd700">{n_total} 則新訊號待推播</b>'
+                    f'<span style="color:#5a8fb0">（{_pending_ts}）'
+                    f'{len(_pending_buy)} 買入 / {len(_pending_sell)} 賣出'
+                    f' — 確認後點推播</span></div>',
                     unsafe_allow_html=True,
                 )
                 if pb2.button("📲 推播", type="primary", key="tg_manual_push",
