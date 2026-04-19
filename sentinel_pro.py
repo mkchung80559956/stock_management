@@ -6006,6 +6006,7 @@ def main():
                 # Scan last 30 bars for all buy/sell signals → timeline
                 sig_events = []
                 lookback_bars = min(60, len(df_sig))
+                _today_date = tw_now().date()   # actual today, not last bar
                 for idx_pos in range(len(df_sig) - lookback_bars, len(df_sig)):
                     row_s   = df_sig.iloc[idx_pos]
                     s_key   = str(row_s.get("Signal", "NEUTRAL") or "NEUTRAL")
@@ -6016,7 +6017,9 @@ def main():
                         s_stop  = round(s_close - s_atr * 1.5, 2) if s_atr else round(s_close * 0.93, 2)
                         s_t1    = round(s_close + (s_close - s_stop) * 1.5, 2)
                         s_t2    = round(s_close + (s_close - s_stop) * 2.5, 2)
-                        days_ago = (df_sig.index[-1] - s_date).days
+                        # Use actual today to compute days_ago — yfinance last bar may lag 1-2 days
+                        _sig_date = s_date.date() if hasattr(s_date, 'date') else s_date
+                        days_ago = (_today_date - _sig_date).days
                         sig_events.append({
                             "date":    s_date,
                             "key":     s_key,
@@ -6038,7 +6041,10 @@ def main():
                     entry_latest = cfg.get("entry_latest", 2)
                     decay_days   = cfg.get("decay_days",   3)
                     days_since   = latest_ev["days_ago"]
-                    still_valid  = days_since <= decay_days
+                    # Trading days ≈ calendar days × 5/7 — be generous:
+                    # a signal fired on Friday is still valid Monday (2 calendar days = 0 trading days)
+                    # Add 2 extra calendar days to account for weekends
+                    still_valid  = days_since <= (decay_days + 2)
 
                     # Recommendation text
                     if is_buy and still_valid:
