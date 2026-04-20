@@ -539,10 +539,11 @@ def _html_safe(s: str) -> str:
 
 def get_scan_signal(df_sig: pd.DataFrame, lookback: int = 5) -> tuple[str, str]:
     """
-    Returns (signal_key, detail).
+    Returns (signal_key, detail) — most recent non-NEUTRAL signal within lookback bars.
+    Always returns the LATEST signal by bar date, not the 'strongest'.
     detail strings must NOT contain raw HTML special chars (< > &).
     """
-    # ── 1. Recent crossover event ──
+    # ── 1. Most recent crossover event (scan from latest bar backwards) ──
     for j in range(min(lookback, len(df_sig))):
         s = df_sig.iloc[-(j + 1)]["Signal"]
         if s not in ("NEUTRAL", "WATCH"):
@@ -1193,13 +1194,44 @@ def lifecycle_mark_exit(record_id: str, price: float, reason: str) -> None:
     _save_lifecycle(store)
 
 
+def _count_trading_days(start_date, end_date) -> int:
+    """
+    Count actual trading days between two dates (exclusive of start, inclusive of end).
+    Skips weekends and Taiwan public holidays 2026.
+    Returns negative if end_date is before start_date.
+    """
+    import datetime as _dt
+    _tw_hols = {
+        "2026-01-01","2026-01-26","2026-01-27","2026-01-28","2026-01-29",
+        "2026-01-30","2026-01-31","2026-02-01","2026-02-02",
+        "2026-02-27","2026-02-28","2026-04-03","2026-04-04",
+        "2026-06-19","2026-09-25","2026-10-09","2026-10-10",
+    }
+    if end_date <= start_date:
+        # Count negative trading days (expired)
+        count = 0
+        d = end_date
+        while d < start_date:
+            d = d + _dt.timedelta(days=1)
+            if d.weekday() < 5 and d.strftime("%Y-%m-%d") not in _tw_hols:
+                count -= 1
+        return count
+    count = 0
+    d = start_date
+    while d < end_date:
+        d = d + _dt.timedelta(days=1)
+        if d.weekday() < 5 and d.strftime("%Y-%m-%d") not in _tw_hols:
+            count += 1
+    return count
+
+
 def lifecycle_days_remaining(record: dict) -> int:
-    """Return trading days remaining in the entry window. Negative = expired."""
+    """Return TRADING days remaining in the entry window. Negative = expired."""
     try:
+        import datetime as _dt
         today  = tw_now().date()
-        expiry = __import__('datetime').date.fromisoformat(record["expiry_date"])
-        delta  = (expiry - today).days
-        return delta
+        expiry = _dt.date.fromisoformat(record["expiry_date"])
+        return _count_trading_days(today, expiry)
     except Exception:
         return 0
 
@@ -2011,6 +2043,7 @@ def batch_fetch_names(codes: tuple) -> dict:
 
 
 @st.cache_data(ttl=180)
+@st.cache_data(ttl=180)   # 3分鐘 — 盤中資料更新頻率
 def fetch_data(symbol: str, period: str = "1y"):
     """Fetch OHLCV. Auto-tries .TW then .TWO for bare codes."""
     if symbol.upper().endswith((".TW", ".TWO")):
@@ -2113,7 +2146,25 @@ def batch_fetch_quotes(symbols: tuple) -> dict:
 
 
 
-@st.cache_data(ttl=1800)   # 方案D：30分鐘快取 — 減少重複下載，自選股模式尤其快
+def _ohlcv_ttl() -> int:
+    """
+    Dynamic OHLCV cache TTL:
+    - 盤中（09:00–13:30）：180 秒（3分鐘），確保開盤資料即時
+    - 盤後 / 休市：1800 秒（30分鐘），減少不必要的請求
+    """
+    try:
+        import pytz as _ptz
+        _now = datetime.now(_ptz.timezone("Asia/Taipei"))
+        _wd  = _now.weekday()
+        _hr  = _now.hour + _now.minute / 60
+        if _wd < 5 and 8.75 <= _hr <= 13.6:   # 08:45–13:36 buffer
+            return 180
+    except Exception:
+        pass
+    return 1800
+
+
+@st.cache_data(ttl=_ohlcv_ttl())   # 盤中 3分鐘，盤後 30分鐘
 def batch_fetch_ohlcv(symbols: tuple, period: str = "1y") -> dict:
     """
     Download OHLCV for ALL symbols in ONE yf.download() call.
@@ -3425,7 +3476,7 @@ def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
     return df_w
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=600)   # 10分鐘，週K資料變化較慢
 def get_weekly_signal(symbol: str, p: dict,
                       _p_ver: int = 1) -> tuple[str, str]:
     """
@@ -5151,6 +5202,18 @@ def main():
         secs_left    = seconds_to_next_refresh(scan_time)
         countdown    = format_countdown(secs_left)
 
+        # ── 強制清除快取按鈕（盤中顯示）──────────────────────────
+        if market_open:
+            if st.button("🔄 強制更新資料（清快取）", key="force_refresh",
+                         help="清除所有快取，下次掃描取得最新盤中資料",
+                         type="secondary"):
+                st.cache_data.clear()
+                st.session_state.scan_rows = []
+                st.session_state["_scan_restored"] = False
+                scan_cache_clear()
+                st.toast("✅ 快取已清除，請重新掃描", icon="🔄")
+                st.rerun()
+
         if market_open:
             mkt_badge = '<span style="background:#0d3a1a;color:#00ff88;padding:1px 8px;border-radius:4px;font-size:0.72rem;font-weight:700">● 盤中</span>'
         elif market_day:
@@ -6319,9 +6382,7 @@ def main():
                     entry_latest = cfg.get("entry_latest", 2)
                     decay_days   = cfg.get("decay_days",   3)
                     days_since   = latest_ev["days_ago"]
-                    # Trading days ≈ calendar days × 5/7 — be generous:
-                    # a signal fired on Friday is still valid Monday (2 calendar days = 0 trading days)
-                    # Add 2 extra calendar days to account for weekends
+                    # Compare calendar days_ago against decay_days (also in trading days logic)
                     still_valid  = days_since <= (decay_days + 2)
 
                     # Recommendation text
@@ -9117,63 +9178,4 @@ def main():
                     wl_codes,
                     format_func=lambda x: f"{x.replace('.TW','').replace('.TWO','')}  {lookup_name(x.replace('.TW','').replace('.TWO',''))[0] or ''}",
                     label_visibility="collapsed", key="wl_nb_code")
-                bare_nb = nb_code.upper().replace(".TW","").replace(".TWO","")
-                ex_note = wl_note_get(bare_nb)
-                with st.form("wl_note_form"):
-                    nb_text = st.text_area("備忘 / 進場理由",
-                        value=ex_note.get("note",""), height=80,
-                        placeholder="記錄關注原因、進場邏輯、觀察重點…")
-                    nb_c1, nb_c2 = st.columns(2)
-                    nb_entry = nb_c1.number_input("進場均價",
-                        min_value=0.0, value=float(ex_note.get("entry",0) or 0), step=0.5)
-                    nb_date  = nb_c2.text_input("關注日期",
-                        value=ex_note.get("watch_date", tw_now().strftime("%Y-%m-%d")))
-                    nb_tags = st.multiselect("標籤",
-                        ["技術突破","籌碼轉強","法人買超","業績成長",
-                         "低估值","高殖利率","週期底部","隔日沖","題材","其他"],
-                        default=ex_note.get("tags", []))
-                    if st.form_submit_button("💾 儲存", type="primary"):
-                        wl_note_set(bare_nb, {
-                            **ex_note,
-                            "note": nb_text, "entry": nb_entry,
-                            "watch_date": nb_date, "tags": nb_tags,
-                            "updated": tw_now().strftime("%Y-%m-%d %H:%M"),
-                        })
-                        st.success("✓ 已儲存")
-
-            # ── 所有備忘一覽 ──────────────────────────────────
-            with st.expander("📋 所有備忘一覽"):
-                note_rows = [
-                    {"代號": c.upper().replace(".TW","").replace(".TWO",""),
-                     "名稱": lookup_name(c.upper().replace(".TW","").replace(".TWO",""))[0] or c,
-                     "備忘": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("note","")[:40],
-                     "標籤": " ".join(wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("tags",[])),
-                     "均價": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("entry",""),
-                     "日期": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("watch_date",""),
-                    }
-                    for c in wl_codes
-                    if wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("note")
-                    or wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("tags")
-                ]
-                if note_rows:
-                    st.dataframe(pd.DataFrame(note_rows), width='stretch', hide_index=True)
-                else:
-                    st.info("尚無備忘記錄")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as _sentinel_err:
-        import traceback as _tb
-        _err_detail = _tb.format_exc()[-600:]
-        try:
-            tg_broadcast(
-                f"⚠️ Sentinel Pro 異常\n"
-                f"{tw_now().strftime('%m/%d %H:%M')}\n\n"
-                f"{type(_sentinel_err).__name__}: {str(_sentinel_err)[:200]}\n\n"
-                f"{_err_detail}"
-            )
-        except Exception:
-            pass
-        raise
+                
