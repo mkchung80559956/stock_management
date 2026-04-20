@@ -9151,4 +9151,29 @@ def main():
                      "均價": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("entry",""),
                      "日期": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("watch_date",""),
                     }
-                    for
+                    for c in wl_codes
+                    if wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("note")
+                    or wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("tags")
+                ]
+                if note_rows:
+                    st.dataframe(pd.DataFrame(note_rows), width='stretch', hide_index=True)
+                else:
+                    st.info("尚無備忘記錄")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as _sentinel_err:
+        import traceback as _tb
+        _err_detail = _tb.format_exc()[-600:]
+        try:
+            tg_broadcast(
+                f"⚠️ Sentinel Pro 異常\n"
+                f"{tw_now().strftime('%m/%d %H:%M')}\n\n"
+                f"{type(_sentinel_err).__name__}: {str(_sentinel_err)[:200]}\n\n"
+                f"{_err_detail}"
+            )
+        except Exception:
+            pass
+        raise
