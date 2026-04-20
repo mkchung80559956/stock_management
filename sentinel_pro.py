@@ -1071,11 +1071,19 @@ def lifecycle_build_record(code: str, name: str, sig_key: str,
 
     # Calculate trading days for entry window (skip weekends)
     def add_trading_days(start_date, n_days):
+        """Count only real trading days (Mon-Fri, excluding TW holidays)."""
+        import datetime as _dt
+        _tw_hols = {
+            "2026-01-01","2026-01-26","2026-01-27","2026-01-28","2026-01-29",
+            "2026-01-30","2026-01-31","2026-02-01","2026-02-02",
+            "2026-02-27","2026-02-28","2026-04-03","2026-04-04",
+            "2026-06-19","2026-09-25","2026-10-09","2026-10-10",
+        }
         d = start_date
         added = 0
         while added < n_days:
-            d = d + __import__('datetime').timedelta(days=1)
-            if d.weekday() < 5:   # Mon-Fri
+            d = d + _dt.timedelta(days=1)
+            if d.weekday() < 5 and d.strftime("%Y-%m-%d") not in _tw_hols:
                 added += 1
         return d
 
@@ -1207,36 +1215,50 @@ def lifecycle_urgency(record: dict) -> str:
 
 def lifecycle_tg_reminder(active_records: list, token: str, chat_id: str) -> int:
     """
-    Push Telegram reminders for active signals:
-    - Expiring tomorrow: 'Last chance' alert
-    - Newly added today: entry window open
+    Push Telegram reminders for active signals.
     Returns count of messages sent.
     """
-    if not token or not chat_id:
+    if not token:
         return 0
     today = str(tw_now().date())
     msgs  = []
     for r in active_records:
-        days = lifecycle_days_remaining(r)
-        if days == 1:
-            msgs.append(
-                f"⏰ 明日進場最後機會\n"
-                f"{r['sig_label']} {r['code']} {r['name']}\n"
-                f"進場窗口：{r['entry_open']} – {r['entry_close']}\n"
-                f"訊號價：{r['price_fired']:.2f}  停損：{r['stop_price']:.2f}\n"
-                f"目標1：{r['target_1r']:.2f}  目標2：{r['target_2r']:.2f}"
-            )
-        elif r["date_fired"] == today and days > 1:
-            msgs.append(
-                f"🆕 新訊號進場窗口開啟\n"
-                f"{r['sig_label']} {r['code']} {r['name']}\n"
-                f"建議進場：{r['entry_time']}\n"
-                f"停損：{r['stop_price']:.2f}  目標：{r['target_1r']:.2f} / {r['target_2r']:.2f}\n"
-                f"有效至：{r['expiry_date']}（剩 {days} 天）"
-            )
+        try:
+            days = lifecycle_days_remaining(r)
+            # Ensure all values are plain strings/numbers — never widget objects
+            sig_label   = str(r.get('sig_label', '') or '')
+            code        = str(r.get('code', '') or '')
+            name        = str(r.get('name', '') or '')
+            entry_open  = str(r.get('entry_open', '') or '')
+            entry_close = str(r.get('entry_close', '') or '')
+            entry_time  = str(r.get('entry_time', '') or '')
+            expiry_date = str(r.get('expiry_date', '') or '')
+            price_fired = float(r.get('price_fired', 0) or 0)
+            stop_price  = float(r.get('stop_price', 0) or 0)
+            target_1r   = float(r.get('target_1r', 0) or 0)
+            target_2r   = float(r.get('target_2r', 0) or 0)
+
+            if days == 1:
+                msgs.append(
+                    f"⏰ 明日進場最後機會\n"
+                    f"{sig_label} {code} {name}\n"
+                    f"進場窗口：{entry_open} - {entry_close}\n"
+                    f"訊號價：{price_fired:.2f}  停損：{stop_price:.2f}\n"
+                    f"目標1：{target_1r:.2f}  目標2：{target_2r:.2f}"
+                )
+            elif r.get("date_fired") == today and days > 1:
+                msgs.append(
+                    f"新訊號進場窗口開啟\n"
+                    f"{sig_label} {code} {name}\n"
+                    f"建議進場：{entry_time}\n"
+                    f"停損：{stop_price:.2f}  目標：{target_1r:.2f} / {target_2r:.2f}\n"
+                    f"有效至：{expiry_date}（剩 {days} 天）"
+                )
+        except Exception:
+            continue
     sent = 0
     for msg in msgs:
-        n = tg_broadcast(msg)
+        n = tg_broadcast(str(msg))   # ensure plain string
         sent += n
     return sent
 
@@ -6287,6 +6309,8 @@ def main():
                         })
 
                 if sig_events:
+                    # Sort by date ascending so [-1] is the most recent signal
+                    sig_events.sort(key=lambda e: e["date"])
                     latest_ev = sig_events[-1]
                     is_buy    = latest_ev["key"] in BUY_SIGNALS
                     is_sell   = latest_ev["key"] in SELL_SIGNALS
@@ -9127,29 +9151,4 @@ def main():
                      "均價": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("entry",""),
                      "日期": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("watch_date",""),
                     }
-                    for c in wl_codes
-                    if wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("note")
-                    or wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("tags")
-                ]
-                if note_rows:
-                    st.dataframe(pd.DataFrame(note_rows), width='stretch', hide_index=True)
-                else:
-                    st.info("尚無備忘記錄")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as _sentinel_err:
-        import traceback as _tb
-        _err_detail = _tb.format_exc()[-600:]   # last 600 chars of traceback
-        try:
-            tg_broadcast(
-                f"⚠️ Sentinel Pro 異常\n"
-                f"{tw_now().strftime('%m/%d %H:%M')}\n\n"
-                f"{type(_sentinel_err).__name__}: {str(_sentinel_err)[:200]}\n\n"
-                f"{_err_detail}"
-            )
-        except Exception:
-            pass
-        raise   # still show error in Streamlit UI
+                    for
