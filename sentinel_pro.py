@@ -191,15 +191,15 @@ section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
 # INDICATOR FUNCTIONS
 # ══════════════════════════════════════════════
 
-def calc_cci(high, low, close, period=39):
+def calc_cci_market(high, low, close, period=39):
     tp = (high + low + close) / 3
-    ma = tp.rolling(window=period).mean()
+    ma = tp.rolling(period).mean()
     
-    # 使用獨立的內部函數取代 lambda，提升效能
     def _mad(x):
         return np.mean(np.abs(x - np.mean(x)))
         
-    md = tp.rolling(window=period).apply(_mad, raw=True)
+    md = tp.rolling(period).std()
+
     return (tp - ma) / (0.015 * md + 1e-10)
 
 def calc_rsi(close, period=6):
