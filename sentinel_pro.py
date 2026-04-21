@@ -197,7 +197,7 @@ def calc_cci(high, low, close, period=39):
     md = tp.rolling(period).apply(
         lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
     )
-    return (tp - ma) / (0.02 * md + 1e-10)
+    return (tp - ma) / (0.015 * md + 1e-10)
 
 
 def calc_rsi(close, period=6):
