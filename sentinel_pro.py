@@ -193,6 +193,7 @@ section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
 
 def calc_cci(high, low, close, period=39):
     tp = (high + low + close) / 3
+    st.write(f"除錯訊息 - 最後一筆收盤價: {close.iloc[-1]}")
     ma = tp.rolling(window=period).mean()
     def _mad(x):
         return np.mean(np.abs(x - np.mean(x)))
