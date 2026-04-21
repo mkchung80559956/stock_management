@@ -5204,17 +5204,16 @@ def main():
         secs_left    = seconds_to_next_refresh(scan_time)
         countdown    = format_countdown(secs_left)
 
-        # ── 強制清除快取按鈕（盤中顯示）──────────────────────────
-        if market_open:
-            if st.button("🔄 強制更新資料（清快取）", key="force_refresh",
-                         help="清除所有快取，下次掃描取得最新盤中資料",
-                         type="secondary"):
-                st.cache_data.clear()
-                st.session_state.scan_rows = []
-                st.session_state["_scan_restored"] = False
-                scan_cache_clear()
-                st.toast("✅ 快取已清除，請重新掃描", icon="🔄")
-                st.rerun()
+        # ── 強制清除快取按鈕（隨時可用）──────────────────────────
+        if st.button("🔄 強制更新資料（清快取）", key="force_refresh",
+                     help="清除所有快取，取得最新資料（CCI/RSI 數值有誤時使用）",
+                     type="secondary"):
+            st.cache_data.clear()
+            st.session_state.scan_rows = []
+            st.session_state["_scan_restored"] = False
+            scan_cache_clear()
+            st.toast("✅ 快取已清除，請重新掃描 / 載入分析", icon="🔄")
+            st.rerun()
 
         if market_open:
             mkt_badge = '<span style="background:#0d3a1a;color:#00ff88;padding:1px 8px;border-radius:4px;font-size:0.72rem;font-weight:700">● 盤中</span>'
@@ -6064,7 +6063,13 @@ def main():
 
     # ─────────────────────────────────────────
     with tab_drill:
-        st.markdown("#### 🔬 個股深度分析")
+        _dc1, _dc2 = st.columns([4, 1])
+        _dc1.markdown("#### 🔬 個股深度分析")
+        if _dc2.button("🔄 清快取", key="drill_clear_cache",
+                       help="CCI/RSI 數值有誤時點此清除快取重新計算"):
+            st.cache_data.clear()
+            st.toast("✅ 快取已清除，請重新載入", icon="🔄")
+            st.rerun()
 
         # A. 若從掃描卡片跳轉過來，自動填入並載入
         _jump = st.session_state.get("drill_jump_code", "")
