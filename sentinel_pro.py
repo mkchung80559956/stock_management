@@ -9246,3 +9246,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise   # still show error in Streamlit UI
+
+st.write(df[['High','Low','Close']].tail(5))
