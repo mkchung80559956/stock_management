@@ -194,7 +194,8 @@ section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
 def calc_cci_market(high, low, close, period=39):
     tp = (high + low + close) / 3
     ma = tp.rolling(period).mean()
-        
+
+    # ⚠️ 改成標準差（市面常用）
     md = tp.rolling(period).std()
 
     return (tp - ma) / (0.015 * md + 1e-10)
