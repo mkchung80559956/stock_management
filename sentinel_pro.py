@@ -194,9 +194,6 @@ section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
 def calc_cci_market(high, low, close, period=39):
     tp = (high + low + close) / 3
     ma = tp.rolling(period).mean()
-    
-    def _mad(x):
-        return np.mean(np.abs(x - np.mean(x)))
         
     md = tp.rolling(period).std()
 
