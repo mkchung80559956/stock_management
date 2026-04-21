@@ -191,11 +191,14 @@ section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
 # INDICATOR FUNCTIONS
 # ══════════════════════════════════════════════
 
-def calc_cci_market(high, low, close, period=39):
+def calc_cci(high, low, close, period=39):
     tp = (high + low + close) / 3
-    md = tp.rolling(period).std()
-   
+    ma = tp.rolling(period).mean()
+    md = tp.rolling(period).apply(
+        lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+    )
     return (tp - ma) / (0.015 * md + 1e-10)
+
 
 def calc_rsi(close, period=6):
     delta = close.diff()
@@ -1939,7 +1942,7 @@ _TW_NAMES: dict[str, tuple[str, str]] = {
     "6548": ("長科國際-KY", "上市"),
     "6701": ("台生材", "上市"),
     "6762": ("協欣電子", "上櫃"),
-    "6791": ("虎門科技", "上櫃"),
+    "6791": ("杰力科技", "上櫃"),
     "6803": ("崇越科技", "上市"),
     "6809": ("聖暉企業", "上市"),
     "6811": ("宏致電子", "上市"),
@@ -1947,7 +1950,7 @@ _TW_NAMES: dict[str, tuple[str, str]] = {
     "6845": ("昇陽半導體", "上櫃"),
     "6850": ("一心診所-KY", "上市"),
     "6856": ("吉銓精密", "上櫃"),
-    "6862": ("三集瑞", "上市"),
+    "6862": ("杰智環境", "上市"),
     "8034": ("辛耘企業", "上市"),
     "8044": ("網家", "上市"),
     "8069": ("元太科技", "上市"),
@@ -1959,7 +1962,7 @@ _TW_NAMES: dict[str, tuple[str, str]] = {
     "8150": ("南茂科技", "上市"),
     "8163": ("達方電子", "上市"),
     "8183": ("精星科技", "上市"),
-    "8210": ("勤誠", "上市"),
+    "8210": ("勝麗國際", "上市"),
 }# ── Clean up the table: remove any accidentally invalid keys ──
 _TW_NAMES = {k: v for k, v in _TW_NAMES.items()
              if k.isdigit() or (len(k) >= 4 and k[:4].isdigit())}
@@ -2051,12 +2054,12 @@ def fetch_data(symbol: str, period: str = "1y"):
     last_err = "無資料"
     for sym in candidates:
         try:
-            # ✅ 改為 auto_adjust=True (使用還原權息價格)
-            df = yf.Ticker(sym).history(period=period, auto_adjust=True)
+            df = yf.Ticker(sym).history(period=period, auto_adjust=False)
             if df.empty:
                 last_err = f"{sym}: 無資料"
                 continue
             df.index = pd.to_datetime(df.index).tz_localize(None)
+            # auto_adjust=False returns Adj Close separately; use raw OHLC
             cols_available = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
             df = df[cols_available].dropna()
             if len(df) < 10:
@@ -2066,6 +2069,7 @@ def fetch_data(symbol: str, period: str = "1y"):
         except Exception as e:
             last_err = str(e)
     return None, last_err
+
 
 @st.cache_data(ttl=60)
 def fetch_quote(symbol: str) -> dict:
@@ -2115,7 +2119,7 @@ def batch_fetch_quotes(symbols: tuple) -> dict:
         df_batch = yf.download(
             tickers=" ".join(tickers),
             period="2d", interval="1d",
-            auto_adjust=True, progress=False,  # ✅ 改為 auto_adjust=True
+            auto_adjust=False, progress=False,
             group_by="ticker",
         )
         if df_batch.empty:
@@ -2143,6 +2147,7 @@ def batch_fetch_quotes(symbols: tuple) -> dict:
     return result
 
 
+
 def _ohlcv_ttl() -> int:
     """
     Dynamic OHLCV cache TTL:
@@ -2167,6 +2172,11 @@ def batch_fetch_ohlcv(symbols: tuple, period: str = "1y") -> dict:
     Download OHLCV for ALL symbols in ONE yf.download() call.
     3–5× faster than calling fetch_data() per stock in a loop.
     Returns {bare_code: pd.DataFrame} — same format as fetch_data().
+
+    Design:
+    • Splits into chunks of 200 to avoid URL length limits
+    • Falls back to .TWO suffix if .TW returns empty
+    • Strips timezone, drops NaN rows, validates min length
     """
     if not symbols:
         return {}
@@ -2189,7 +2199,7 @@ def batch_fetch_ohlcv(symbols: tuple, period: str = "1y") -> dict:
                 tickers=" ".join(chunk),
                 period=period,
                 interval="1d",
-                auto_adjust=True,   # ✅ 改為 True (使用還原權息價格，與市面軟體 CCI 一致)
+                auto_adjust=False,   # 使用未調整原始價格，與市面軟體 CCI 一致
                 progress=False,
                 group_by="ticker",
             )
@@ -2214,7 +2224,8 @@ def batch_fetch_ohlcv(symbols: tuple, period: str = "1y") -> dict:
             continue
 
     return result
-    
+
+
 # ══════════════════════════════════════════════
 # CHART  (4-panel drill-down)
 # ══════════════════════════════════════════════
