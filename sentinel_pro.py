@@ -193,11 +193,12 @@ section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
 
 def calc_cci(high, low, close, period=39):
     tp = (high + low + close) / 3
-    ma = tp.rolling(period).mean()
-    md = tp.rolling(period).apply(
-        lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
-    )
-    return (tp - ma) / (0.015 * md + 1e-10)
+    sma = tp.rolling(window=period).mean()
+    def _mad(x):
+        return np.mean(np.abs(x - np.mean(x)))
+    mad = tp.rolling(window=period).apply(_mad, raw=True)
+    cci = (tp - sma) / (0.015 * mad + 1e-10)
+    return cci
 
 
 def calc_rsi(close, period=6):
@@ -2054,7 +2055,7 @@ def fetch_data(symbol: str, period: str = "1y"):
     last_err = "無資料"
     for sym in candidates:
         try:
-            df = yf.Ticker(sym).history(period=period, auto_adjust=False)
+            df = yf.Ticker(sym).history(period=period, auto_adjust=True)
             if df.empty:
                 last_err = f"{sym}: 無資料"
                 continue
@@ -2199,7 +2200,7 @@ def batch_fetch_ohlcv(symbols: tuple, period: str = "1y") -> dict:
                 tickers=" ".join(chunk),
                 period=period,
                 interval="1d",
-                auto_adjust=False,   # 使用未調整原始價格，與市面軟體 CCI 一致
+                auto_adjust=True,   # 使用未調整原始價格，與市面軟體 CCI 一致
                 progress=False,
                 group_by="ticker",
             )
