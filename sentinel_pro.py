@@ -193,13 +193,13 @@ section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
 
 def calc_cci(high, low, close, period=39):
     tp = (high + low + close) / 3
-    sma = tp.rolling(window=period).mean()
+    ma = tp.rolling(window=period).mean()
     def _mad(x):
         return np.mean(np.abs(x - np.mean(x)))
-    mad = tp.rolling(window=period).apply(_mad, raw=True)
-    cci = (tp - sma) / (0.015 * mad + 1e-10)
+    
+    md = tp.rolling(window=period).apply(_mad, raw=True)
+    cci = (tp - ma) / (0.015 * md + 1e-10)
     return cci
-
 
 def calc_rsi(close, period=6):
     delta = close.diff()
@@ -2056,6 +2056,8 @@ def fetch_data(symbol: str, period: str = "1y"):
     for sym in candidates:
         try:
             df = yf.Ticker(sym).history(period=period, auto_adjust=True)
+            df = df.dropna(subset=['Close'])
+            df = df[df['Volume'] > 0]
             if df.empty:
                 last_err = f"{sym}: 無資料"
                 continue
@@ -9247,4 +9249,3 @@ if __name__ == "__main__":
             pass
         raise   # still show error in Streamlit UI
 
-st.write(df[['High','Low','Close']].tail(5))
