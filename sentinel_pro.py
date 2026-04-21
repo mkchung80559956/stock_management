@@ -192,23 +192,14 @@ section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
 # ══════════════════════════════════════════════
 
 def calc_cci(high, low, close, period=39):
-    # 1. 計算典型價格 TP
     tp = (high + low + close) / 3
-    
-    # 2. 計算簡單移動平均 SMA (這是原本第 197 行報錯的地方)
-    sma = tp.rolling(window=period).mean()
-    
-    # 3. 計算平均絕對偏差 (Mean Deviation)
-    def _calculate_mad(x):
-        return np.mean(np.abs(x - np.mean(x)))
-    
-    # 使用 raw=True 確保精確度
-    mad = tp.rolling(window=period).apply(_calculate_mad, raw=True)
-    
-    # 4. 計算 CCI (增加 1e-10 避免除以 0)
-    cci = (tp - sma) / (0.015 * mad + 1e-10)
-    
-    return cci
+    ma = tp.rolling(period).mean()
+    md = tp.rolling(period).apply(
+        lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+    )
+    return (tp - ma) / (0.015 * md + 1e-10)
+
+
 def calc_rsi(close, period=6):
     delta = close.diff()
     gain = delta.clip(lower=0)
@@ -2063,9 +2054,7 @@ def fetch_data(symbol: str, period: str = "1y"):
     last_err = "無資料"
     for sym in candidates:
         try:
-            df = yf.Ticker(sym).history(period=period, auto_adjust=True)
-            df = df.dropna(subset=['Close'])
-            df = df[df['Volume'] > 0]
+            df = yf.Ticker(sym).history(period=period, auto_adjust=False)
             if df.empty:
                 last_err = f"{sym}: 無資料"
                 continue
@@ -2210,7 +2199,7 @@ def batch_fetch_ohlcv(symbols: tuple, period: str = "1y") -> dict:
                 tickers=" ".join(chunk),
                 period=period,
                 interval="1d",
-                auto_adjust=True,   # 使用未調整原始價格，與市面軟體 CCI 一致
+                auto_adjust=False,   # 使用未調整原始價格，與市面軟體 CCI 一致
                 progress=False,
                 group_by="ticker",
             )
@@ -9256,4 +9245,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise   # still show error in Streamlit UI
-
