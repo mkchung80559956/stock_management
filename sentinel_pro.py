@@ -191,23 +191,13 @@ section[data-testid="stSidebar"] label { font-size: 0.8rem !important; }
 # INDICATOR FUNCTIONS
 # ══════════════════════════════════════════════
 
-def calc_cci(high, low, close, period=39, mode="market"):
+def calc_cci(high, low, close, period=39):
     tp = (high + low + close) / 3
-    ma = tp.rolling(period, min_periods=period).mean()
-
-    if mode == "market":
-        # 👉 券商一致算法（關鍵修正）
-        md = tp.rolling(period, min_periods=period).std()
-        cci = (tp - ma) / (0.015 * md + 1e-10)
-        return cci.round(2)
-
-    else:
-        # 👉 原本高靈敏版本（保留你策略優勢）
-        md = tp.rolling(period).apply(
-            lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
-        )
-        return (tp - ma) / (0.015 * md + 1e-10)
-
+    ma = tp.rolling(period).mean()
+    md = tp.rolling(period).apply(
+        lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+    )
+    return (tp - ma) / (0.015 * md + 1e-10)
 
 
 def calc_rsi(close, period=6):
@@ -616,8 +606,7 @@ def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
     df = df.copy()
 
     # ── Core indicators ──
-    df["CCI"] = calc_cci(high, low, close, period, mode="market")
-    df["CCI_raw"] = calc_cci(high, low, close, period, mode="raw")
+    df["CCI"]    = calc_cci(df["High"], df["Low"], df["Close"], p["cci_period"])
     df["RSI"]    = calc_rsi(df["Close"], p["rsi_period"])
     df["Vol_MA"] = calc_vol_ma(df["Volume"], p["vol_ma_period"])
     df["ATR"]    = calc_atr(df["High"], df["Low"], df["Close"], 14)
