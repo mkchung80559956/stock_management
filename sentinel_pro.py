@@ -5828,70 +5828,74 @@ def main():
                 📢 近期訊號 (5日內) — {scan_time}{opt_badge}</div>
                 </div>""", unsafe_allow_html=True)
 
-                # Buy signal cards
-                if today_buy:
-                    st.markdown("**🟢 買入訊號**")
-                    cols_per_row = 2
-                    for start in range(0, min(len(today_buy), 8), cols_per_row):
-                        chunk = today_buy[start:start + cols_per_row]
-                        cols  = st.columns(cols_per_row)
-                        for ci, r in enumerate(chunk):
-                            sig_key   = r["_sig_key"]
-                            chg_color = "#e8414e" if r["_chg_p"] >= 0 else "#22cc66"
-                            wr_color  = "#00ff88" if r["_win_rate"] >= 60 else "#f0a500" if r["_win_rate"] >= 45 else "#aaaaaa"
-                            border    = "#ffd700" if sig_key == "HIGH_CONF_BUY" else "#00ff88"
-                            fired_at  = r.get("_fired_at", "")
-                            new_badge = (
-                                f'<span style="background:#ff9900;color:#000;padding:1px 6px;'
-                                f'border-radius:3px;font-size:0.62rem;font-weight:700;'
-                                f'margin-left:4px">NEW</span>'
-                            ) if r.get("_is_new") else ""
-                            # Resistance zone warning badge
-                            resist_badge = (
-                                f'<span style="background:#ff3355;color:#fff;padding:1px 6px;'
-                                f'border-radius:3px;font-size:0.60rem;font-weight:700;'
-                                f'margin-left:4px">⚠️壓力</span>'
-                            ) if r.get("_near_resist") else ""
-                            # Show signal detection time on ALL buy cards (not just NEW)
-                            time_label = (
-                                f'<div style="font-size:0.62rem;color:#37474f;margin-top:3px">'
-                                f'📍 訊號出現：{fired_at}</div>'
-                            ) if fired_at else ""
-                            with cols[ci]:
-                                st.markdown(f"""
-                                <div style="background:#0d1a2d;border:1.5px solid {border};
-                                    border-radius:10px;padding:12px 14px;margin-bottom:4px">
-                                <div style="display:flex;justify-content:space-between;
-                                    align-items:baseline;margin-bottom:4px">
-                                <span style="font-size:1.05rem;font-weight:700;
-                                    color:#e8f4fd;font-family:'Space Mono',monospace">
-                                {r['代號']}{new_badge}{resist_badge}</span>
-                                <span style="font-size:0.75rem;color:{chg_color};font-weight:600">
-                                {r['_price']:.2f}　{r['_chg_p']:+.2f}%</span>
-                                </div>
-                                <div style="font-size:0.78rem;color:#8a9bb5;margin-bottom:4px">
-                                {r['_cn_name'] or ''}</div>
-                                <div style="font-size:0.82rem;font-weight:700;color:{border};
-                                    margin-bottom:6px">{SIGNAL_LABEL.get(sig_key,'')}</div>
-                                <div style="display:flex;gap:8px;font-size:0.72rem;flex-wrap:wrap">
-                                <span style="color:{wr_color}">勝率 {r['_win_rate']:.0f}%</span>
-                                <span style="color:#5a8fb0">CCI{r['最佳CCI']}</span>
-                                <span style="color:#5a8fb0">止損 {r['_atr_stop']}</span>
-                                </div>
-                                <div style="font-size:0.68rem;color:#37474f;margin-top:4px;
-                                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
-                                {r['_detail'][:45]}</div>
-                                {time_label}
-                                </div>""", unsafe_allow_html=True)
-                                # A. 一鍵跳轉到個股分析
-                                if st.button(
-                                    f"🔬 分析 {r['代號']}",
-                                    key=f"jump_{r['代號']}_{sig_key}",
-                                    width='stretch', use_container_width=True,
-                                ):
-                                    st.session_state.drill_jump_code = r['代號']
-                                    st.rerun()
-
+              # Buy signal cards
+if today_buy:
+    st.markdown("**🟢 買入訊號**")
+    cols_per_row = 2
+    # 這裡維持原樣即可
+    for start in range(0, min(len(today_buy), 8), cols_per_row):
+        chunk = today_buy[start:start + cols_per_row]
+        cols  = st.columns(cols_per_row)
+        
+        # --- 修正點 1：這裡本來就有 ci，我們將利用 start 和 ci 來建立唯一 ID ---
+        for ci, r in enumerate(chunk):
+            sig_key   = r["_sig_key"]
+            chg_color = "#e8414e" if r["_chg_p"] >= 0 else "#22cc66"
+            wr_color  = "#00ff88" if r["_win_rate"] >= 60 else "#f0a500" if r["_win_rate"] >= 45 else "#aaaaaa"
+            border    = "#ffd700" if sig_key == "HIGH_CONF_BUY" else "#00ff88"
+            fired_at  = r.get("_fired_at", "")
+            new_badge = (
+                f'<span style="background:#ff9900;color:#000;padding:1px 6px;'
+                f'border-radius:3px;font-size:0.62rem;font-weight:700;'
+                f'margin-left:4px">NEW</span>'
+            ) if r.get("_is_new") else ""
+            
+            resist_badge = (
+                f'<span style="background:#ff3355;color:#fff;padding:1px 6px;'
+                f'border-radius:3px;font-size:0.60rem;font-weight:700;'
+                f'margin-left:4px">⚠️壓力</span>'
+            ) if r.get("_near_resist") else ""
+            
+            time_label = (
+                f'<div style="font-size:0.62rem;color:#37474f;margin-top:3px">'
+                f'📍 訊號出現：{fired_at}</div>'
+            ) if fired_at else ""
+            
+            with cols[ci]:
+                st.markdown(f"""
+                <div style="background:#0d1a2d;border:1.5px solid {border};
+                    border-radius:10px;padding:12px 14px;margin-bottom:4px">
+                <div style="display:flex;justify-content:space-between;
+                    align-items:baseline;margin-bottom:4px">
+                <span style="font-size:1.05rem;font-weight:700;
+                    color:#e8f4fd;font-family:'Space Mono',monospace">
+                {r['代號']}{new_badge}{resist_badge}</span>
+                <span style="font-size:0.75rem;color:{chg_color};font-weight:600">
+                {r['_price']:.2f}　{r['_chg_p']:+.2f}%</span>
+                </div>
+                <div style="font-size:0.78rem;color:#8a9bb5;margin-bottom:4px">
+                {r['_cn_name'] or ''}</div>
+                <div style="font-size:0.82rem;font-weight:700;color:{border};
+                    margin-bottom:6px">{SIGNAL_LABEL.get(sig_key,'')}</div>
+                <div style="display:flex;gap:8px;font-size:0.72rem;flex-wrap:wrap">
+                <span style="color:{wr_color}">勝率 {r['_win_rate']:.0f}%</span>
+                <span style="color:#5a8fb0">CCI{r['最佳CCI']}</span>
+                <span style="color:#5a8fb0">止損 {r['_atr_stop']}</span>
+                </div>
+                <div style="font-size:0.68rem;color:#37474f;margin-top:4px;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+                {r['_detail'][:45]}</div>
+                {time_label}
+                </div>""", unsafe_allow_html=True)
+                
+                # --- 修正點 2：加入 start 與 ci 到 key 中 ---
+                if st.button(
+                    f"🔬 分析 {r['代號']}",
+                    key=f"jump_{r['代號']}_{sig_key}_{start}_{ci}", # 加入唯一後綴
+                    use_container_width=True,
+                ):
+                    st.session_state.drill_jump_code = r['代號']
+                    st.rerun()
                 # Sell signal cards
                 if today_sell:
                     st.markdown("**🔴 賣出訊號**")
