@@ -5886,7 +5886,7 @@ def main():
                                 # A. 一鍵跳轉到個股分析
                                 if st.button(
                                     f"🔬 分析 {r['代號']}",
-                                    key=f"jump_{r['代號']}_{sig_key}_{i}",
+                                    key=f"jump_{r['代號']}_{sig_key}",
                                     width='stretch', use_container_width=True,
                                 ):
                                     st.session_state.drill_jump_code = r['代號']
