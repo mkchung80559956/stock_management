@@ -2045,7 +2045,11 @@ def batch_fetch_names(codes: tuple) -> dict:
 @st.cache_data(ttl=180)
 @st.cache_data(ttl=180)   # 3分鐘 — 盤中資料更新頻率
 def fetch_data(symbol: str, period: str = "1y"):
-    """Fetch OHLCV. Auto-tries .TW then .TWO for bare codes."""
+    """
+    Fetch OHLCV using yf.download() — correctly honours auto_adjust=False.
+    yf.Ticker().history() in yfinance 1.2.x ignores auto_adjust parameter.
+    Auto-tries .TW then .TWO for bare codes.
+    """
     if symbol.upper().endswith((".TW", ".TWO")):
         candidates = [symbol]
     else:
@@ -2054,14 +2058,25 @@ def fetch_data(symbol: str, period: str = "1y"):
     last_err = "無資料"
     for sym in candidates:
         try:
-            df = yf.Ticker(sym).history(period=period, auto_adjust=False)
+            df = yf.download(
+                sym,
+                period=period,
+                interval="1d",
+                auto_adjust=False,   # 使用原始未調整價格，CCI 與市面軟體一致
+                progress=False,
+            )
             if df.empty:
                 last_err = f"{sym}: 無資料"
                 continue
+
+            # yf.download 可能回傳 MultiIndex columns (field, ticker)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
             df.index = pd.to_datetime(df.index).tz_localize(None)
-            # auto_adjust=False returns Adj Close separately; use raw OHLC
-            cols_available = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-            df = df[cols_available].dropna()
+            needed = [c for c in ["Open", "High", "Low", "Close", "Volume"]
+                      if c in df.columns]
+            df = df[needed].dropna()
             if len(df) < 10:
                 last_err = f"{sym}: 資料不足"
                 continue
@@ -5832,12 +5847,9 @@ def main():
                 if today_buy:
                     st.markdown("**🟢 買入訊號**")
                     cols_per_row = 2
-                    # 這裡維持原樣即可
                     for start in range(0, min(len(today_buy), 8), cols_per_row):
                         chunk = today_buy[start:start + cols_per_row]
                         cols  = st.columns(cols_per_row)
-                        
-                        # --- 修正點 1：這裡本來就有 ci，我們將利用 start 和 ci 來建立唯一 ID ---
                         for ci, r in enumerate(chunk):
                             sig_key   = r["_sig_key"]
                             chg_color = "#e8414e" if r["_chg_p"] >= 0 else "#22cc66"
@@ -5849,18 +5861,17 @@ def main():
                                 f'border-radius:3px;font-size:0.62rem;font-weight:700;'
                                 f'margin-left:4px">NEW</span>'
                             ) if r.get("_is_new") else ""
-                            
+                            # Resistance zone warning badge
                             resist_badge = (
                                 f'<span style="background:#ff3355;color:#fff;padding:1px 6px;'
                                 f'border-radius:3px;font-size:0.60rem;font-weight:700;'
                                 f'margin-left:4px">⚠️壓力</span>'
                             ) if r.get("_near_resist") else ""
-                            
+                            # Show signal detection time on ALL buy cards (not just NEW)
                             time_label = (
                                 f'<div style="font-size:0.62rem;color:#37474f;margin-top:3px">'
                                 f'📍 訊號出現：{fired_at}</div>'
                             ) if fired_at else ""
-                            
                             with cols[ci]:
                                 st.markdown(f"""
                                 <div style="background:#0d1a2d;border:1.5px solid {border};
@@ -5887,12 +5898,11 @@ def main():
                                 {r['_detail'][:45]}</div>
                                 {time_label}
                                 </div>""", unsafe_allow_html=True)
-                                
-                                # --- 修正點 2：加入 start 與 ci 到 key 中 ---
+                                # A. 一鍵跳轉到個股分析
                                 if st.button(
                                     f"🔬 分析 {r['代號']}",
-                                    key=f"jump_{r['代號']}_{sig_key}_{start}_{ci}", # 加入唯一後綴
-                                    use_container_width=True,
+                                    key=f"jump_{r['代號']}_{sig_key}",
+                                    width='stretch', use_container_width=True,
                                 ):
                                     st.session_state.drill_jump_code = r['代號']
                                     st.rerun()
@@ -9177,76 +9187,4 @@ def main():
                 sel_code  = gc1.selectbox("股票", wl_codes,
                     format_func=lambda x: f"{x.replace('.TW','').replace('.TWO','')}  {lookup_name(x.replace('.TW','').replace('.TWO',''))[0] or ''}",
                     label_visibility="collapsed", key="wl_gc_code")
-                sel_grp   = gc2.selectbox("分組", PRESET_GROUPS,
-                    label_visibility="collapsed", key="wl_gc_grp")
-                if gc3.button("更新", width='stretch', key="wl_gc_save"):
-                    bare_sel = sel_code.upper().replace(".TW","").replace(".TWO","")
-                    wl_set_group(bare_sel, sel_grp)
-                    st.success(f"✓ {bare_sel} → {sel_grp}"); st.rerun()
-
-            # ── 備忘 + 標籤 ───────────────────────────────────
-            with st.expander("📝 備忘 & 標籤"):
-                nb_code = st.selectbox("選股",
-                    wl_codes,
-                    format_func=lambda x: f"{x.replace('.TW','').replace('.TWO','')}  {lookup_name(x.replace('.TW','').replace('.TWO',''))[0] or ''}",
-                    label_visibility="collapsed", key="wl_nb_code")
-                bare_nb = nb_code.upper().replace(".TW","").replace(".TWO","")
-                ex_note = wl_note_get(bare_nb)
-                with st.form("wl_note_form"):
-                    nb_text = st.text_area("備忘 / 進場理由",
-                        value=ex_note.get("note",""), height=80,
-                        placeholder="記錄關注原因、進場邏輯、觀察重點…")
-                    nb_c1, nb_c2 = st.columns(2)
-                    nb_entry = nb_c1.number_input("進場均價",
-                        min_value=0.0, value=float(ex_note.get("entry",0) or 0), step=0.5)
-                    nb_date  = nb_c2.text_input("關注日期",
-                        value=ex_note.get("watch_date", tw_now().strftime("%Y-%m-%d")))
-                    nb_tags = st.multiselect("標籤",
-                        ["技術突破","籌碼轉強","法人買超","業績成長",
-                         "低估值","高殖利率","週期底部","隔日沖","題材","其他"],
-                        default=ex_note.get("tags", []))
-                    if st.form_submit_button("💾 儲存", type="primary"):
-                        wl_note_set(bare_nb, {
-                            **ex_note,
-                            "note": nb_text, "entry": nb_entry,
-                            "watch_date": nb_date, "tags": nb_tags,
-                            "updated": tw_now().strftime("%Y-%m-%d %H:%M"),
-                        })
-                        st.success("✓ 已儲存")
-
-            # ── 所有備忘一覽 ──────────────────────────────────
-            with st.expander("📋 所有備忘一覽"):
-                note_rows = [
-                    {"代號": c.upper().replace(".TW","").replace(".TWO",""),
-                     "名稱": lookup_name(c.upper().replace(".TW","").replace(".TWO",""))[0] or c,
-                     "備忘": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("note","")[:40],
-                     "標籤": " ".join(wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("tags",[])),
-                     "均價": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("entry",""),
-                     "日期": wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("watch_date",""),
-                    }
-                    for c in wl_codes
-                    if wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("note")
-                    or wl_note_get(c.upper().replace(".TW","").replace(".TWO","")).get("tags")
-                ]
-                if note_rows:
-                    st.dataframe(pd.DataFrame(note_rows), width='stretch', hide_index=True)
-                else:
-                    st.info("尚無備忘記錄")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as _sentinel_err:
-        import traceback as _tb
-        _err_detail = _tb.format_exc()[-600:]   # last 600 chars of traceback
-        try:
-            tg_broadcast(
-                f"⚠️ Sentinel Pro 異常\n"
-                f"{tw_now().strftime('%m/%d %H:%M')}\n\n"
-                f"{type(_sentinel_err).__name__}: {str(_sentinel_err)[:200]}\n\n"
-                f"{_err_detail}"
-            )
-        except Exception:
-            pass
-        raise   # still show error in Streamlit UI
+  
