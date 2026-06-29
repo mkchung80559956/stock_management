@@ -3053,6 +3053,50 @@ def _tg_send(token: str, chat_id: str, text: str) -> tuple[bool, str]:
         return False, err
 
 
+def _tg_send_photo(token: str, chat_id: str, photo_bytes: bytes,
+                   caption: str = "") -> tuple[bool, str]:
+    """
+    Send a photo via Telegram Bot API (multipart/form-data, sendPhoto).
+    Returns (success, error_message).
+    """
+    if not token or not chat_id:
+        return False, "Token 或 Chat ID 未設定"
+    try:
+        boundary = "----SentinelProBoundary"
+        clean_caption = _re.sub(r'<[^>]+>', '', caption)[:1024]
+        body = bytearray()
+
+        def _field(name: str, value: str) -> None:
+            body.extend(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+                f'{value}\r\n'.encode("utf-8")
+            )
+
+        _field("chat_id", str(chat_id).strip())
+        if clean_caption:
+            _field("caption", clean_caption)
+        body.extend(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; '
+            f'filename="chart.png"\r\nContent-Type: image/png\r\n\r\n'.encode("utf-8")
+        )
+        body.extend(photo_bytes)
+        body.extend(f'\r\n--{boundary}--\r\n'.encode("utf-8"))
+
+        url = f"https://api.telegram.org/bot{token.strip()}/sendPhoto"
+        req = _urllib_req.Request(url, data=bytes(body), method="POST")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        with _urllib_req.urlopen(req, timeout=20) as r:
+            if r.status == 200:
+                return True, ""
+            return False, f"HTTP Error {r.status}: {r.read().decode()[:300]}"
+    except Exception as e:
+        err = str(e)
+        if hasattr(e, 'read'):
+            try: err += " | " + e.read().decode()[:200]
+            except Exception: pass
+        return False, err
+
+
 def tg_get_recipients() -> tuple[str, list[str]]:
     """
     讀取所有收件人 chat_id。
@@ -3112,6 +3156,19 @@ def tg_broadcast(text: str) -> int:
     sent = 0
     for cid in cids:
         ok, _ = _tg_send(token, cid, text)
+        if ok:
+            sent += 1
+    return sent
+
+
+def tg_broadcast_photo(photo_bytes: bytes, caption: str = "") -> int:
+    """推播圖表圖片給所有設定的收件人。Returns count of successful sends."""
+    token, cids = tg_get_recipients()
+    if not token or not cids:
+        return 0
+    sent = 0
+    for cid in cids:
+        ok, _ = _tg_send_photo(token, cid, photo_bytes, caption)
         if ok:
             sent += 1
     return sent
@@ -6656,6 +6713,24 @@ def main():
                                   stop_price=atr_stop,
                                   rr_targets=rr_targets_list)
                 st.plotly_chart(fig, width='stretch')
+
+                # ── 傳送圖表到 Telegram（手機斷線時改用 Telegram 看圖，不依賴 Streamlit session）──
+                if st.button("📤 傳送圖表到 Telegram", key="drill_send_tg"):
+                    with st.spinner("產生圖片並傳送中…"):
+                        try:
+                            png_bytes = fig.to_image(format="png", width=1000, height=700, scale=2)
+                            cap = (f"📊 {bare_t} {cn_name}\n"
+                                   f"訊號：{SIGNAL_LABEL.get(scan_sig, scan_sig)}\n"
+                                   f"現價：{price:.2f}　漲跌：{chg_pct:+.2f}%\n"
+                                   f"CCI週期：{stock_params.get('cci_period')}"
+                                   f"{'（已優化）' if _opt.get('optimised') else '（全域）'}")
+                            n_sent = tg_broadcast_photo(png_bytes, cap)
+                            if n_sent > 0:
+                                st.success(f"✅ 已傳送至 {n_sent} 個 Telegram 收件人")
+                            else:
+                                st.warning("傳送失敗或尚未設定 Telegram Token / Chat ID（側欄或 Secrets）")
+                        except Exception as e:
+                            st.error(f"圖片產生失敗：{e}")
 
                 # ── Professional signal history table (clean 6 columns) ──
                 EVENT_SIGS = set(BUY_SIGNALS) | set(SELL_SIGNALS) | {"WATCH", "FAKE_BREAKOUT"}
