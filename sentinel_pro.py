@@ -1453,6 +1453,39 @@ def auto_optimize_cci(symbol: str, period: str,
 
 
 # ══════════════════════════════════════════════
+# CCI 優化結果持久化（掃描頁 + 個股分析頁共用）
+# ══════════════════════════════════════════════
+_CCI_OPT_FILE = "/tmp/sentinel_cci_opt.json"  # {code: {cci_period, vol_multiplier, win_rate, avg_return, total, optimised}}
+
+
+def cci_opt_load() -> dict:
+    """Always read fresh — avoids stale cache losing optimisation results."""
+    try:
+        if os.path.exists(_CCI_OPT_FILE):
+            return json.load(open(_CCI_OPT_FILE))
+    except Exception:
+        pass
+    return {}
+
+
+def cci_opt_save(d: dict) -> None:
+    try:
+        tmp = _CCI_OPT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, _CCI_OPT_FILE)
+    except Exception:
+        pass
+
+
+def cci_opt_set(code: str, opt: dict) -> None:
+    bare = code.upper().replace(".TW", "").replace(".TWO", "")
+    d = cci_opt_load()
+    d[bare] = opt
+    cci_opt_save(d)
+
+
+# ══════════════════════════════════════════════
 # 台股中文名稱對照表（靜態，零 API 呼叫）
 # ══════════════════════════════════════════════
 _TW_NAMES: dict[str, tuple[str, str]] = {
@@ -4645,6 +4678,9 @@ def main():
     # ── Session state ────────────────────────────
     if "watchlist" not in st.session_state:
         st.session_state.watchlist = DEFAULT_WATCHLIST.copy()
+    if "cci_opt_map" not in st.session_state:
+        # 還原先前持久化的個股CCI優化結果（掃描頁 + 個股分析頁皆會更新）
+        st.session_state.cci_opt_map = cci_opt_load()
     if "scan_rows" not in st.session_state:
         st.session_state.scan_rows = []
         # ── 方案A：斷線重連時自動還原上次掃描結果 ──
@@ -5332,7 +5368,8 @@ def main():
                 except Exception:
                     pass
             prog2.empty()
-            st.session_state.cci_opt_map = opt_map
+            st.session_state.cci_opt_map = {**st.session_state.get("cci_opt_map", {}), **opt_map}
+            cci_opt_save(st.session_state.cci_opt_map)
             # Patch rows with optimised results
             for row in st.session_state.scan_rows:
                 o = opt_map.get(row["代號"])
@@ -6129,6 +6166,8 @@ def main():
         if load_btn and not _jump:
             st.session_state["drill_active_code"] = ""
 
+        bare_t = target.upper().replace(".TW", "").replace(".TWO", "") if target else ""
+
         # Timeframe selector
         tf_opts  = {"1個月": "1mo", "3個月": "3mo", "6個月": "6mo",
                     "1年": "1y", "2年": "2y"}
@@ -6137,13 +6176,49 @@ def main():
                             label_visibility="collapsed")
         drill_period = tf_opts[tf_label]
 
+        # ── 個股 CCI 自動優化（不必先去掃描頁）────────────────
+        oc1, oc2 = st.columns([1, 3])
+        opt_btn  = oc1.button("🎯 優化此股CCI", key="drill_opt_btn",
+                              help="針對此股票獨立回測，找出最佳CCI週期（約幾秒）")
+        _opt_existing = st.session_state.get("cci_opt_map", {}).get(bare_t, {})
+        if _opt_existing.get("optimised"):
+            oc2.caption(f"✅ 已優化：CCI={_opt_existing['cci_period']} · "
+                        f"勝率 {_opt_existing['win_rate']}% · "
+                        f"平均報酬 {_opt_existing['avg_return']}%")
+        else:
+            oc2.caption("尚未優化此股，圖表將使用側欄全域CCI參數")
+
+        if opt_btn and bare_t:
+            with st.spinner(f"優化 {bare_t} 的CCI週期…"):
+                opt = auto_optimize_cci(
+                    target, drill_period,
+                    holding_days, profit_target, stop_loss,
+                    vol_ma_period, rsi_period, kd_period, ema2,
+                )
+            st.session_state.setdefault("cci_opt_map", {})
+            st.session_state.cci_opt_map[bare_t] = opt
+            cci_opt_set(bare_t, opt)
+            if opt.get("optimised"):
+                st.success(f"✅ 優化完成：CCI={opt['cci_period']}　"
+                           f"勝率 {opt['win_rate']}%　平均報酬 {opt['avg_return']}%")
+            else:
+                st.warning("樣本不足（交易次數 <3），無法優化，沿用全域CCI參數")
+            load_btn = True   # 優化後立即重新載入圖表以套用新參數
+
         if load_btn:
             with st.spinner(f"載入 {target} …"):
                 df_raw, err = fetch_data(target, drill_period)
             if df_raw is None:
                 st.error(f"無法取得資料：{err}")
             else:
-                df_sig  = generate_signals(df_raw, params)
+                _opt = st.session_state.get("cci_opt_map", {}).get(bare_t, {})
+                if _opt.get("optimised"):
+                    stock_params = {**params,
+                                     "cci_period":     _opt["cci_period"],
+                                     "vol_multiplier": _opt["vol_multiplier"]}
+                else:
+                    stock_params = params
+                df_sig  = generate_signals(df_raw, stock_params)
                 latest  = df_sig.iloc[-1]
                 prev    = df_sig.iloc[-2]
                 quote   = fetch_quote(target)
@@ -6154,7 +6229,6 @@ def main():
                 chg_pct = quote.get("change_pct") or float(chg / (prev["Close"] + 1e-8) * 100)
 
                 # ── Name banner ──
-                bare_t    = target.upper().replace(".TW", "").replace(".TWO", "")
                 mkt_color = "#22cc66" if mkt_label == "上櫃" else "#00aaff"
                 chg_color = "#e8414e" if chg >= 0 else "#22cc66"
                 st.markdown(
@@ -6330,9 +6404,9 @@ def main():
                 try:
                     with st.spinner("載入週K線確認…"):
                         w_sig_drill, w_det_drill = get_weekly_signal(
-                            target, params,
-                            _p_ver=hash((params.get("cci_period",39),
-                                         params.get("vol_multiplier",1.5)))
+                            target, stock_params,
+                            _p_ver=hash((stock_params.get("cci_period",39),
+                                         stock_params.get("vol_multiplier",1.5)))
                         )
                     mtf_ok_d, mtf_lbl_d = mtf_confirm(scan_sig, w_sig_drill)
                     w_color = "#00ff88" if mtf_ok_d else "#ffd600" if w_sig_drill == "NEUTRAL" else "#ff3355"
@@ -6577,7 +6651,7 @@ def main():
 
                 # ── Chart (with S/R + stop + R:R) ──
                 sr = calc_support_resistance(df_sig)
-                fig = build_chart(df_sig, bare_t, params,
+                fig = build_chart(df_sig, bare_t, stock_params,
                                   sr=sr,
                                   stop_price=atr_stop,
                                   rr_targets=rr_targets_list)
