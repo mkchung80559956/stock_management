@@ -3,5 +3,6 @@ yfinance==1.2.1
 pandas==3.0.2
 numpy==2.4.4
 plotly==6.7.0
+kaleido
 openpyxl==3.1.5
 pytz
