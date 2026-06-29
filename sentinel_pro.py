@@ -6177,6 +6177,7 @@ def main():
         if _dc2.button("🔄 清快取", key="drill_clear_cache",
                        help="CCI/RSI 數值有誤時點此清除快取重新計算"):
             st.cache_data.clear()
+            st.session_state.pop("drill_cache", None)
             st.toast("✅ 快取已清除，請重新載入", icon="🔄")
             st.rerun()
 
@@ -6262,9 +6263,26 @@ def main():
                 st.warning("樣本不足（交易次數 <3），無法優化，沿用全域CCI參數")
             load_btn = True   # 優化後立即重新載入圖表以套用新參數
 
+        # 用 session_state 記住上次成功載入的資料，避免圖表下方其他按鈕
+        # （例如「傳送圖表到 Telegram」）被點擊觸發整頁重跑後，因為
+        # load_btn（一次性按鈕）已變回 False 而讓整個圖表區塊消失、
+        # 按鈕本身的點擊也跟著被吃掉、看起來像「按鈕無效」。
+        _drill_cache = st.session_state.get("drill_cache")
+        _use_cache = (not load_btn) and bool(_drill_cache) \
+            and _drill_cache.get("bare_t") == bare_t \
+            and _drill_cache.get("period") == drill_period
+
         if load_btn:
             with st.spinner(f"載入 {target} …"):
                 df_raw, err = fetch_data(target, drill_period)
+            if df_raw is not None:
+                st.session_state["drill_cache"] = {
+                    "bare_t": bare_t, "period": drill_period, "df_raw": df_raw,
+                }
+        elif _use_cache:
+            df_raw, err = _drill_cache["df_raw"], None
+
+        if load_btn or _use_cache:
             if df_raw is None:
                 st.error(f"無法取得資料：{err}")
             else:
