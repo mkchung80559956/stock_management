@@ -520,6 +520,30 @@ SIGNAL_LABEL = {
     "FAKE_BREAKOUT":  "🟣 誘多",
 }
 
+# 圖表（含匯出成PNG）專用英文標籤 — kaleido 的內建渲染器沒有中文字型，
+# 中文會變成方塊，圖表內所有靜態文字（legend/annotation）改用英文。
+# App 介面其他地方（表格、提示文字）仍維持中文，因為那些是瀏覽器渲染。
+SIGNAL_LABEL_EN = {
+    "HIGH_CONF_BUY":      "Triple Confluence",
+    "HIGH_CONF_PULLBACK": "Confluence Pullback",
+    "BREAKOUT_BUY":       "Breakout Buy",
+    "STRONG_BUY":         "Strong Buy",
+    "BUY":                "Buy",
+    "DIV_BUY":            "Bullish Div",
+    "KD_GOLDEN_ZONE":     "KD Golden",
+    "BULL_ZONE":          "Bull Zone",
+    "RISING":             "Rising",
+    "WATCH":              "Watch",
+    "NEUTRAL":            "-",
+    "FALLING":            "Falling",
+    "BEAR_ZONE":          "Oversold Zone",
+    "KD_HIGH":            "KD High",
+    "DIV_SELL":           "Bearish Div",
+    "SELL":               "Sell",
+    "STRONG_SELL":        "Strong Sell",
+    "FAKE_BREAKOUT":      "Fakeout",
+}
+
 # ── Map signal → concise zone for mobile display ──
 SIGNAL_ZONE = {
     "BREAKOUT_BUY": "買", "STRONG_BUY": "買", "BUY": "買",
@@ -2474,7 +2498,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
     # ── P1: K線 ──
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"],
-        low=df["Low"], close=df["Close"], name="K線",
+        low=df["Low"], close=df["Close"], name="Candles",
         increasing_fillcolor="#e8414e", increasing_line_color="#e8414e",
         decreasing_fillcolor="#22cc66", decreasing_line_color="#22cc66",
         hoverinfo="x+text",
@@ -2486,7 +2510,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
         ("EMA1",   f"EMA{ema1_p}",  "#f0a500", 1.4, "solid"),
         ("EMA2",   f"EMA{ema2_p}",  "#2196f3", 1.4, "solid"),
         ("EMA60",  "EMA60",          "#e040fb", 1.0, "dash"),
-        ("EMA200", "EMA200 (年線)", "#ffd600", 1.2, "dashdot"),  # 年線 — golden
+        ("EMA200", "EMA200 (Year)", "#ffd600", 1.2, "dashdot"),  # 年線 — golden
     ]:
         if col_key in df.columns:
             fig.add_trace(go.Scatter(
@@ -2498,23 +2522,23 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
 
     if "BB_Upper" in df.columns:
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["BB_Upper"], name=f"BB上({bb_p},2σ)",
+            x=df.index, y=df["BB_Upper"], name=f"BB Upper({bb_p},2σ)",
             line=dict(color="#546e7a", width=0.9, dash="dot"),
             showlegend=True, legendgroup="bb",
-            hovertemplate="BB上: %{y:.2f}<extra></extra>",
+            hovertemplate="BB Upper: %{y:.2f}<extra></extra>",
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["BB_Lower"], name="BB下",
+            x=df.index, y=df["BB_Lower"], name="BB Lower",
             line=dict(color="#546e7a", width=0.9, dash="dot"),
             fill="tonexty", fillcolor="rgba(84,110,122,0.06)",
             showlegend=False,
-            hovertemplate="BB下: %{y:.2f}<extra></extra>",
+            hovertemplate="BB Lower: %{y:.2f}<extra></extra>",
         ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["BB_Mid"], name="BB中",
+            x=df.index, y=df["BB_Mid"], name="BB Mid",
             line=dict(color="#37474f", width=0.7, dash="dash"),
             showlegend=False,
-            hovertemplate="BB中: %{y:.2f}<extra></extra>",
+            hovertemplate="BB Mid: %{y:.2f}<extra></extra>",
         ), row=1, col=1)
 
     # Support / Resistance levels
@@ -2523,28 +2547,28 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
             fig.add_hline(y=lvl, line_dash="dot",
                           line_color="rgba(232,65,78,0.65)", line_width=1.2,
                           row=1, col=1,
-                          annotation_text=f"壓 {lvl:.2f}",
+                          annotation_text=f"Res {lvl:.2f}",
                           annotation_font_size=9,
                           annotation_font_color="rgba(232,65,78,0.9)")
         for lvl in sr.get("support", []):
             fig.add_hline(y=lvl, line_dash="dot",
                           line_color="rgba(34,204,102,0.65)", line_width=1.2,
                           row=1, col=1,
-                          annotation_text=f"撐 {lvl:.2f}",
+                          annotation_text=f"Sup {lvl:.2f}",
                           annotation_font_size=9,
                           annotation_font_color="rgba(34,204,102,0.9)")
         if sr.get("52w_high"):
             fig.add_hline(y=sr["52w_high"], line_dash="longdash",
                           line_color="rgba(255,153,0,0.55)", line_width=1,
                           row=1, col=1,
-                          annotation_text=f"52W高 {sr['52w_high']:.2f}",
+                          annotation_text=f"52W High {sr['52w_high']:.2f}",
                           annotation_font_size=9,
                           annotation_font_color="rgba(255,153,0,0.8)")
         if sr.get("52w_low"):
             fig.add_hline(y=sr["52w_low"], line_dash="longdash",
                           line_color="rgba(100,181,246,0.55)", line_width=1,
                           row=1, col=1,
-                          annotation_text=f"52W低 {sr['52w_low']:.2f}",
+                          annotation_text=f"52W Low {sr['52w_low']:.2f}",
                           annotation_font_size=9,
                           annotation_font_color="rgba(100,181,246,0.8)")
 
@@ -2553,7 +2577,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
         fig.add_hline(y=stop_price, line_dash="solid",
                       line_color="rgba(255,51,85,0.9)", line_width=2.0,
                       row=1, col=1,
-                      annotation_text=f"🛑 停損 {stop_price:.2f}",
+                      annotation_text=f"Stop {stop_price:.2f}",
                       annotation_font_size=10,
                       annotation_font_color="#ff3355")
 
@@ -2564,7 +2588,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
             fig.add_hline(y=target, line_dash="dash",
                           line_color=rr_col, line_width=1.3,
                           row=1, col=1,
-                          annotation_text=f"🎯 R{rr}x {target:.2f}",
+                          annotation_text=f"R{rr}x {target:.2f}",
                           annotation_font_size=9,
                           annotation_font_color=rr_col)
 
@@ -2581,7 +2605,7 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
             x=df.index[mask], y=y_vals, mode="markers",
             marker=dict(symbol=shape, color=color, size=size + 2,
                         line=dict(width=1.2, color="#000")),
-            name=SIGNAL_LABEL.get(sig, sig),
+            name=SIGNAL_LABEL_EN.get(sig, sig),
             hovertext=hover, hoverinfo="text",
             showlegend=True, legendgroup="signals",
         ), row=1, col=1)
@@ -2591,16 +2615,16 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
                   for c, o in zip(df["Close"], df["Open"])]
     fig.add_trace(go.Bar(
         x=df.index, y=df["Volume"], marker_color=vol_colors,
-        name="成交量", opacity=0.65, showlegend=False,
-        hovertemplate="量: %{y:,.0f}<extra></extra>",
+        name="Volume", opacity=0.65, showlegend=False,
+        hovertemplate="Vol: %{y:,.0f}<extra></extra>",
     ), row=2, col=1)
     if "Vol_MA" in df.columns:
         fig.add_trace(go.Scatter(
             x=df.index, y=df["Vol_MA"],
-            name=f"均量{p.get('vol_ma_period',20)}日",
+            name=f"VolMA{p.get('vol_ma_period',20)}",
             line=dict(color="#f0a500", width=1.2),
             showlegend=True, legendgroup="vol",
-            hovertemplate="均量: %{y:,.0f}<extra></extra>",
+            hovertemplate="VolMA: %{y:,.0f}<extra></extra>",
         ), row=2, col=1)
     if "OBV" in df.columns:
         fig.add_trace(go.Scatter(
@@ -2611,10 +2635,10 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
         ), row=2, col=1, secondary_y=True)
         if "OBV_MA" in df.columns:
             fig.add_trace(go.Scatter(
-                x=df.index, y=df["OBV_MA"], name="OBV均線",
+                x=df.index, y=df["OBV_MA"], name="OBV MA",
                 line=dict(color="#004d66", width=1.0, dash="dot"),
                 showlegend=False,
-                hovertemplate="OBV均: %{y:,.0f}<extra></extra>",
+                hovertemplate="OBV MA: %{y:,.0f}<extra></extra>",
             ), row=2, col=1, secondary_y=True)
 
     # ── P3: CCI ──
@@ -2654,8 +2678,8 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
                         y0=0, y1=1, fillcolor=fill_col, line_width=0, layer="below")
                 except Exception:
                     pass
-    for lvl, col, lbl in [(100, "rgba(232,65,78,0.4)", "超買"),
-                           (-100, "rgba(34,204,102,0.4)", "超賣"),
+    for lvl, col, lbl in [(100, "rgba(232,65,78,0.4)", "Overbought"),
+                           (-100, "rgba(34,204,102,0.4)", "Oversold"),
                            (0, "#37474f", "")]:
         fig.add_hline(y=lvl, line_dash="dot", line_color=col, line_width=1,
                       row=3, col=1,
@@ -2684,10 +2708,10 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
                 mode="markers+text",
                 marker=dict(symbol="triangle-up", color="#00ff88", size=12,
                             line=dict(width=1.5, color="#000")),
-                text=["金叉"] * int(gc.sum()), textposition="bottom center",
+                text=["GC"] * int(gc.sum()), textposition="bottom center",
                 textfont=dict(size=8, color="#00ff88"),
-                name="KD金叉", showlegend=True, legendgroup="kd",
-                hovertemplate="KD金叉 K=%{y:.1f}<extra></extra>",
+                name="KD Golden Cross", showlegend=True, legendgroup="kd",
+                hovertemplate="KD Golden Cross K=%{y:.1f}<extra></extra>",
             ), row=4, col=1)
         if hasattr(dc, "any") and dc.any():
             fig.add_trace(go.Scatter(
@@ -2695,14 +2719,14 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
                 mode="markers+text",
                 marker=dict(symbol="triangle-down", color="#ff3355", size=12,
                             line=dict(width=1.5, color="#000")),
-                text=["死叉"] * int(dc.sum()), textposition="top center",
+                text=["DC"] * int(dc.sum()), textposition="top center",
                 textfont=dict(size=8, color="#ff3355"),
-                name="KD死叉", showlegend=True, legendgroup="kd",
-                hovertemplate="KD死叉 K=%{y:.1f}<extra></extra>",
+                name="KD Dead Cross", showlegend=True, legendgroup="kd",
+                hovertemplate="KD Dead Cross K=%{y:.1f}<extra></extra>",
             ), row=4, col=1)
-        for lvl, col, lbl in [(80, "rgba(232,65,78,0.35)", "超買80"),
+        for lvl, col, lbl in [(80, "rgba(232,65,78,0.35)", "Overbought 80"),
                                (50, "#37474f", ""),
-                               (20, "rgba(34,204,102,0.35)", "超賣20")]:
+                               (20, "rgba(34,204,102,0.35)", "Oversold 20")]:
             fig.add_hline(y=lvl, line_dash="dot", line_color=col, line_width=1,
                           row=4, col=1, annotation_text=lbl,
                           annotation_font_size=8, annotation_font_color=col)
@@ -2712,18 +2736,18 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
                    for v in df["MACD_Hist"].fillna(0)]
     fig.add_trace(go.Bar(
         x=df.index, y=df["MACD_Hist"], marker_color=hist_colors,
-        name="MACD柱(紅多綠空)", opacity=0.8,
+        name="MACD Hist", opacity=0.8,
         showlegend=True, legendgroup="macd",
         hovertemplate="Hist: %{y:.3f}<extra></extra>",
     ), row=5, col=1)
     fig.add_trace(go.Scatter(
-        x=df.index, y=df["MACD"], name="MACD(藍)",
+        x=df.index, y=df["MACD"], name="MACD",
         line=dict(color="#2196f3", width=1.5),
         showlegend=True, legendgroup="macd",
         hovertemplate="MACD: %{y:.3f}<extra></extra>",
     ), row=5, col=1)
     fig.add_trace(go.Scatter(
-        x=df.index, y=df["MACD_Sig"], name="訊號(橙)",
+        x=df.index, y=df["MACD_Sig"], name="Signal",
         line=dict(color="#f0a500", width=1.5),
         showlegend=True, legendgroup="macd",
         hovertemplate="Signal: %{y:.3f}<extra></extra>",
@@ -2754,19 +2778,19 @@ def build_chart(df: pd.DataFrame, symbol: str, p: dict,
 
     annotations = [
         dict(x=0.01, y=1.00, xref="paper", yref="paper", showarrow=False,
-             text=f"<b>{symbol}</b>  EMA{ema1_p}(橙) / EMA{ema2_p}(藍) / EMA60(紫) / BB({bb_p},2σ)  撐/壓=水平虛線",
+             text=f"<b>{symbol}</b>  EMA{ema1_p}(Orange) / EMA{ema2_p}(Blue) / EMA60(Purple) / BB({bb_p},2σ)  Support/Resistance = dashed lines",
              font=dict(color="#8a9bb5", size=10)),
         dict(x=0.01, y=0.578, xref="paper", yref="paper", showarrow=False,
-             text=f"成交量(棒紅升綠降) / 均量{p.get('vol_ma_period',20)}日(橙) | OBV累積量能(藍,右軸) — OBV向上=量能支撐",
+             text=f"Volume(bar, red=up/green=down) / VolMA{p.get('vol_ma_period',20)}(orange) | OBV cumulative(blue, right axis) — OBV rising = volume support",
              font=dict(color="#8a9bb5", size=10)),
         dict(x=0.01, y=0.445, xref="paper", yref="paper", showarrow=False,
-             text=f"CCI({cci_p})  紅柱&gt;+100超買 / 綠柱&lt;-100超賣 / 綠底=趨勢多頭 / 紅底=趨勢空頭",
+             text=f"CCI({cci_p})  red bar&gt;+100 overbought / green bar&lt;-100 oversold / green bg=uptrend / red bg=downtrend",
              font=dict(color="#8a9bb5", size=10)),
         dict(x=0.01, y=0.285, xref="paper", yref="paper", showarrow=False,
-             text=f"KD({kd_p})  橙=K線 藍=D線 / 金叉▲(低檔多) 死叉▼(高檔空) / 超買80 超賣20",
+             text=f"KD({kd_p})  orange=K blue=D / Golden Cross▲(bullish) Dead Cross▼(bearish) / Overbought 80 Oversold 20",
              font=dict(color="#8a9bb5", size=10)),
         dict(x=0.01, y=0.132, xref="paper", yref="paper", showarrow=False,
-             text="MACD  藍=MACD 橙=訊號線 / 柱紅=MACD>0多頭 柱綠=MACD<0空頭 / 黃金交叉=買進",
+             text="MACD  blue=MACD orange=Signal / red bar=MACD>0 bullish, green bar=MACD<0 bearish / Golden Cross=Buy",
              font=dict(color="#8a9bb5", size=10)),
     ]
     fig.update_layout(annotations=annotations)
